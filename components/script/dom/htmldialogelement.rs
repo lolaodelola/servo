@@ -5,7 +5,7 @@
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name, namespace_url, ns};
 use js::rust::HandleObject;
-
+use stylo_dom::ElementState;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::HTMLDialogElementBinding::HTMLDialogElementMethods;
 use crate::dom::bindings::inheritance::Castable;
@@ -73,11 +73,11 @@ impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
         *self.return_value.borrow_mut() = return_value;
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#dom-dialog-show>
+    // <https://html.spec.whatwg.org/multipage/#dom-dialog-show>
     fn Show(&self, can_gc: CanGc) {
         let element = self.upcast::<Element>();
 
-//         TODO: STEP 1: If this has an open attribute and is modal of this is false, then return.
+    //TODO: STEP 1: If this has an open attribute and is modal of this is false, then return.
          if element.has_attribute(&local_name!("open")) {
                     return;
          }
@@ -88,7 +88,7 @@ impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
 //         with the cancelable attribute initialized to true, the oldState attribute
 //         initialized to "closed", and the newState attribute initialized to "open"
 //         at this is false, then return.
-        this.upcast::<EventTarget>().fire_cancelable_event(atom!("beforetoggle"), CanGc::note());
+        self.upcast::<EventTarget>().fire_cancelable_event(atom!("beforetoggle"), CanGc::note());
 
 //         TODO: STEP 4: If this has an open attribute, then return.
 
