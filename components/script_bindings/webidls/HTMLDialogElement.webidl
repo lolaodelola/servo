@@ -13,7 +13,7 @@ interface HTMLDialogElement : HTMLElement {
   [CEReactions]
   undefined show();
   // [CEReactions]
-  // void showModal();
+  // undefined showModal();
   [CEReactions]
   undefined close(optional DOMString returnValue);
 };
