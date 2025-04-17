@@ -78,7 +78,8 @@ impl HTMLDialogElementMethods<crate::DomTypeHolder> for HTMLDialogElement {
         let element = self.upcast::<Element>();
 
     //TODO: STEP 1: If this has an open attribute and is modal of this is false, then return.
-         if element.has_attribute(&local_name!("open")) {
+         if element.has_attribute(&local_name!("open")) && 
+             (element.state() != ElementState::MODAL ) {
                     return;
          }
 
