@@ -254,6 +254,7 @@ pub(crate) mod clipboard;
 pub(crate) mod clipboardevent;
 pub(crate) mod clipboarditem;
 pub(crate) mod closeevent;
+pub(crate) mod closewatcher;
 pub(crate) mod comment;
 pub(crate) mod compositionevent;
 pub(crate) mod console;
