@@ -5,7 +5,7 @@
 //https://html.spec.whatwg.org/multipage/interaction.html#the-closewatcher-interface
 [Exposed=Window]
 interface CloseWatcher : EventTarget {
-  constructor(optional CloseWatcherOptions options = {});
+  [Throws] constructor(optional CloseWatcherOptions options = {});
 
   undefined requestClose();
   undefined close();
