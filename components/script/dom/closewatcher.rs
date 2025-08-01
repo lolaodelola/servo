@@ -107,6 +107,7 @@ impl CloseWatcher {
         }
         
         // 11. Close closeWatcher.
+        self.close(can_gc);
         
         // 12. Return true.
         return true;
@@ -114,6 +115,33 @@ impl CloseWatcher {
     
     fn is_active(&self) -> bool {
         false
+    }
+
+    fn close(&self, can_gc: CanGc) {
+        // 1. If closeWatcher is not active, then return.
+        // 2. If the result of running closeWatcher's get enabled state is false, then return.
+        if !self.is_active() || !self.enabled {
+            return;
+        }
+
+        // 3. If closeWatcher's window's associated Document is not fully active, then return.
+        let global = self.global();
+        let window = global.as_window();
+
+        if !window.Document().is_fully_active() {
+            return;
+        }
+        // 4. Destroy closeWatcher.
+        self.Destroy();
+        // 5. Run closeWatcher's close action.
+        let event = Event::new(&self.global(), 
+                               atom!("close"), 
+                               EventBubbles::DoesNotBubble, 
+                               EventCancelable::NotCancelable,
+                               can_gc
+        );
+        self.event_target.dispatch_event(event, can_gc);
+
     }
 
 }
@@ -125,15 +153,15 @@ impl CloseWatcherMethods<crate::DomTypeHolder> for CloseWatcher {
     }
 
     /// <https://html.spec.whatwg.org/multipage/interaction.html#dom-closewatcher-close>
-    fn Close(&self) {
-        todo!()
+     fn Close(&self) {
+        self.close(CanGc::note());
     }
-
+   
     /// <https://html.spec.whatwg.org/multipage/interaction.html#dom-closewatcher-destroy>
     fn Destroy(&self) {
         todo!()
     }
-    
+
     /// <https://html.spec.whatwg.org/multipage/#handler-closewatcher-oncancel>
     event_handler!(cancel, GetOncancel, SetOncancel);
 
