@@ -31,8 +31,6 @@ use http::{HeaderName, Method, StatusCode};
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Body, Bytes, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
-use ipc_channel::ipc::{self, IpcSharedMemory};
-use ipc_channel::router::ROUTER;
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
 use net::fetch::methods::{self};
@@ -41,8 +39,8 @@ use net::resource_thread::AuthCacheEntry;
 use net::test::{DECODER_BUFFER_SIZE, replace_host_table};
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{
-    BodyChunkRequest, BodyChunkResponse, BodySource, CredentialsMode, Destination, Referrer,
-    Request, RequestBody, RequestBuilder, RequestMode,
+    CredentialsMode, Destination, Referrer, Request, RequestBuilder, RequestMode,
+    create_request_body_with_content,
 };
 use net_traits::response::{Response, ResponseBody};
 use net_traits::{CookieSource, FetchTaskTarget, NetworkError, ReferrerPolicy};
@@ -51,7 +49,7 @@ use url::Url;
 
 use crate::{
     create_embedder_proxy_and_receiver, fetch, fetch_with_context, make_body, make_server,
-    new_fetch_context, receive_credential_prompt_msgs,
+    new_fetch_context, receive_credential_prompt_msgs, spawn_blocking_task,
 };
 
 fn mock_origin() -> ImmutableOrigin {
@@ -69,18 +67,79 @@ fn assert_cookie_for_domain(
     assert_eq!(cookies.as_ref().map(|c| &**c), cookie);
 }
 
-pub fn expect_devtools_http_request(
-    devtools_port: &Receiver<DevtoolsControlMsg>,
-) -> DevtoolsHttpRequest {
+fn recv_http_request(devtools_port: &Receiver<DevtoolsControlMsg>) -> DevtoolsHttpRequest {
     match devtools_port.recv().unwrap() {
         DevtoolsControlMsg::FromChrome(ChromeToDevtoolsControlMsg::NetworkEvent(_, net_event)) => {
             match net_event {
-                NetworkEvent::HttpRequest(httprequest) => httprequest,
-
-                _ => panic!("No HttpRequest Received"),
+                NetworkEvent::HttpRequest(req) => req,
+                NetworkEvent::HttpRequestUpdate(req) => req,
+                other => panic!("Expected HttpRequest but got: {:?}", other),
             }
         },
-        _ => panic!("No HttpRequest Received"),
+        other => panic!("Expected NetworkEvent but got: {:?}", other),
+    }
+}
+
+fn recv_all_network_events(devtools_port: Receiver<DevtoolsControlMsg>) -> Vec<NetworkEvent> {
+    let mut events = vec![];
+    while let Ok(msg) = devtools_port.recv() {
+        match msg {
+            DevtoolsControlMsg::FromChrome(ChromeToDevtoolsControlMsg::NetworkEvent(
+                _,
+                net_event,
+            )) => events.push(net_event),
+            other => panic!("Expected NetworkEvent but got: {:?}", other),
+        }
+    }
+    events
+}
+
+pub fn expect_devtools_http_request(
+    devtools_port: &Receiver<DevtoolsControlMsg>,
+) -> (DevtoolsHttpRequest, DevtoolsHttpRequest) {
+    (
+        recv_http_request(devtools_port),
+        recv_http_request(devtools_port),
+    )
+}
+
+fn pluck<F: Fn(&NetworkEvent) -> bool>(events: &mut Vec<NetworkEvent>, f: F) -> NetworkEvent {
+    let Some(idx) = events.iter().position(f) else {
+        panic!("No matching network event")
+    };
+    events.remove(idx)
+}
+
+#[track_caller]
+fn expect_request(events: &mut Vec<NetworkEvent>) -> DevtoolsHttpRequest {
+    let event = pluck(events, |event| {
+        matches!(event, NetworkEvent::HttpRequest(_))
+    });
+    match event {
+        NetworkEvent::HttpRequest(req) => req,
+        _ => unreachable!(),
+    }
+}
+
+#[track_caller]
+fn expect_request_update(events: &mut Vec<NetworkEvent>) -> DevtoolsHttpRequest {
+    let event = pluck(events, |event| {
+        matches!(event, NetworkEvent::HttpRequestUpdate(_))
+    });
+    match event {
+        NetworkEvent::HttpRequestUpdate(req) => req,
+        _ => unreachable!(),
+    }
+}
+
+#[track_caller]
+fn expect_response(events: &mut Vec<NetworkEvent>) -> DevtoolsHttpResponse {
+    let event = pluck(events, |event| {
+        matches!(event, NetworkEvent::HttpResponse(_))
+    });
+    match event {
+        NetworkEvent::HttpResponse(resp) => resp,
+        _ => unreachable!(),
     }
 }
 
@@ -94,28 +153,23 @@ pub fn expect_devtools_http_response(
         )) => match net_event_response {
             NetworkEvent::HttpResponse(httpresponse) => httpresponse,
 
-            _ => panic!("No HttpResponse Received"),
+            other => panic!("Expected HttpResponse but got: {:?}", other),
         },
-        _ => panic!("No HttpResponse Received"),
+        other => panic!("Expected NetworkEvent but got: {:?}", other),
     }
 }
 
-fn create_request_body_with_content(content: IpcSharedMemory) -> RequestBody {
-    let content_len = content.len();
-
-    let (chunk_request_sender, chunk_request_receiver) = ipc::channel().unwrap();
-    ROUTER.add_typed_route(
-        chunk_request_receiver,
-        Box::new(move |message| {
-            let request = message.unwrap();
-            if let BodyChunkRequest::Connect(sender) = request {
-                let _ = sender.send(BodyChunkResponse::Chunk(content.clone()));
-                let _ = sender.send(BodyChunkResponse::Done);
-            }
-        }),
-    );
-
-    RequestBody::new(chunk_request_sender, BodySource::Object, Some(content_len))
+pub fn devtools_response_with_body(
+    devtools_port: &Receiver<DevtoolsControlMsg>,
+) -> DevtoolsHttpResponse {
+    let devhttpresponses = vec![
+        expect_devtools_http_response(devtools_port),
+        expect_devtools_http_response(devtools_port),
+    ];
+    return devhttpresponses
+        .into_iter()
+        .find(|resp| resp.body.is_some())
+        .expect("One of the responses should have a body");
 }
 
 #[test]
@@ -272,7 +326,7 @@ fn test_request_and_response_data_with_network_messages() {
 
     let mut request_headers = HeaderMap::new();
     request_headers.typed_insert(Host::from("bar.foo".parse::<Authority>().unwrap()));
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .method(Method::GET)
         .headers(request_headers)
         .body(None)
@@ -295,10 +349,10 @@ fn test_request_and_response_data_with_network_messages() {
     let _ = server.close();
 
     // notification received from devtools
-    let devhttprequest = expect_devtools_http_request(&devtools_port);
-    let devhttpresponse = expect_devtools_http_response(&devtools_port);
+    let devhttprequests = expect_devtools_http_request(&devtools_port);
+    let devhttpresponse = devtools_response_with_body(&devtools_port);
 
-    //Creating default headers for request
+    // Creating default headers for request
     let mut headers = HeaderMap::new();
 
     headers.insert(
@@ -329,7 +383,7 @@ fn test_request_and_response_data_with_network_messages() {
     );
     headers.insert(
         HeaderName::from_static("sec-fetch-site"),
-        HeaderValue::from_static("same-site"),
+        HeaderValue::from_static("cross-site"),
     );
     headers.insert(
         HeaderName::from_static("sec-fetch-user"),
@@ -342,11 +396,13 @@ fn test_request_and_response_data_with_network_messages() {
         headers: headers,
         body: Some(vec![]),
         pipeline_id: TEST_PIPELINE_ID,
-        started_date_time: devhttprequest.started_date_time,
-        time_stamp: devhttprequest.time_stamp,
-        connect_time: devhttprequest.connect_time,
-        send_time: devhttprequest.send_time,
+        started_date_time: devhttprequests.1.started_date_time,
+        time_stamp: devhttprequests.1.time_stamp,
+        connect_time: devhttprequests.1.connect_time,
+        send_time: devhttprequests.1.send_time,
+        destination: Destination::Document,
         is_xhr: false,
+        browsing_context_id: TEST_WEBVIEW_ID.0,
     };
 
     let content = "Yay!";
@@ -366,11 +422,12 @@ fn test_request_and_response_data_with_network_messages() {
     let httpresponse = DevtoolsHttpResponse {
         headers: Some(response_headers),
         status: HttpStatus::default(),
-        body: None,
+        body: Some(content.as_bytes().to_vec()),
         pipeline_id: TEST_PIPELINE_ID,
+        browsing_context_id: TEST_WEBVIEW_ID.0,
     };
 
-    assert_eq!(devhttprequest, httprequest);
+    assert_eq!(devhttprequests.1, httprequest);
     assert_eq!(devhttpresponse, httpresponse);
 }
 
@@ -427,7 +484,7 @@ fn test_redirected_request_to_devtools() {
         };
     let (pre_server, pre_url) = make_server(pre_handler);
 
-    let request = RequestBuilder::new(None, pre_url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), pre_url.clone(), Referrer::NoReferrer)
         .method(Method::POST)
         .destination(Destination::Document)
         .pipeline_id(Some(TEST_PIPELINE_ID))
@@ -439,22 +496,29 @@ fn test_redirected_request_to_devtools() {
     let _ = pre_server.close();
     let _ = post_server.close();
 
-    let devhttprequest = expect_devtools_http_request(&devtools_port);
-    let devhttpresponse = expect_devtools_http_response(&devtools_port);
+    let mut events = recv_all_network_events(devtools_port);
+    let first_request = expect_request(&mut events);
+    let first_request_update = expect_request_update(&mut events);
+    let first_response = expect_response(&mut events);
 
-    assert_eq!(devhttprequest.method, Method::POST);
-    assert_eq!(devhttprequest.url, pre_url);
+    assert_eq!(first_request.method, Method::POST);
+    assert_eq!(first_request.url, pre_url);
     assert_eq!(
-        devhttpresponse.status,
+        first_response.status,
         HttpStatus::from(StatusCode::MOVED_PERMANENTLY)
     );
+    assert_eq!(first_request.method, first_request_update.method);
+    assert_eq!(first_request.url, first_request_update.url);
 
-    let devhttprequest = expect_devtools_http_request(&devtools_port);
-    let devhttpresponse = expect_devtools_http_response(&devtools_port);
+    let second_request = expect_request(&mut events);
+    let second_request_update = expect_request_update(&mut events);
+    let second_response = expect_response(&mut events);
 
-    assert_eq!(devhttprequest.method, Method::GET);
-    assert_eq!(devhttprequest.url, post_url);
-    assert_eq!(devhttpresponse.status, HttpStatus::default());
+    assert_eq!(second_request.method, Method::GET);
+    assert_eq!(second_request.url, post_url);
+    assert_eq!(second_response.status, HttpStatus::default());
+    assert_eq!(second_request.method, second_request_update.method);
+    assert_eq!(second_request.url, second_request_update.url);
 }
 
 #[test]
@@ -591,8 +655,8 @@ fn test_load_doesnt_send_request_body_on_any_redirect() {
         };
     let (pre_server, pre_url) = make_server(pre_handler);
 
-    let content = b"Body on POST!";
-    let request_body = create_request_body_with_content(IpcSharedMemory::from_bytes(content));
+    let content = "Body on POST!";
+    let request_body = create_request_body_with_content(content);
 
     let request = RequestBuilder::new(None, pre_url.clone(), Referrer::NoReferrer)
         .body(Some(request_body))
@@ -891,20 +955,21 @@ fn test_when_cookie_received_marked_secure_is_ignored_for_http() {
 
 #[test]
 fn test_load_sets_content_length_to_length_of_request_body() {
-    let content = b"This is a request body";
+    let content = "This is a request body";
+    let content_bytes = content.as_bytes();
     let handler =
         move |request: HyperRequest<Incoming>,
               response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
-            let content_length = ContentLength(content.len() as u64);
+            let content_length = ContentLength(content_bytes.len() as u64);
             assert_eq!(
                 request.headers().typed_get::<ContentLength>(),
                 Some(content_length)
             );
-            *response.body_mut() = make_body(content.to_vec());
+            *response.body_mut() = make_body(content_bytes.to_vec());
         };
     let (server, url) = make_server(handler);
 
-    let request_body = create_request_body_with_content(IpcSharedMemory::from_bytes(content));
+    let request_body = create_request_body_with_content(content);
 
     let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
         .method(Method::POST)
@@ -1546,7 +1611,7 @@ fn test_fetch_compressed_response_update_count() {
         sender: Some(sender),
         update_count: 0,
     };
-    let response_update_count = crate::HANDLE.block_on(async move {
+    let response_update_count = spawn_blocking_task::<_, Response>(async move {
         methods::fetch(
             request,
             &mut target,

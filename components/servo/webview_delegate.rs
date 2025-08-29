@@ -7,13 +7,12 @@ use std::path::PathBuf;
 use base::id::PipelineId;
 use constellation_traits::EmbedderToConstellationMessage;
 use embedder_traits::{
-    AllowOrDeny, AuthenticationResponse, ContextMenuResult, Cursor, FilterPattern,
-    GamepadHapticEffectType, InputMethodType, LoadStatus, MediaSessionEvent, Notification,
-    PermissionFeature, RgbColor, ScreenGeometry, SelectElementOptionOrOptgroup, SimpleDialog,
-    WebResourceRequest, WebResourceResponse, WebResourceResponseMsg,
+    AllowOrDeny, AuthenticationResponse, ContextMenuResult, Cursor, FilterPattern, FocusId,
+    GamepadHapticEffectType, InputMethodType, KeyboardEvent, LoadStatus, MediaSessionEvent,
+    Notification, PermissionFeature, RgbColor, ScreenGeometry, SelectElementOptionOrOptgroup,
+    SimpleDialog, TraversalId, WebResourceRequest, WebResourceResponse, WebResourceResponseMsg,
 };
 use ipc_channel::ipc::IpcSender;
-use keyboard_types::KeyboardEvent;
 use serde::Serialize;
 use url::Url;
 use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
@@ -419,6 +418,9 @@ pub trait WebViewDelegate {
     /// This [`WebView`] has either become focused or lost focus. Whether or not the
     /// [`WebView`] is focused can be accessed via [`WebView::focused`].
     fn notify_focus_changed(&self, _webview: WebView, _focused: bool) {}
+    /// A focus operation that was initiated by this webview has completed.
+    /// The current focus status of this [`WebView`] can be accessed via [`WebView::focused`].
+    fn notify_focus_complete(&self, _webview: WebView, _focus_id: FocusId) {}
     /// This [`WebView`] has either started to animate or stopped animating. When a
     /// [`WebView`] is animating, it is up to the embedding application ensure that
     /// `Servo::spin_event_loop` is called at regular intervals in order to update the
@@ -430,15 +432,17 @@ pub trait WebViewDelegate {
     /// The [`Cursor`] of the currently loaded page in this [`WebView`] has changed. The new
     /// cursor can accessed via [`WebView::cursor`].
     fn notify_cursor_changed(&self, _webview: WebView, _: Cursor) {}
-    /// The favicon [`Url`] of the currently loaded page in this [`WebView`] has changed. The new
-    /// favicon [`Url`] can accessed via [`WebView::favicon_url`].
-    fn notify_favicon_url_changed(&self, _webview: WebView, _: Url) {}
+    /// The favicon of the currently loaded page in this [`WebView`] has changed. The new
+    /// favicon [`Image`] can accessed via [`WebView::favicon`].
+    fn notify_favicon_changed(&self, _webview: WebView) {}
 
     /// Notify the embedder that it needs to present a new frame.
     fn notify_new_frame_ready(&self, _webview: WebView) {}
     /// The history state has changed.
     // changed pattern; maybe wasteful if embedder doesn’t care?
     fn notify_history_changed(&self, _webview: WebView, _: Vec<Url>, _: usize) {}
+    /// A history traversal operation is complete.
+    fn notify_traversal_complete(&self, _webview: WebView, _: TraversalId) {}
     /// Page content has closed this [`WebView`] via `window.close()`. It's the embedder's
     /// responsibility to remove the [`WebView`] from the interface when this notification
     /// occurs.
@@ -467,10 +471,10 @@ pub trait WebViewDelegate {
     /// Whether or not to allow a [`WebView`]  to unload a `Document` in its main frame or one
     /// of its nested `<iframe>`s. By default, unloads are allowed.
     fn request_unload(&self, _webview: WebView, _unload_request: AllowOrDenyRequest) {}
-    /// Move the window to a point
+    /// Move the window to a point.
     fn request_move_to(&self, _webview: WebView, _: DeviceIntPoint) {}
-    /// Resize the window to size
-    fn request_resize_to(&self, _webview: WebView, _: DeviceIntSize) {}
+    /// Try to resize the window that contains this [`WebView`] to the provided outer size.
+    fn request_resize_to(&self, _webview: WebView, _requested_outer_size: DeviceIntSize) {}
     /// Whether or not to allow script to open a new `WebView`. If not handled by the
     /// embedder, these requests are automatically denied.
     fn request_open_auxiliary_webview(&self, _parent_webview: WebView) -> Option<WebView> {

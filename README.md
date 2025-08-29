@@ -4,7 +4,15 @@ Servo is a prototype web browser engine written in the
 [Rust](https://github.com/rust-lang/rust) language. It is currently developed on
 64-bit macOS, 64-bit Linux, 64-bit Windows, 64-bit OpenHarmony, and Android.
 
-Servo welcomes contribution from everyone. Check out [The Servo Book](https://book.servo.org) to get started, or go to [servo.org](https://servo.org/) for news and guides.
+Servo welcomes contribution from everyone. Check out:
+
+- The [Servo Book](https://book.servo.org) for documentation
+- [servo.org](https://servo.org/) for news and guides
+
+Coordination of Servo development happens:
+- Here in the Github Issues
+- On the [Servo Zulip](https://servo.zulipchat.com/)
+- In video calls advertised in the [Servo Project](https://github.com/servo/project/issues) repo.
 
 ## Getting started
 
@@ -42,7 +50,7 @@ For more detailed build instructions, see the Servo book under [Setting up your 
 - Download [`uv`](https://docs.astral.sh/uv/getting-started/installation/#standalone-installer), [`choco`](https://chocolatey.org/install#individual), and [`rustup`](https://win.rustup.rs/)
   - Be sure to select *Quick install via the Visual Studio Community installer*
 - In the Visual Studio Installer, ensure the following components are installed:
-  - **Windows 10 SDK (10.0.19041.0)** (`Microsoft.VisualStudio.Component.Windows10SDK.19041`)
+  - **Windows 10/11 SDK (anything >= 10.0.19041.0)** (`Microsoft.VisualStudio.Component.Windows{10, 11}SDK.{>=19041}`)
   - **MSVC v143 - VS 2022 C++ x64/x86 build tools (Latest)** (`Microsoft.VisualStudio.Component.VC.Tools.x86.x64`)
   - **C++ ATL for latest v143 build tools (x86 & x64)** (`Microsoft.VisualStudio.Component.VC.ATL`)
   - **C++ MFC for latest v143 build tools (x86 & x64)** (`Microsoft.VisualStudio.Component.VC.ATLMFC`)
@@ -82,4 +90,4 @@ For more detailed build instructions, see the Servo book under [Setting up your 
   - `OHOS_SDK_NATIVE` (e.g. `${DEVECO_SDK_HOME}/default/openharmony/native` or `${OHOS_BASE_SDK_HOME}/${API_VERSION}/native`)
   - `SERVO_OHOS_SIGNING_CONFIG`: Path to json file containing a valid signing configuration for the demo app.
 - Review the detailed instructions at [Building for OpenHarmony].
-- The target distribution can be modified by passing `--flavor=<default|harmonyos>` to `mach <build|package|install>.
+- The target distribution can be modified by passing `--flavor=<default|harmonyos>` to `mach <build|package|install>`.

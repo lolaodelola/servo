@@ -45,9 +45,9 @@ interface Element : Node {
   [CEReactions, Throws]
   boolean toggleAttribute(DOMString name, optional boolean force);
   [CEReactions, Throws]
-  undefined setAttribute(DOMString name, DOMString value);
+  undefined setAttribute(DOMString name, (TrustedType or DOMString) value);
   [CEReactions, Throws]
-  undefined setAttributeNS(DOMString? namespace, DOMString name, DOMString value);
+  undefined setAttributeNS(DOMString? namespace, DOMString name, (TrustedType or DOMString) value);
   [CEReactions]
   undefined removeAttribute(DOMString name);
   [CEReactions]
@@ -102,6 +102,7 @@ partial interface Element {
   [NewObject]
   DOMRect getBoundingClientRect();
 
+  undefined scrollIntoView(optional (boolean or ScrollIntoViewOptions) arg = {});
   undefined scroll(optional ScrollToOptions options = {});
   undefined scroll(unrestricted double x, unrestricted double y);
 
@@ -134,6 +135,16 @@ dictionary GetHTMLOptions {
   sequence<ShadowRoot> shadowRoots = [];
 };
 
+// https://drafts.csswg.org/cssom-view/#dictdef-scrollintoviewoptions
+dictionary ScrollIntoViewOptions : ScrollOptions {
+  ScrollLogicalPosition block = "start";
+  ScrollLogicalPosition inline = "nearest";
+  ScrollIntoViewContainer container = "all";
+};
+
+enum ScrollLogicalPosition { "start", "center", "end", "nearest" };
+enum ScrollIntoViewContainer { "all", "nearest" };
+
 // https://fullscreen.spec.whatwg.org/#api
 partial interface Element {
   Promise<undefined> requestFullscreen();
@@ -144,3 +155,8 @@ Element includes NonDocumentTypeChildNode;
 Element includes ParentNode;
 Element includes ActivatableElement;
 Element includes ARIAMixin;
+
+// https://drafts.csswg.org/css-shadow-parts/#idl
+partial interface Element {
+  [SameObject, PutForwards=value] readonly attribute DOMTokenList part;
+};

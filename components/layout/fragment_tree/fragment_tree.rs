@@ -2,14 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
+
 use app_units::Au;
 use base::print_tree::PrintTree;
 use compositing_traits::display_list::AxesScrollSensitivity;
-use euclid::default::Size2D;
 use fxhash::FxHashSet;
 use malloc_size_of_derive::MallocSizeOf;
 use style::animation::AnimationSetKey;
-use webrender_api::units;
+use style::computed_values::position::T as Position;
 
 use super::{BoxFragment, ContainingBlockManager, Fragment};
 use crate::ArcRefCell;
@@ -30,7 +31,7 @@ pub struct FragmentTree {
 
     /// The scrollable overflow rectangle for the entire tree
     /// <https://drafts.csswg.org/css-overflow/#scrollable>
-    pub(crate) scrollable_overflow: PhysicalRect<Au>,
+    scrollable_overflow: Cell<Option<PhysicalRect<Au>>>,
 
     /// The containing block used in the layout of this fragment tree.
     pub(crate) initial_containing_block: PhysicalRect<Au>,
@@ -43,13 +44,12 @@ impl FragmentTree {
     pub(crate) fn new(
         layout_context: &LayoutContext,
         root_fragments: Vec<Fragment>,
-        scrollable_overflow: PhysicalRect<Au>,
         initial_containing_block: PhysicalRect<Au>,
         viewport_scroll_sensitivity: AxesScrollSensitivity,
     ) -> Self {
         let fragment_tree = Self {
             root_fragments,
-            scrollable_overflow,
+            scrollable_overflow: Cell::default(),
             initial_containing_block,
             viewport_scroll_sensitivity,
         };
@@ -59,7 +59,11 @@ impl FragmentTree {
         // them. Create a set of all elements that used to be animating.
         let mut animations = layout_context.style_context.animations.sets.write();
         let mut invalid_animating_nodes: FxHashSet<_> = animations.keys().cloned().collect();
-        let mut image_animations = layout_context.node_image_animation_map.write().to_owned();
+        let mut image_animations = layout_context
+            .image_resolver
+            .node_to_animating_image_map
+            .write()
+            .to_owned();
         let mut invalid_image_animating_nodes: FxHashSet<_> = image_animations
             .keys()
             .cloned()
@@ -68,8 +72,15 @@ impl FragmentTree {
 
         fragment_tree.find(|fragment, _level, containing_block| {
             if let Some(tag) = fragment.tag() {
-                invalid_animating_nodes.remove(&AnimationSetKey::new(tag.node, tag.pseudo));
-                invalid_image_animating_nodes.remove(&AnimationSetKey::new(tag.node, tag.pseudo));
+                // TODO: Support animations on nested pseudo-elements.
+                invalid_animating_nodes.remove(&AnimationSetKey::new(
+                    tag.node,
+                    tag.pseudo_element_chain.primary,
+                ));
+                invalid_image_animating_nodes.remove(&AnimationSetKey::new(
+                    tag.node,
+                    tag.pseudo_element_chain.primary,
+                ));
             }
 
             fragment.set_containing_block(containing_block);
@@ -97,11 +108,64 @@ impl FragmentTree {
         }
     }
 
-    pub fn scrollable_overflow(&self) -> units::LayoutSize {
-        units::LayoutSize::from_untyped(Size2D::new(
-            self.scrollable_overflow.size.width.to_f32_px(),
-            self.scrollable_overflow.size.height.to_f32_px(),
-        ))
+    pub(crate) fn scrollable_overflow(&self) -> PhysicalRect<Au> {
+        self.scrollable_overflow
+            .get()
+            .expect("Should only call `scrollable_overflow()` after calculating overflow")
+    }
+
+    /// Calculate the scrollable overflow / scrolling area for this [`FragmentTree`] according
+    /// to <https://drafts.csswg.org/cssom-view/#scrolling-area>.
+    pub(crate) fn calculate_scrollable_overflow(&self) {
+        let scrollable_overflow = || {
+            let Some(first_root_fragment) = self.root_fragments.first() else {
+                return self.initial_containing_block;
+            };
+
+            let scrollable_overflow = self.root_fragments.iter().fold(
+                self.initial_containing_block,
+                |overflow, fragment| {
+                    // Need to calculate the overflow for each fragments within the tree
+                    // because it is required in the next stages of reflow.
+                    let overflow_from_fragment =
+                        fragment.calculate_scrollable_overflow_for_parent();
+
+                    // Scrollable overflow should be accumulated in the block that
+                    // establishes the containing block for the element. Thus, fixed
+                    // positioned fragments whose containing block is the initial
+                    // containing block should not be included in overflow calculation.
+                    // See <https://www.w3.org/TR/css-overflow-3/#scrollable>.
+                    if fragment
+                        .retrieve_box_fragment()
+                        .is_some_and(|box_fragment| {
+                            box_fragment.borrow().style.get_box().position == Position::Fixed
+                        })
+                    {
+                        return overflow;
+                    }
+
+                    overflow.union(&overflow_from_fragment)
+                },
+            );
+
+            // Assuming that the first fragment is the root element, ensure that
+            // scrollable overflow that is unreachable is not included in the final
+            // rectangle. See
+            // <https://drafts.csswg.org/css-overflow/#scrolling-direction>.
+            let first_root_fragment = match first_root_fragment {
+                Fragment::Box(fragment) | Fragment::Float(fragment) => fragment.borrow(),
+                _ => return scrollable_overflow,
+            };
+            if !first_root_fragment.is_root_element() {
+                return scrollable_overflow;
+            }
+            first_root_fragment.clip_wholly_unreachable_scrollable_overflow(
+                scrollable_overflow,
+                self.initial_containing_block,
+            )
+        };
+
+        self.scrollable_overflow.set(Some(scrollable_overflow()))
     }
 
     pub(crate) fn find<T>(
@@ -116,29 +180,6 @@ impl FragmentTree {
         self.root_fragments
             .iter()
             .find_map(|child| child.find(&info, 0, &mut process_func))
-    }
-
-    /// <https://drafts.csswg.org/cssom-view/#scrolling-area>
-    ///
-    /// Scrolling area for a viewport that is clipped according to overflow direction of root element.
-    pub fn get_scrolling_area_for_viewport(&self) -> PhysicalRect<Au> {
-        let mut scroll_area = self.initial_containing_block;
-        if let Some(root_fragment) = self.root_fragments.first() {
-            for fragment in self.root_fragments.iter() {
-                scroll_area = fragment.unclipped_scrolling_area().union(&scroll_area);
-            }
-            match root_fragment {
-                Fragment::Box(fragment) | Fragment::Float(fragment) => fragment
-                    .borrow()
-                    .clip_unreachable_scrollable_overflow_region(
-                        scroll_area,
-                        self.initial_containing_block,
-                    ),
-                _ => scroll_area,
-            }
-        } else {
-            scroll_area
-        }
     }
 
     /// Find the `<body>` element's [`Fragment`], if it exists in this [`FragmentTree`].

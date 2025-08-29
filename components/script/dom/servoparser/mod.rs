@@ -9,7 +9,7 @@ use base::cross_process_instant::CrossProcessInstant;
 use base::id::PipelineId;
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use content_security_policy as csp;
+use devtools_traits::ScriptToDevtoolsControlMsg;
 use dom_struct::dom_struct;
 use embedder_traits::resources::{self, Resource};
 use encoding_rs::Encoding;
@@ -56,11 +56,11 @@ use crate::dom::bindings::settings_stack::is_execution_stack_empty;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::characterdata::CharacterData;
 use crate::dom::comment::Comment;
+use crate::dom::csp::{CspReporting, GlobalCspReporting, Violation, parse_csp_list_from_metadata};
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::documenttype::DocumentType;
 use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
-use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlformelement::{FormControlElementHelpers, HTMLFormElement};
 use crate::dom::htmlimageelement::HTMLImageElement;
 use crate::dom::htmlinputelement::HTMLInputElement;
@@ -70,12 +70,13 @@ use crate::dom::node::{Node, ShadowIncluding};
 use crate::dom::performanceentry::PerformanceEntry;
 use crate::dom::performancenavigationtiming::PerformanceNavigationTiming;
 use crate::dom::processinginstruction::ProcessingInstruction;
+use crate::dom::reportingendpoint::ReportingEndpoint;
 use crate::dom::shadowroot::IsUserAgentWidget;
 use crate::dom::text::Text;
 use crate::dom::virtualmethods::vtable_for;
 use crate::network_listener::PreInvoke;
 use crate::realms::enter_realm;
-use crate::script_runtime::CanGc;
+use crate::script_runtime::{CanGc, IntroductionType};
 use crate::script_thread::ScriptThread;
 
 mod async_html;
@@ -137,6 +138,9 @@ pub(crate) struct ServoParser {
     #[ignore_malloc_size_of = "Defined in html5ever"]
     #[no_trace]
     prefetch_input: BufferQueue,
+    // The whole input as a string, if needed for the devtools Sources panel.
+    // TODO: use a faster type for concatenating strings?
+    content_for_devtools: Option<DomRefCell<String>>,
 }
 
 pub(crate) struct ElementAttribute {
@@ -161,12 +165,18 @@ impl ServoParser {
         self.can_write()
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#parse-html-from-a-string>
     pub(crate) fn parse_html_document(
         document: &Document,
         input: Option<DOMString>,
         url: ServoUrl,
         can_gc: CanGc,
     ) {
+        // Step 1. Set document's type to "html".
+        //
+        // Set by callers of this function and asserted here
+        assert!(document.is_html_document());
+        // Step 2. Create an HTML parser parser, associated with document.
         let parser = if pref!(dom_servoparser_async_html_tokenizer_enabled) {
             ServoParser::new(
                 document,
@@ -187,7 +197,10 @@ impl ServoParser {
                 can_gc,
             )
         };
-
+        // Step 3. Place html into the input stream for parser. The encoding confidence is irrelevant.
+        // Step 4. Start parser and let it run until it has consumed all the
+        // characters just inserted into the input stream.
+        //
         // Set as the document's current parser and initialize with `input`, if given.
         if let Some(input) = input {
             parser.parse_complete_string_chunk(String::from(input), can_gc);
@@ -196,7 +209,7 @@ impl ServoParser {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#parsing-html-fragments
+    /// <https://html.spec.whatwg.org/multipage/#parsing-html-fragments>
     pub(crate) fn parse_html_fragment(
         context: &Element,
         input: DOMString,
@@ -208,7 +221,7 @@ impl ServoParser {
         let window = context_document.window();
         let url = context_document.url();
 
-        // Step 1.
+        // Step 1. Let document be a Document node whose type is "html".
         let loader = DocumentLoader::new_with_threads(
             context_document.loader().resource_threads().clone(),
             Some(url.clone()),
@@ -234,8 +247,15 @@ impl ServoParser {
             can_gc,
         );
 
-        // Step 2.
+        // Step 2. If context's node document is in quirks mode, then set document's mode to "quirks".
+        // Step 3. Otherwise, if context's node document is in limited-quirks mode, then set document's
+        // mode to "limited-quirks".
         document.set_quirks_mode(context_document.quirks_mode());
+
+        // NOTE: The following steps happened as part of Step 1.
+        // Step 4. If allowDeclarativeShadowRoots is true, then set document's
+        // allow declarative shadow roots to true.
+        // Step 5. Create a new HTML parser, and associate it with document.
 
         // Step 11.
         let form = context_node
@@ -245,6 +265,7 @@ impl ServoParser {
         let fragment_context = FragmentContext {
             context_elem: context_node,
             form_elem: form.as_deref(),
+            context_element_allows_scripting: context_document.scripting_enabled(),
         };
 
         let parser = ServoParser::new(
@@ -457,6 +478,13 @@ impl ServoParser {
 
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(document: &Document, tokenizer: Tokenizer, kind: ParserKind) -> Self {
+        // Store the whole input for the devtools Sources panel, if the devtools server is running
+        // and we are parsing for a document load (not just things like innerHTML).
+        // TODO: check if a devtools client is actually connected and/or wants the sources?
+        let content_for_devtools = (document.global().devtools_chan().is_some() &&
+            document.has_browsing_context())
+        .then_some(DomRefCell::new(String::new()));
+
         ServoParser {
             reflector: Reflector::new(),
             document: Dom::from_ref(document),
@@ -472,6 +500,7 @@ impl ServoParser {
             script_created_parser: kind == ParserKind::ScriptCreated,
             prefetch_tokenizer: prefetch::Tokenizer::new(document),
             prefetch_input: BufferQueue::default(),
+            content_for_devtools,
         }
     }
 
@@ -490,6 +519,15 @@ impl ServoParser {
     }
 
     fn push_tendril_input_chunk(&self, chunk: StrTendril) {
+        if let Some(mut content_for_devtools) = self
+            .content_for_devtools
+            .as_ref()
+            .map(|content| content.borrow_mut())
+        {
+            // TODO: append these chunks more efficiently
+            content_for_devtools.push_str(chunk.as_ref());
+        }
+
         if chunk.is_empty() {
             return;
         }
@@ -630,9 +668,7 @@ impl ServoParser {
             assert!(!self.suspended.get());
             assert!(!self.aborted.get());
 
-            self.document
-                .window()
-                .reflow_if_reflow_timer_expired(can_gc);
+            self.document.window().reflow_if_reflow_timer_expired();
             let script = match feed(&self.tokenizer) {
                 TokenizerResult::Done => return,
                 TokenizerResult::Script(script) => script,
@@ -654,7 +690,10 @@ impl ServoParser {
             let script_nesting_level = self.script_nesting_level.get();
 
             self.script_nesting_level.set(script_nesting_level + 1);
-            script.prepare(can_gc);
+            script.set_initial_script_text();
+            let introduction_type_override =
+                (script_nesting_level > 0).then_some(IntroductionType::INJECTED_SCRIPT);
+            script.prepare(introduction_type_override, can_gc);
             self.script_nesting_level.set(script_nesting_level);
 
             if self.document.has_pending_parsing_blocking_script() {
@@ -686,6 +725,21 @@ impl ServoParser {
         // Steps 3-12 are in another castle, namely finish_load.
         let url = self.tokenizer.url().clone();
         self.document.finish_load(LoadType::PageSource(url), can_gc);
+
+        // Send the source contents to devtools, if needed.
+        if let Some(content_for_devtools) = self
+            .content_for_devtools
+            .as_ref()
+            .map(|content| content.take())
+        {
+            let global = self.document.global();
+            let chan = global.devtools_chan().expect("Guaranteed by new");
+            let pipeline_id = self.document.global().pipeline_id();
+            let _ = chan.send(ScriptToDevtoolsControlMsg::UpdateSourceContent(
+                pipeline_id,
+                content_for_devtools,
+            ));
+        }
     }
 }
 
@@ -815,21 +869,14 @@ impl ParserContext {
         let Some(policy_container) = policy_container else {
             return;
         };
-        let Some(parent_csp_list) = &policy_container.csp_list else {
-            return;
-        };
         let Some(parser) = self.parser.as_ref().map(|p| p.root()) else {
             return;
         };
-        let new_csp_list = match parser.document.get_csp_list() {
-            None => parent_csp_list.clone(),
-            Some(original_csp_list) => {
-                let mut appended_csp_list = original_csp_list.clone();
-                appended_csp_list.append(parent_csp_list.clone());
-                appended_csp_list.to_owned()
-            },
-        };
-        parser.document.set_csp_list(Some(new_csp_list));
+        let new_csp_list = parser
+            .document
+            .get_csp_list()
+            .concatenate(policy_container.csp_list.clone());
+        parser.document.set_csp_list(new_csp_list);
     }
 }
 
@@ -869,9 +916,13 @@ impl FetchResponseListener for ParserContext {
             .map(Serde::into_inner)
             .map(Into::into);
 
-        let csp_list = metadata
-            .as_ref()
-            .and_then(|m| GlobalScope::parse_csp_list_from_metadata(&m.headers));
+        let (csp_list, endpoints_list) = match metadata.as_ref() {
+            None => (None, None),
+            Some(m) => (
+                parse_csp_list_from_metadata(&m.headers),
+                ReportingEndpoint::parse_reporting_endpoints_header(&self.url.clone(), &m.headers),
+            ),
+        };
 
         let parser = match ScriptThread::page_headers_available(&self.id, metadata, CanGc::note()) {
             Some(parser) => parser,
@@ -883,7 +934,9 @@ impl FetchResponseListener for ParserContext {
 
         let _realm = enter_realm(&*parser.document);
 
-        parser.document.set_csp_list(csp_list);
+        if let Some(endpoints) = endpoints_list {
+            parser.document.window().set_endpoints_list(endpoints);
+        }
         self.parser = Some(Trusted::new(&*parser));
         self.submit_resource_timing();
 
@@ -909,7 +962,14 @@ impl FetchResponseListener for ParserContext {
 
                 let doc = &parser.document;
                 let doc_body = DomRoot::upcast::<Node>(doc.GetBody().unwrap());
-                let img = HTMLImageElement::new(local_name!("img"), None, doc, None, CanGc::note());
+                let img = HTMLImageElement::new(
+                    local_name!("img"),
+                    None,
+                    doc,
+                    None,
+                    ElementCreator::ParserCreated(1),
+                    CanGc::note(),
+                );
                 img.SetSrc(USVString(self.url.to_string()));
                 doc_body
                     .AppendChild(&DomRoot::upcast::<Node>(img), CanGc::note())
@@ -949,12 +1009,14 @@ impl FetchResponseListener for ParserContext {
                     parser.parse_sync(CanGc::note());
                 },
                 Some(_) => {},
-                None => {},
+                None => parser.document.set_csp_list(csp_list),
             },
             (mime::TEXT, mime::XML, _) |
             (mime::APPLICATION, mime::XML, _) |
-            (mime::APPLICATION, mime::JSON, _) => {},
-            (mime::APPLICATION, subtype, Some(mime::XML)) if subtype == "xhtml" => {},
+            (mime::APPLICATION, mime::JSON, _) => parser.document.set_csp_list(csp_list),
+            (mime::APPLICATION, subtype, Some(mime::XML)) if subtype == "xhtml" => {
+                parser.document.set_csp_list(csp_list)
+            },
             (mime_type, subtype, _) => {
                 // Show warning page for unknown mime types.
                 let page = format!(
@@ -1068,7 +1130,7 @@ impl FetchResponseListener for ParserContext {
         );
     }
 
-    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
+    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
         let parser = match self.parser.as_ref() {
             Some(parser) => parser.root(),
             None => return,
@@ -1076,7 +1138,7 @@ impl FetchResponseListener for ParserContext {
         let document = &parser.document;
         let global = &document.global();
         // TODO(https://github.com/w3c/webappsec-csp/issues/687): Update after spec is resolved
-        global.report_csp_violations(violations, None);
+        global.report_csp_violations(violations, None, None);
     }
 }
 
@@ -1085,6 +1147,7 @@ impl PreInvoke for ParserContext {}
 pub(crate) struct FragmentContext<'a> {
     pub(crate) context_elem: &'a Node,
     pub(crate) form_elem: Option<&'a Node>,
+    pub(crate) context_element_allows_scripting: bool,
 }
 
 #[cfg_attr(crown, allow(crown::unrooted_must_root))]
@@ -1403,83 +1466,9 @@ impl TreeSink for Sink {
         &self,
         host: &Dom<Node>,
         template: &Dom<Node>,
-        attrs: Vec<Attribute>,
-    ) -> Result<(), String> {
-        let host_element = host.downcast::<Element>().unwrap();
-
-        if host_element.shadow_root().is_some() {
-            return Err(String::from("Already in a shadow host"));
-        }
-
-        let template_element = template.downcast::<HTMLTemplateElement>().unwrap();
-
-        // Step 3. Let mode be template start tag's shadowrootmode attribute's value.
-        // Step 4. Let clonable be true if template start tag has a shadowrootclonable attribute; otherwise false.
-        // Step 5. Let delegatesfocus be true if template start tag
-        // has a shadowrootdelegatesfocus attribute; otherwise false.
-        // Step 6. Let serializable be true if template start tag
-        // has a shadowrootserializable attribute; otherwise false.
-        let mut shadow_root_mode = ShadowRootMode::Open;
-        let mut clonable = false;
-        let mut delegatesfocus = false;
-        let mut serializable = false;
-
-        let attrs: Vec<ElementAttribute> = attrs
-            .clone()
-            .into_iter()
-            .map(|attr| ElementAttribute::new(attr.name, DOMString::from(String::from(attr.value))))
-            .collect();
-
-        attrs
-            .iter()
-            .for_each(|attr: &ElementAttribute| match attr.name.local {
-                local_name!("shadowrootmode") => {
-                    if attr.value.str().eq_ignore_ascii_case("open") {
-                        shadow_root_mode = ShadowRootMode::Open;
-                    } else if attr.value.str().eq_ignore_ascii_case("closed") {
-                        shadow_root_mode = ShadowRootMode::Closed;
-                    } else {
-                        unreachable!("shadowrootmode value is not open nor closed");
-                    }
-                },
-                local_name!("shadowrootclonable") => {
-                    clonable = true;
-                },
-                local_name!("shadowrootdelegatesfocus") => {
-                    delegatesfocus = true;
-                },
-                local_name!("shadowrootserializable") => {
-                    serializable = true;
-                },
-                _ => {},
-            });
-
-        // Step 8.1. Attach a shadow root with declarative shadow host element,
-        // mode, clonable, serializable, delegatesFocus, and "named".
-        match host_element.attach_shadow(
-            IsUserAgentWidget::No,
-            shadow_root_mode,
-            clonable,
-            serializable,
-            delegatesfocus,
-            SlotAssignmentMode::Named,
-            CanGc::note(),
-        ) {
-            Ok(shadow_root) => {
-                // Step 8.3. Set shadow's declarative to true.
-                shadow_root.set_declarative(true);
-
-                // Set 8.4. Set template's template contents property to shadow.
-                let shadow = shadow_root.upcast::<DocumentFragment>();
-                template_element.set_contents(Some(shadow));
-
-                // Step 8.5. Set shadow’s available to element internals to true.
-                shadow_root.set_available_to_element_internals(true);
-
-                Ok(())
-            },
-            Err(_) => Err(String::from("Attaching shadow fails")),
-        }
+        attributes: &[Attribute],
+    ) -> bool {
+        attach_declarative_shadow_inner(host, template, attributes)
     }
 }
 
@@ -1614,5 +1603,87 @@ impl TendrilSink<UTF8> for NetworkSink {
 
     fn finish(self) -> Self::Output {
         self.output
+    }
+}
+
+fn attach_declarative_shadow_inner(host: &Node, template: &Node, attributes: &[Attribute]) -> bool {
+    let host_element = host.downcast::<Element>().unwrap();
+
+    if host_element.shadow_root().is_some() {
+        return false;
+    }
+
+    let template_element = template.downcast::<HTMLTemplateElement>().unwrap();
+
+    // Step 3. Let mode be template start tag's shadowrootmode attribute's value.
+    // Step 4. Let clonable be true if template start tag has a shadowrootclonable attribute; otherwise false.
+    // Step 5. Let delegatesfocus be true if template start tag
+    // has a shadowrootdelegatesfocus attribute; otherwise false.
+    // Step 6. Let serializable be true if template start tag
+    // has a shadowrootserializable attribute; otherwise false.
+    let mut shadow_root_mode = ShadowRootMode::Open;
+    let mut clonable = false;
+    let mut delegatesfocus = false;
+    let mut serializable = false;
+
+    let attributes: Vec<ElementAttribute> = attributes
+        .iter()
+        .map(|attr| {
+            ElementAttribute::new(
+                attr.name.clone(),
+                DOMString::from(String::from(attr.value.clone())),
+            )
+        })
+        .collect();
+
+    attributes
+        .iter()
+        .for_each(|attr: &ElementAttribute| match attr.name.local {
+            local_name!("shadowrootmode") => {
+                if attr.value.str().eq_ignore_ascii_case("open") {
+                    shadow_root_mode = ShadowRootMode::Open;
+                } else if attr.value.str().eq_ignore_ascii_case("closed") {
+                    shadow_root_mode = ShadowRootMode::Closed;
+                } else {
+                    unreachable!("shadowrootmode value is not open nor closed");
+                }
+            },
+            local_name!("shadowrootclonable") => {
+                clonable = true;
+            },
+            local_name!("shadowrootdelegatesfocus") => {
+                delegatesfocus = true;
+            },
+            local_name!("shadowrootserializable") => {
+                serializable = true;
+            },
+            _ => {},
+        });
+
+    // Step 8.1. Attach a shadow root with declarative shadow host element,
+    // mode, clonable, serializable, delegatesFocus, and "named".
+    match host_element.attach_shadow(
+        IsUserAgentWidget::No,
+        shadow_root_mode,
+        clonable,
+        serializable,
+        delegatesfocus,
+        SlotAssignmentMode::Named,
+        CanGc::note(),
+    ) {
+        Ok(shadow_root) => {
+            // Step 8.3. Set shadow's declarative to true.
+            shadow_root.set_declarative(true);
+
+            // Set 8.4. Set template's template contents property to shadow.
+            let shadow = shadow_root.upcast::<DocumentFragment>();
+            template_element.set_contents(Some(shadow));
+
+            // Step 8.5. Set shadow’s available to element internals to true.
+            shadow_root.set_available_to_element_internals(true);
+
+            true
+        },
+        Err(_) => false,
     }
 }

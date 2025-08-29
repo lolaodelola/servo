@@ -5,12 +5,13 @@
 use std::rc::Rc;
 
 use js::jsval::UndefinedValue;
+use script_bindings::root::DomRoot;
 
-use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::htmlheadelement::HTMLHeadElement;
 use crate::dom::htmlscriptelement::SourceCode;
 use crate::dom::node::NodeTraits;
+use crate::dom::window::Window;
 use crate::script_module::ScriptFetchOptions;
 use crate::script_runtime::CanGc;
 
@@ -20,9 +21,8 @@ pub(crate) fn load_script(head: &HTMLHeadElement) {
     if userscripts.is_empty() {
         return;
     }
-    let window = Trusted::new(doc.window());
-    doc.add_delayed_task(task!(UserScriptExecute: move || {
-        let win = window.root();
+    let win = DomRoot::from_ref(doc.window());
+    doc.add_delayed_task(task!(UserScriptExecute: |win: DomRoot<Window>| {
         let cx = win.get_cx();
         rooted!(in(*cx) let mut rval = UndefinedValue());
 
@@ -31,7 +31,7 @@ pub(crate) fn load_script(head: &HTMLHeadElement) {
                 Rc::new(DOMString::from_string(user_script.script))
             );
             let global_scope = win.as_global_scope();
-            global_scope.evaluate_script_on_global_with_result(
+            _ = global_scope.evaluate_script_on_global_with_result(
                 &script_text,
                 &user_script.source_file.map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
                 rval.handle_mut(),
@@ -39,6 +39,7 @@ pub(crate) fn load_script(head: &HTMLHeadElement) {
                 ScriptFetchOptions::default_classic_script(global_scope),
                 global_scope.api_base_url(),
                 CanGc::note(),
+                None,
             );
         }
     }));

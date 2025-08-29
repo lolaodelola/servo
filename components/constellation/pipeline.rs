@@ -5,12 +5,14 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use background_hang_monitor::HangMonitorRegister;
 use background_hang_monitor_api::{
     BackgroundHangMonitorControlMsg, BackgroundHangMonitorRegister, HangMonitorAlert,
 };
 use base::Epoch;
+use base::generic_channel::{GenericReceiver, GenericSender};
 use base::id::{
     BrowsingContextId, HistoryStateId, PipelineId, PipelineNamespace, PipelineNamespaceId,
     PipelineNamespaceRequest, WebViewId,
@@ -25,20 +27,20 @@ use constellation_traits::{LoadData, SWManagerMsg, ScriptToConstellationChan};
 use crossbeam_channel::{Sender, unbounded};
 use devtools_traits::{DevtoolsControlMsg, ScriptToDevtoolsControlMsg};
 use embedder_traits::user_content_manager::UserContentManager;
-use embedder_traits::{AnimationState, FocusSequenceNumber, ViewportDetails};
+use embedder_traits::{AnimationState, FocusSequenceNumber, Theme, ViewportDetails};
 use fonts::{SystemFontServiceProxy, SystemFontServiceProxySender};
 use ipc_channel::Error;
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
+use layout_api::{LayoutFactory, ScriptThreadFactory};
 use log::{debug, error, warn};
 use media::WindowGLContext;
 use net::image_cache::ImageCacheImpl;
-use net_traits::ResourceThreads;
 use net_traits::image_cache::ImageCache;
+use net_traits::{CoreResourceThread, ResourceThreads};
 use profile::system_reporter;
 use profile_traits::mem::{ProfilerMsg, Reporter};
 use profile_traits::{mem as profile_mem, time};
-use script_layout_interface::{LayoutFactory, ScriptThreadFactory};
 use script_traits::{
     DiscardBrowsingContext, DocumentActivity, InitialScriptState, NewLayoutInfo,
     ScriptThreadMessage,
@@ -61,7 +63,7 @@ pub struct Pipeline {
     /// The ID of the browsing context that contains this Pipeline.
     pub browsing_context_id: BrowsingContextId,
 
-    /// The ID of the top-level browsing context that contains this Pipeline.
+    /// The [`WebViewId`] of the `WebView` that contains this Pipeline.
     pub webview_id: WebViewId,
 
     pub opener: Option<BrowsingContextId>,
@@ -130,7 +132,7 @@ pub struct InitialPipelineState {
     pub script_to_constellation_chan: ScriptToConstellationChan,
 
     /// A sender to request pipeline namespace ids.
-    pub namespace_request_sender: IpcSender<PipelineNamespaceRequest>,
+    pub namespace_request_sender: GenericSender<PipelineNamespaceRequest>,
 
     /// A handle to register components for hang monitoring.
     /// None when in multiprocess mode.
@@ -170,6 +172,9 @@ pub struct InitialPipelineState {
     /// The initial [`ViewportDetails`] to use when starting this new [`Pipeline`].
     pub viewport_details: ViewportDetails,
 
+    /// The initial [`Theme`] to use when starting this new [`Pipeline`].
+    pub theme: Theme,
+
     /// The ID of the pipeline namespace for this script thread.
     pub pipeline_namespace_id: PipelineNamespaceId,
 
@@ -205,6 +210,7 @@ pub struct NewPipeline {
     pub pipeline: Pipeline,
     pub bhm_control_chan: Option<IpcSender<BackgroundHangMonitorControlMsg>>,
     pub lifeline: Option<(IpcReceiver<()>, Process)>,
+    pub join_handle: Option<JoinHandle<()>>,
 }
 
 impl Pipeline {
@@ -214,7 +220,7 @@ impl Pipeline {
     ) -> Result<NewPipeline, Error> {
         // Note: we allow channel creation to panic, since recovering from this
         // probably requires a general low-memory strategy.
-        let (script_chan, (bhm_control_chan, lifeline)) = match state.event_loop {
+        let (script_chan, (bhm_control_chan, lifeline, join_handle)) = match state.event_loop {
             Some(script_chan) => {
                 let new_layout_info = NewLayoutInfo {
                     parent_info: state.parent_pipeline_id,
@@ -224,16 +230,18 @@ impl Pipeline {
                     opener: state.opener,
                     load_data: state.load_data.clone(),
                     viewport_details: state.viewport_details,
+                    theme: state.theme,
                 };
 
                 if let Err(e) = script_chan.send(ScriptThreadMessage::AttachLayout(new_layout_info))
                 {
                     warn!("Sending to script during pipeline creation failed ({})", e);
                 }
-                (script_chan, (None, None))
+                (script_chan, (None, None, None))
             },
             None => {
-                let (script_chan, script_port) = ipc::channel().expect("Pipeline script chan");
+                let (script_chan, script_port) =
+                    base::generic_channel::channel().expect("Pipeline script chan");
 
                 // Route messages coming from content to devtools as appropriate.
                 let script_to_devtools_ipc_sender =
@@ -280,6 +288,7 @@ impl Pipeline {
                     time_profiler_chan: state.time_profiler_chan,
                     mem_profiler_chan: state.mem_profiler_chan,
                     viewport_details: state.viewport_details,
+                    theme: state.theme,
                     script_chan: script_chan.clone(),
                     load_data: state.load_data.clone(),
                     script_port,
@@ -309,18 +318,18 @@ impl Pipeline {
                         ipc::channel().expect("Failed to create lifeline channel");
                     unprivileged_pipeline_content.lifeline_sender = Some(sender);
                     let process = unprivileged_pipeline_content.spawn_multiprocess()?;
-                    (Some(bhm_control_chan), Some((receiver, process)))
+                    (Some(bhm_control_chan), Some((receiver, process)), None)
                 } else {
                     // Should not be None in single-process mode.
                     let register = state
                         .background_monitor_register
                         .expect("Couldn't start content, no background monitor has been initiated");
-                    unprivileged_pipeline_content.start_all::<STF>(
+                    let join_handle = unprivileged_pipeline_content.start_all::<STF>(
                         false,
                         state.layout_factory,
                         register,
                     );
-                    (None, None)
+                    (None, None, Some(join_handle))
                 };
 
                 (EventLoop::new(script_chan), multiprocess_data)
@@ -341,6 +350,7 @@ impl Pipeline {
             pipeline,
             bhm_control_chan,
             lifeline,
+            join_handle,
         })
     }
 
@@ -380,41 +390,20 @@ impl Pipeline {
         pipeline
     }
 
-    /// A normal exit of the pipeline, which waits for the compositor,
-    /// and delegates layout shutdown to the script thread.
-    pub fn exit(&self, discard_bc: DiscardBrowsingContext) {
-        debug!("pipeline {:?} exiting", self.id);
-
-        // The compositor wants to know when pipelines shut down too.
-        // It may still have messages to process from these other threads
-        // before they can be safely shut down.
-        // It's OK for the constellation to block on the compositor,
-        // since the compositor never blocks on the constellation.
-        if let Ok((sender, receiver)) = ipc::channel() {
-            self.compositor_proxy.send(CompositorMsg::PipelineExited(
-                self.webview_id,
-                self.id,
-                sender,
-            ));
-            if let Err(e) = receiver.recv() {
-                warn!("Sending exit message failed ({:?}).", e);
-            }
-        }
+    /// Let the `ScriptThread` for this [`Pipeline`] know that it has exited. If the `ScriptThread` hasn't
+    /// panicked and is still alive, it will send a `PipelineExited` message back to the `Constellation`
+    /// when it finishes cleaning up.
+    pub fn send_exit_message_to_script(&self, discard_bc: DiscardBrowsingContext) {
+        debug!("{:?} Sending exit message to script", self.id);
 
         // Script thread handles shutting down layout, and layout handles shutting down the painter.
         // For now, if the script thread has failed, we give up on clean shutdown.
-        let msg = ScriptThreadMessage::ExitPipeline(self.id, discard_bc);
-        if let Err(e) = self.event_loop.send(msg) {
-            warn!("Sending script exit message failed ({}).", e);
-        }
-    }
-
-    /// A forced exit of the shutdown, which does not wait for the compositor,
-    /// or for the script thread to shut down layout.
-    pub fn force_exit(&self, discard_bc: DiscardBrowsingContext) {
-        let msg = ScriptThreadMessage::ExitPipeline(self.id, discard_bc);
-        if let Err(e) = self.event_loop.send(msg) {
-            warn!("Sending script exit message failed ({}).", e);
+        if let Err(error) = self.event_loop.send(ScriptThreadMessage::ExitPipeline(
+            self.webview_id,
+            self.id,
+            discard_bc,
+        )) {
+            warn!("Sending script exit message failed ({error}).");
         }
     }
 
@@ -481,7 +470,7 @@ pub struct UnprivilegedPipelineContent {
     browsing_context_id: BrowsingContextId,
     parent_pipeline_id: Option<PipelineId>,
     opener: Option<BrowsingContextId>,
-    namespace_request_sender: IpcSender<PipelineNamespaceRequest>,
+    namespace_request_sender: GenericSender<PipelineNamespaceRequest>,
     script_to_constellation_chan: ScriptToConstellationChan,
     background_hang_monitor_to_constellation_chan: IpcSender<HangMonitorAlert>,
     bhm_control_port: Option<IpcReceiver<BackgroundHangMonitorControlMsg>>,
@@ -494,9 +483,10 @@ pub struct UnprivilegedPipelineContent {
     time_profiler_chan: time::ProfilerChan,
     mem_profiler_chan: profile_mem::ProfilerChan,
     viewport_details: ViewportDetails,
-    script_chan: IpcSender<ScriptThreadMessage>,
+    theme: Theme,
+    script_chan: GenericSender<ScriptThreadMessage>,
     load_data: LoadData,
-    script_port: IpcReceiver<ScriptThreadMessage>,
+    script_port: GenericReceiver<ScriptThreadMessage>,
     opts: Opts,
     prefs: Box<Preferences>,
     pipeline_namespace_id: PipelineNamespaceId,
@@ -515,7 +505,7 @@ impl UnprivilegedPipelineContent {
         wait_for_completion: bool,
         layout_factory: Arc<dyn LayoutFactory>,
         background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
-    ) {
+    ) -> JoinHandle<()> {
         // Setup pipeline-namespace-installing for all threads in this process.
         // Idempotent in single-process mode.
         PipelineNamespace::set_installer_sender(self.namespace_request_sender);
@@ -525,7 +515,7 @@ impl UnprivilegedPipelineContent {
             self.rippy_data,
         ));
         let (content_process_shutdown_chan, content_process_shutdown_port) = unbounded();
-        STF::create(
+        let join_handle = STF::create(
             InitialScriptState {
                 id: self.id,
                 browsing_context_id: self.browsing_context_id,
@@ -544,6 +534,7 @@ impl UnprivilegedPipelineContent {
                 memory_profiler_sender: self.mem_profiler_chan.clone(),
                 devtools_server_sender: self.devtools_ipc_sender,
                 viewport_details: self.viewport_details,
+                theme: self.theme,
                 pipeline_namespace_id: self.pipeline_namespace_id,
                 content_process_shutdown_sender: content_process_shutdown_chan,
                 webgl_chan: self.webgl_chan,
@@ -564,6 +555,8 @@ impl UnprivilegedPipelineContent {
                 Err(_) => error!("Script-thread shut-down unexpectedly"),
             }
         }
+
+        join_handle
     }
 
     pub fn spawn_multiprocess(self) -> Result<Process, Error> {
@@ -572,7 +565,7 @@ impl UnprivilegedPipelineContent {
 
     pub fn register_with_background_hang_monitor(
         &mut self,
-    ) -> Box<dyn BackgroundHangMonitorRegister> {
+    ) -> (Box<dyn BackgroundHangMonitorRegister>, JoinHandle<()>) {
         HangMonitorRegister::init(
             self.background_hang_monitor_to_constellation_chan.clone(),
             self.bhm_control_port.take().expect("no sampling profiler?"),
@@ -582,6 +575,10 @@ impl UnprivilegedPipelineContent {
 
     pub fn script_to_constellation_chan(&self) -> &ScriptToConstellationChan {
         &self.script_to_constellation_chan
+    }
+
+    pub fn core_resource_thread(&self) -> &CoreResourceThread {
+        &self.resource_threads.core_thread
     }
 
     pub fn opts(&self) -> Opts {

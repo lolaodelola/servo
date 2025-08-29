@@ -7,8 +7,7 @@ use std::vec::IntoIter;
 use app_units::Au;
 use fonts::FontMetrics;
 use malloc_size_of_derive::MallocSizeOf;
-use script::layout_dom::ServoLayoutNode;
-use script_layout_interface::wrapper_traits::{LayoutNode, ThreadSafeLayoutNode};
+use script::layout_dom::ServoThreadSafeLayoutNode;
 use servo_arc::Arc as ServoArc;
 use style::properties::ComputedValues;
 
@@ -67,18 +66,18 @@ impl InlineBox {
     }
 
     #[inline]
-    pub(crate) fn layout_style(&self) -> LayoutStyle {
+    pub(crate) fn layout_style(&self) -> LayoutStyle<'_> {
         LayoutStyle::Default(&self.base.style)
     }
 
     pub(crate) fn repair_style(
         &mut self,
-        node: &ServoLayoutNode,
+        node: &ServoThreadSafeLayoutNode,
         new_style: &ServoArc<ComputedValues>,
     ) {
         self.base.repair_style(new_style);
         *self.shared_inline_styles.style.borrow_mut() = new_style.clone();
-        *self.shared_inline_styles.selected.borrow_mut() = node.to_threadsafe().selected_style();
+        *self.shared_inline_styles.selected.borrow_mut() = node.selected_style();
     }
 }
 
@@ -114,8 +113,8 @@ impl InlineBoxes {
 
     pub(super) fn start_inline_box(
         &mut self,
-        mut inline_box: InlineBox,
-    ) -> (InlineBoxIdentifier, ArcRefCell<InlineBox>) {
+        inline_box: ArcRefCell<InlineBox>,
+    ) -> InlineBoxIdentifier {
         assert!(self.inline_boxes.len() <= u32::MAX as usize);
         assert!(self.inline_box_tree.len() <= u32::MAX as usize);
 
@@ -126,14 +125,13 @@ impl InlineBoxes {
             index_of_start_in_tree,
             index_in_inline_boxes,
         };
-        inline_box.identifier = identifier;
-        let inline_box = ArcRefCell::new(inline_box);
+        inline_box.borrow_mut().identifier = identifier;
 
-        self.inline_boxes.push(inline_box.clone());
+        self.inline_boxes.push(inline_box);
         self.inline_box_tree
             .push(InlineBoxTreePathToken::Start(identifier));
 
-        (identifier, inline_box)
+        identifier
     }
 
     pub(super) fn get_path(

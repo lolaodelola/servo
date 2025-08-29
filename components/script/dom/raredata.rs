@@ -5,12 +5,14 @@
 use std::rc::Rc;
 
 use euclid::default::Rect;
+use style::selector_parser::PseudoElement;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::root::{Dom, MutNullableDom};
 use crate::dom::customelementregistry::{
     CustomElementDefinition, CustomElementReaction, CustomElementState,
 };
+use crate::dom::domtokenlist::DOMTokenList;
 use crate::dom::elementinternals::ElementInternals;
 use crate::dom::htmlslotelement::SlottableData;
 use crate::dom::intersectionobserver::IntersectionObserverRegistration;
@@ -21,7 +23,7 @@ use crate::dom::range::WeakRangeVec;
 use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::window::LayoutValue;
 
-//XXX(ferjm) Ideally merge NodeRareData and ElementRareData so they share
+// XXX(ferjm) Ideally merge NodeRareData and ElementRareData so they share
 //           storage.
 
 #[derive(Default, JSTraceable, MallocSizeOf)]
@@ -46,6 +48,13 @@ pub(crate) struct NodeRareData {
 
     /// The live list of children return by .childNodes.
     pub(crate) child_list: MutNullableDom<NodeList>,
+
+    /// Whether this node represents a certain implemented pseudo-element.
+    /// An implemented pseudo-element is a real element within a UA shadow tree
+    /// that will match a certain pseudo-element selector.
+    /// An example of this is the element matching the `::placeholder` selector.
+    #[no_trace]
+    pub(crate) implemented_pseudo_element: Option<PseudoElement>,
 }
 
 #[derive(Default, JSTraceable, MallocSizeOf)]
@@ -57,7 +66,7 @@ pub(crate) struct ElementRareData {
     /// <https://html.spec.whatwg.org/multipage/#custom-element-reaction-queue>
     pub(crate) custom_element_reaction_queue: Vec<CustomElementReaction>,
     /// <https://dom.spec.whatwg.org/#concept-element-custom-element-definition>
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     pub(crate) custom_element_definition: Option<Rc<CustomElementDefinition>>,
     /// <https://dom.spec.whatwg.org/#concept-element-custom-element-state>
     pub(crate) custom_element_state: CustomElementState,
@@ -76,4 +85,10 @@ pub(crate) struct ElementRareData {
     /// > which is initialized to an empty list. This list holds IntersectionObserverRegistration records, which have:
     pub(crate) registered_intersection_observers: Vec<IntersectionObserverRegistration>,
     pub(crate) cryptographic_nonce: String,
+
+    /// <https://drafts.csswg.org/css-shadow-parts/#element-forwarded-part-name-list>
+    pub(crate) forwarded_part_names: Vec<(String, String)>,
+
+    /// <https://drafts.csswg.org/css-shadow-parts/#dom-element-part>
+    pub(crate) part: MutNullableDom<DOMTokenList>,
 }

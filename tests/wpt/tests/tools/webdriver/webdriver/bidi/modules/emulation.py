@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Union
+from typing import Any, Dict, List, Literal, Mapping, MutableMapping, Optional, \
+    Union
 
 from ._module import BidiModule, command
 from ..undefined import UNDEFINED, Undefined
@@ -45,6 +46,73 @@ class Emulation(BidiModule):
             params["coordinates"] = coordinates
         if error is not None:
             params["error"] = error
+        if contexts is not None:
+            params["contexts"] = contexts
+        if user_contexts is not None:
+            params["userContexts"] = user_contexts
+
+        return params
+
+    @command
+    def set_locale_override(
+        self,
+        locale: Union[str, None],
+        contexts: Optional[List[str]] = None,
+        user_contexts: Optional[List[str]] = None,
+    ) -> Mapping[str, Any]:
+        params: MutableMapping[str, Any] = {
+            "locale": locale
+        }
+
+        if contexts is not None:
+            params["contexts"] = contexts
+        if user_contexts is not None:
+            params["userContexts"] = user_contexts
+
+        return params
+
+    @command
+    def set_scripting_enabled(
+            self,
+            enabled: Literal[False, None],
+            contexts: Union[List[str], Undefined] = UNDEFINED,
+            user_contexts: Union[List[str], Undefined] = UNDEFINED,
+    ) -> Mapping[str, Any]:
+        return {
+            "enabled": enabled,
+            "contexts": contexts,
+            "userContexts": user_contexts,
+        }
+
+    @command
+    def set_screen_orientation_override(
+        self,
+        screen_orientation:Dict[str, Any],
+        contexts: Optional[List[str]] = None,
+        user_contexts: Optional[List[str]] = None,
+    ) -> Mapping[str, Any]:
+        params: MutableMapping[str, Any] = {
+            "screenOrientation": screen_orientation
+        }
+
+        if contexts is not None:
+            params["contexts"] = contexts
+        if user_contexts is not None:
+            params["userContexts"] = user_contexts
+
+        return params
+
+    @command
+    def set_timezone_override(
+            self,
+            timezone: Union[str, None],
+            contexts: Optional[List[str]] = None,
+            user_contexts: Optional[List[str]] = None,
+    ) -> Mapping[str, Any]:
+        params: MutableMapping[str, Any] = {
+            "timezone": timezone
+        }
+
         if contexts is not None:
             params["contexts"] = contexts
         if user_contexts is not None:

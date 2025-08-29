@@ -16,11 +16,11 @@ use js::jsapi::{
     GetFunctionRealm, GetNonCCWObjectGlobal, GetRealmGlobalOrNull, GetWellKnownSymbol,
     HandleObject as RawHandleObject, IsSharableCompartment, IsSystemCompartment,
     JS_AtomizeAndPinString, JS_GetFunctionObject, JS_GetProperty, JS_IterateCompartments,
-    JS_NewFunction, JS_NewGlobalObject, JS_NewObject, JS_NewPlainObject, JS_NewStringCopyN,
-    JS_SetReservedSlot, JS_WrapObject, JSAutoRealm, JSClass, JSClassOps, JSContext,
-    JSFUN_CONSTRUCTOR, JSFunctionSpec, JSObject, JSPROP_PERMANENT, JSPROP_READONLY,
-    JSPROP_RESOLVING, JSPropertySpec, JSString, JSTracer, ObjectOps, OnNewGlobalHookOption,
-    SymbolCode, TrueHandleValue, Value, jsid,
+    JS_NewFunction, JS_NewGlobalObject, JS_NewObject, JS_NewStringCopyN, JS_SetReservedSlot,
+    JS_SetTrustedPrincipals, JS_WrapObject, JSAutoRealm, JSClass, JSClassOps, JSContext,
+    JSFUN_CONSTRUCTOR, JSFunctionSpec, JSObject, JSPROP_ENUMERATE, JSPROP_PERMANENT,
+    JSPROP_READONLY, JSPROP_RESOLVING, JSPropertySpec, JSString, JSTracer, ObjectOps,
+    OnNewGlobalHookOption, SymbolCode, TrueHandleValue, Value, jsid,
 };
 use js::jsval::{JSVal, NullValue, PrivateValue};
 use js::rust::wrappers::{
@@ -142,15 +142,33 @@ pub(crate) unsafe fn create_global_object<D: DomTypes>(
     trace: TraceHook,
     mut rval: MutableHandleObject,
     origin: &MutableOrigin,
+    use_system_compartment: bool,
 ) {
     assert!(rval.is_null());
 
     let mut options = RealmOptions::default();
     options.creationOptions_.traceGlobal_ = Some(trace);
     options.creationOptions_.sharedMemoryAndAtomics_ = false;
-    select_compartment(cx, &mut options);
+    if use_system_compartment {
+        options.creationOptions_.compSpec_ = CompartmentSpecifier::NewCompartmentAndZone;
+        options.creationOptions_.__bindgen_anon_1.comp_ = std::ptr::null_mut();
+    } else {
+        select_compartment(cx, &mut options);
+    }
 
+    // “System or addon” principals control JIT policy (IsBaselineJitEnabled, IsIonEnabled) and WASM policy
+    // (IsSimdPrivilegedContext, HasSupport). This is unrelated to the concept of “system” compartments, though WASM
+    // HasSupport describes checking this flag as “check trusted principals”, which seems to be a mistake.
+    // Servo currently creates all principals as non-system-or-addon principals.
     let principal = ServoJSPrincipals::new::<D>(origin);
+    if use_system_compartment {
+        // “System” compartments are those that have all “system” realms, which in turn are those that were
+        // created with the runtime’s global “trusted” principals. This influences the IsSystemCompartment() check
+        // in select_compartment() below [1], preventing compartment reuse in either direction between this global
+        // and any globals created with `use_system_compartment` set to false.
+        // [1] IsSystemCompartment() → Realm::isSystem() → Realm::isSystem_ → principals == trustedPrincipals()
+        JS_SetTrustedPrincipals(*cx, principal.as_raw());
+    }
 
     rval.set(JS_NewGlobalObject(
         *cx,
@@ -473,7 +491,11 @@ fn create_unscopable_object(cx: SafeJSContext, names: &[&CStr], mut rval: Mutabl
     assert!(!names.is_empty());
     assert!(rval.is_null());
     unsafe {
-        rval.set(JS_NewPlainObject(*cx));
+        rval.set(JS_NewObjectWithGivenProto(
+            *cx,
+            ptr::null(),
+            HandleObject::null(),
+        ));
         assert!(!rval.is_null());
         for &name in names {
             assert!(JS_DefineProperty(
@@ -481,7 +503,7 @@ fn create_unscopable_object(cx: SafeJSContext, names: &[&CStr], mut rval: Mutabl
                 rval.handle(),
                 name.as_ptr(),
                 HandleValue::from_raw(TrueHandleValue),
-                JSPROP_READONLY as u32,
+                JSPROP_ENUMERATE as u32,
             ));
         }
     }

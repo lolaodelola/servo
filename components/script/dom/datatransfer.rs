@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::rust::{HandleObject, MutableHandleValue};
+use net_traits::image_cache::Image;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::DataTransferBinding::DataTransferMethods;
@@ -84,7 +85,7 @@ impl DataTransfer {
         Self::new_with_proto(window, None, can_gc, data_store)
     }
 
-    pub(crate) fn data_store(&self) -> Option<Ref<DragDataStore>> {
+    pub(crate) fn data_store(&self) -> Option<Ref<'_, DragDataStore>> {
         Ref::filter_map(self.data_store.borrow(), |data_store| data_store.as_ref()).ok()
     }
 }
@@ -155,7 +156,10 @@ impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
 
         // Step 3
         if let Some(image) = image.downcast::<HTMLImageElement>() {
-            data_store.set_bitmap(image.image_data(), x, y);
+            match image.image_data().as_ref().and_then(Image::as_raster_image) {
+                Some(image) => data_store.set_bitmap(Some(image), x, y),
+                None => warn!("Vector images are not yet supported in setDragImage"),
+            }
         }
     }
 
@@ -201,7 +205,7 @@ impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
             // Step 9 If convert-to-URL is true, then parse result as appropriate for text/uri-list data,
             // and then set result to the first URL from the list, if any, or the empty string otherwise.
             if convert_to_url {
-                //TODO parse uri-list as [RFC2483]
+                // TODO parse uri-list as [RFC2483]
             }
 
             // Step 10 Return result.

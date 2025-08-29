@@ -5,9 +5,10 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crossbeam_channel::Receiver;
 use dpi::PhysicalSize;
+use embedder_traits::webdriver::WebDriverSenders;
 use ipc_channel::ipc::IpcSender;
-use keyboard_types::{CompositionEvent, CompositionState};
 use log::{debug, error, info, warn};
 use raw_window_handle::{RawWindowHandle, WindowHandle};
 use servo::base::id::WebViewId;
@@ -16,15 +17,17 @@ use servo::servo_geometry::DeviceIndependentPixel;
 use servo::webrender_api::ScrollLocation;
 use servo::webrender_api::units::{DeviceIntRect, DeviceIntSize, DevicePixel};
 use servo::{
-    AllowOrDenyRequest, ContextMenuResult, ImeEvent, InputEvent, InputMethodType, Key, KeyState,
-    KeyboardEvent, LoadStatus, MediaSessionActionType, MediaSessionEvent, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NavigationRequest, PermissionRequest,
-    RenderingContext, ScreenGeometry, Servo, ServoDelegate, ServoError, SimpleDialog, TouchEvent,
-    TouchEventType, TouchId, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+    AllowOrDenyRequest, CompositionEvent, CompositionState, ContextMenuResult, ImeEvent,
+    InputEvent, InputMethodType, Key, KeyState, KeyboardEvent, LoadStatus, MediaSessionActionType,
+    MediaSessionEvent, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, NamedKey,
+    NavigationRequest, PermissionRequest, RenderingContext, ScreenGeometry, Servo, ServoDelegate,
+    ServoError, SimpleDialog, TouchEvent, TouchEventType, TouchId, WebDriverCommandMsg, WebView,
+    WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
 use url::Url;
 
 use crate::egl::host_trait::HostTrait;
+use crate::output_image::save_output_image_if_necessary;
 use crate::prefs::ServoShellPreferences;
 
 #[derive(Clone, Debug)]
@@ -72,6 +75,10 @@ pub struct RunningAppState {
     inner: RefCell<RunningAppStateInner>,
     /// servoshell specific preferences created during startup of the application.
     servoshell_preferences: ServoShellPreferences,
+    /// A [`Receiver`] for receiving commands from a running WebDriver server, if WebDriver
+    /// was enabled.
+    webdriver_receiver: Option<Receiver<WebDriverCommandMsg>>,
+    webdriver_senders: RefCell<WebDriverSenders>,
 }
 
 struct RunningAppStateInner {
@@ -123,13 +130,12 @@ impl ServoDelegate for ServoShellServoDelegate {
 impl WebViewDelegate for RunningAppState {
     fn screen_geometry(&self, _webview: WebView) -> Option<ScreenGeometry> {
         let coord = self.callbacks.coordinates.borrow();
-        let offset = coord.origin();
         let available_size = coord.size();
         let screen_size = coord.size();
         Some(ScreenGeometry {
             size: screen_size,
             available_size,
-            offset,
+            window_rect: DeviceIntRect::from_origin_and_size(coord.origin(), coord.size()),
         })
     }
 
@@ -152,6 +158,24 @@ impl WebViewDelegate for RunningAppState {
         self.callbacks
             .host_callbacks
             .notify_load_status_changed(load_status);
+
+        #[cfg(feature = "tracing")]
+        if load_status == LoadStatus::Complete {
+            #[cfg(feature = "tracing-hitrace")]
+            let (snd, recv) = ipc_channel::ipc::channel().expect("Could not create channel");
+            self.servo.create_memory_report(snd);
+            std::thread::spawn(move || {
+                let result = recv.recv().expect("Could not get memory report");
+                let reports = result
+                    .results
+                    .first()
+                    .expect("We should have some memory report");
+                for report in &reports.reports {
+                    let path = String::from("servo_memory_profiling:") + &report.path.join("/");
+                    hitrace::trace_metric_str(&path, report.size as i64);
+                }
+            });
+        }
     }
 
     fn notify_closed(&self, webview: WebView) {
@@ -289,6 +313,7 @@ impl RunningAppState {
         servo: Servo,
         callbacks: Rc<ServoWindowCallbacks>,
         servoshell_preferences: ServoShellPreferences,
+        webdriver_receiver: Option<Receiver<WebDriverCommandMsg>>,
     ) -> Rc<Self> {
         let initial_url = initial_url.and_then(|string| Url::parse(&string).ok());
         let initial_url = initial_url
@@ -306,6 +331,8 @@ impl RunningAppState {
             servo,
             callbacks,
             servoshell_preferences,
+            webdriver_receiver,
+            webdriver_senders: RefCell::default(),
             inner: RefCell::new(RunningAppStateInner {
                 need_present: false,
                 context_menu_sender: None,
@@ -317,11 +344,11 @@ impl RunningAppState {
             }),
         });
 
-        app_state.new_toplevel_webview(initial_url);
+        app_state.create_and_focus_toplevel_webview(initial_url);
         app_state
     }
 
-    pub(crate) fn new_toplevel_webview(self: &Rc<Self>, url: Url) {
+    pub(crate) fn create_and_focus_toplevel_webview(self: &Rc<Self>, url: Url) {
         let webview = WebViewBuilder::new(&self.servo)
             .url(url)
             .hidpi_scale_factor(self.inner().hidpi_scale_factor)
@@ -337,11 +364,20 @@ impl RunningAppState {
         self.inner_mut().webviews.insert(webview.id(), webview);
     }
 
-    fn inner(&self) -> Ref<RunningAppStateInner> {
+    /// The focused webview will not be immediately valid via `active_webview()`
+    pub(crate) fn focus_webview(&self, id: WebViewId) {
+        if let Some(webview) = self.inner().webviews.get(&id) {
+            webview.focus();
+        } else {
+            error!("We could not find the webview with this id {id}");
+        }
+    }
+
+    fn inner(&self) -> Ref<'_, RunningAppStateInner> {
         self.inner.borrow()
     }
 
-    fn inner_mut(&self) -> RefMut<RunningAppStateInner> {
+    fn inner_mut(&self) -> RefMut<'_, RunningAppStateInner> {
         self.inner.borrow_mut()
     }
 
@@ -353,14 +389,14 @@ impl RunningAppState {
         Ok(webview_id)
     }
 
-    fn newest_webview(&self) -> Option<WebView> {
+    pub(crate) fn newest_webview(&self) -> Option<WebView> {
         self.inner()
             .creation_order
             .last()
             .and_then(|id| self.inner().webviews.get(id).cloned())
     }
 
-    fn active_webview(&self) -> WebView {
+    pub(crate) fn active_webview(&self) -> WebView {
         self.inner()
             .focused_webview_id
             .and_then(|id| self.inner().webviews.get(&id).cloned())
@@ -446,48 +482,44 @@ impl RunningAppState {
         self.perform_updates();
     }
 
-    /// Start scrolling.
-    /// x/y are scroll coordinates.
-    /// dx/dy are scroll deltas.
-    #[cfg(not(target_env = "ohos"))]
-    pub fn scroll_start(&self, dx: f32, dy: f32, x: i32, y: i32) {
-        let delta = Vector2D::new(dx, dy);
-        let scroll_location = ScrollLocation::Delta(delta);
-        self.active_webview().notify_scroll_event(
-            scroll_location,
-            Point2D::new(x, y),
-            TouchEventType::Down,
-        );
-        self.perform_updates();
-    }
-
     /// Scroll.
     /// x/y are scroll coordinates.
     /// dx/dy are scroll deltas.
     pub fn scroll(&self, dx: f32, dy: f32, x: i32, y: i32) {
         let delta = Vector2D::new(dx, dy);
         let scroll_location = ScrollLocation::Delta(delta);
-        self.active_webview().notify_scroll_event(
-            scroll_location,
-            Point2D::new(x, y),
-            TouchEventType::Move,
-        );
+        self.active_webview()
+            .notify_scroll_event(scroll_location, Point2D::new(x, y));
         self.perform_updates();
     }
 
-    /// End scrolling.
-    /// x/y are scroll coordinates.
-    /// dx/dy are scroll deltas.
-    #[cfg(not(target_env = "ohos"))]
-    pub fn scroll_end(&self, dx: f32, dy: f32, x: i32, y: i32) {
-        let delta = Vector2D::new(dx, dy);
-        let scroll_location = ScrollLocation::Delta(delta);
-        self.active_webview().notify_scroll_event(
-            scroll_location,
-            Point2D::new(x, y),
-            TouchEventType::Up,
-        );
-        self.perform_updates();
+    /// WebDriver message handling methods
+    pub(crate) fn webdriver_receiver(&self) -> Option<&Receiver<WebDriverCommandMsg>> {
+        self.webdriver_receiver.as_ref()
+    }
+
+    pub fn handle_webdriver_messages(self: &Rc<Self>) {
+        if let Some(webdriver_receiver) = &self.webdriver_receiver {
+            while let Ok(msg) = webdriver_receiver.try_recv() {
+                match msg {
+                    WebDriverCommandMsg::LoadUrl(webview_id, url, load_status_sender) => {
+                        info!(
+                            "(Not Implemented) Loading URL in webview {}: {}",
+                            webview_id, url
+                        );
+                    },
+                    WebDriverCommandMsg::NewWebView(response_sender, load_status_sender) => {
+                        info!("(Not Implemented) Creating new webview");
+                    },
+                    WebDriverCommandMsg::FocusWebView(webview_id, response_sender) => {
+                        info!("(Not Implemented) Focusing webview {}", webview_id);
+                    },
+                    _ => {
+                        info!("(Not Implemented) Received WebDriver command: {:?}", msg);
+                    },
+                }
+            }
+        }
     }
 
     /// Touch event: press down
@@ -598,33 +630,39 @@ impl RunningAppState {
     }
 
     pub fn key_down(&self, key: Key) {
-        let key_event = KeyboardEvent {
-            state: KeyState::Down,
-            key,
-            ..KeyboardEvent::default()
-        };
+        let key_event = KeyboardEvent::from_state_and_key(KeyState::Down, key);
         self.active_webview()
             .notify_input_event(InputEvent::Keyboard(key_event));
         self.perform_updates();
     }
 
     pub fn key_up(&self, key: Key) {
-        let key_event = KeyboardEvent {
-            state: KeyState::Up,
-            key,
-            ..KeyboardEvent::default()
-        };
+        let key_event = KeyboardEvent::from_state_and_key(KeyState::Up, key);
         self.active_webview()
             .notify_input_event(InputEvent::Keyboard(key_event));
         self.perform_updates();
     }
 
     pub fn ime_insert_text(&self, text: String) {
-        self.active_webview()
-            .notify_input_event(InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
+        // In OHOS, we get empty text after the intended text.
+        if text.is_empty() {
+            return;
+        }
+        let active_webview = self.active_webview();
+        active_webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
+            KeyState::Down,
+            Key::Named(NamedKey::Process),
+        )));
+        active_webview.notify_input_event(InputEvent::Ime(ImeEvent::Composition(
+            CompositionEvent {
                 state: CompositionState::End,
                 data: text,
-            })));
+            },
+        )));
+        active_webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
+            KeyState::Up,
+            Key::Named(NamedKey::Process),
+        )));
         self.perform_updates();
     }
 
@@ -684,8 +722,14 @@ impl RunningAppState {
     pub fn present_if_needed(&self) {
         if self.inner().need_present {
             self.inner_mut().need_present = false;
-            self.active_webview().paint();
+            if !self.active_webview().paint() {
+                return;
+            }
+            save_output_image_if_necessary(&self.servoshell_preferences, &self.rendering_context);
             self.rendering_context.present();
+            if self.servoshell_preferences.exit_after_stable_image {
+                self.request_shutdown();
+            }
         }
     }
 }
@@ -696,6 +740,7 @@ pub(crate) struct XrDiscoveryWebXrRegistry {
 }
 
 #[cfg(feature = "webxr")]
+#[cfg_attr(target_env = "ohos", allow(dead_code))]
 impl XrDiscoveryWebXrRegistry {
     pub(crate) fn new(xr_discovery: Option<servo::webxr::Discovery>) -> Self {
         Self {

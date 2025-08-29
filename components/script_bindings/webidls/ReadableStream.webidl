@@ -4,7 +4,7 @@
 
 // https://streams.spec.whatwg.org/#readablestream
 
-[Exposed=*] // [Transferable] - See Bug 1562065
+[Exposed=*, Transferable]
 interface _ReadableStream {
   [Throws]
   constructor(optional object underlyingSource, optional QueuingStrategy strategy = {});
@@ -56,5 +56,5 @@ dictionary StreamPipeOptions {
   boolean preventClose = false;
   boolean preventAbort = false;
   boolean preventCancel = false;
-  // AbortSignal signal;
+  AbortSignal signal;
 };

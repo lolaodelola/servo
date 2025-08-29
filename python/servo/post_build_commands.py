@@ -11,8 +11,9 @@ import json
 import os
 import os.path as path
 import subprocess
+from subprocess import CompletedProcess
 from shutil import copy2
-from typing import List
+from typing import Any
 
 import mozdebug
 
@@ -30,12 +31,12 @@ from servo.command_base import (
     check_call,
     is_linux,
 )
-
+from servo.platform.build_target import is_android
 
 ANDROID_APP_NAME = "org.servo.servoshell"
 
 
-def read_file(filename, if_exists=False):
+def read_file(filename: str, if_exists: bool = False) -> str | None:
     if if_exists and not path.exists(filename):
         return None
     with open(filename) as f:
@@ -43,7 +44,7 @@ def read_file(filename, if_exists=False):
 
 
 # Copied from Python 3.3+'s shlex.quote()
-def shell_quote(arg):
+def shell_quote(arg: str) -> str:
     # use single quotes, and put single quotes into double quotes
     # the string $'b is then quoted as '$'"'"'b'
     return "'" + arg.replace("'", "'\"'\"'") + "'"
@@ -51,39 +52,50 @@ def shell_quote(arg):
 
 @CommandProvider
 class PostBuildCommands(CommandBase):
-    @Command('run',
-             description='Run Servo',
-             category='post-build')
-    @CommandArgument('--android', action='store_true', default=None,
-                     help='Run on an Android device through `adb shell`')
-    @CommandArgument('--emulator',
-                     action='store_true',
-                     help='For Android, run in the only emulated device')
-    @CommandArgument('--usb',
-                     action='store_true',
-                     help='For Android, run in the only USB device')
-    @CommandArgument('--debugger', action='store_true',
-                     help='Enable the debugger. Not specifying a '
-                          '--debugger-cmd option will result in the default '
-                          'debugger being used. The following arguments '
-                          'have no effect without this.')
-    @CommandArgument('--debugger-cmd', default=None, type=str,
-                     help='Name of debugger to use.')
-    @CommandArgument('--headless', '-z', action='store_true',
-                     help='Launch in headless mode')
-    @CommandArgument('--software', '-s', action='store_true',
-                     help='Launch with software rendering')
+    @Command("run", description="Run Servo", category="post-build")
     @CommandArgument(
-        'params', nargs='...',
-        help="Command-line arguments to be passed through to Servo")
+        "--android", action="store_true", default=None, help="Run on an Android device through `adb shell`"
+    )
+    @CommandArgument("--emulator", action="store_true", help="For Android, run in the only emulated device")
+    @CommandArgument("--usb", action="store_true", help="For Android, run in the only USB device")
+    @CommandArgument(
+        "--debugger",
+        action="store_true",
+        help="Enable the debugger. Not specifying a "
+        "--debugger-cmd option will result in the default "
+        "debugger being used. The following arguments "
+        "have no effect without this.",
+    )
+    @CommandArgument("--debugger-cmd", default=None, type=str, help="Name of debugger to use.")
+    @CommandArgument("--headless", "-z", action="store_true", help="Launch in headless mode")
+    @CommandArgument("--software", "-s", action="store_true", help="Launch with software rendering")
+    @CommandArgument("params", nargs="...", help="Command-line arguments to be passed through to Servo")
     @CommandBase.common_command_arguments(binary_selection=True)
     @CommandBase.allow_target_configuration
-    def run(self, servo_binary: str, params, debugger=False, debugger_cmd=None,
-            headless=False, software=False, emulator=False, usb=False):
+    def run(
+        self,
+        servo_binary: str,
+        params: list[str],
+        debugger: bool = False,
+        debugger_cmd: str | None = None,
+        headless: bool = False,
+        software: bool = False,
+        emulator: bool = False,
+        usb: bool = False,
+    ) -> int | None:
         return self._run(servo_binary, params, debugger, debugger_cmd, headless, software, emulator, usb)
 
-    def _run(self, servo_binary: str, params, debugger=False, debugger_cmd=None,
-             headless=False, software=False, emulator=False, usb=False):
+    def _run(
+        self,
+        servo_binary: str,
+        params: list[str],
+        debugger: bool = False,
+        debugger_cmd: str | None = None,
+        headless: bool = False,
+        software: bool = False,
+        emulator: bool = False,
+        usb: bool = False,
+    ) -> int | None:
         env = self.build_env()
         env["RUST_BACKTRACE"] = "1"
         if software:
@@ -91,14 +103,14 @@ class PostBuildCommands(CommandBase):
                 print("Software rendering is only supported on Linux at the moment.")
                 return
 
-            env['LIBGL_ALWAYS_SOFTWARE'] = "1"
+            env["LIBGL_ALWAYS_SOFTWARE"] = "1"
         os.environ.update(env)
 
         # Make --debugger-cmd imply --debugger
         if debugger_cmd:
             debugger = True
 
-        if self.is_android():
+        if is_android(self.target):
             if debugger:
                 print("Android on-device debugging is not supported by mach yet. See")
                 print("https://github.com/servo/servo/wiki/Building-for-Android#debugging-on-device")
@@ -119,7 +131,7 @@ class PostBuildCommands(CommandBase):
                 "sleep 0.5",
                 f"echo Servo PID: $(pidof {ANDROID_APP_NAME})",
                 f"logcat --pid=$(pidof {ANDROID_APP_NAME})",
-                "exit"
+                "exit",
             ]
             args = [self.android_adb_path(env)]
             if emulator and usb:
@@ -130,13 +142,13 @@ class PostBuildCommands(CommandBase):
             if usb:
                 args += ["-d"]
             shell = subprocess.Popen(args + ["shell"], stdin=subprocess.PIPE)
-            shell.communicate(bytes("\n".join(script) + "\n", "utf8"))
+            shell.communicate("\n".join(script) + "\n")
             return shell.wait()
 
         args = [servo_binary]
 
         if headless:
-            args.append('-z')
+            args.append("-z")
 
         # Borrowed and modified from:
         # http://hg.mozilla.org/mozilla-central/file/c9cfa9b91dea/python/mozbuild/mozbuild/mach_commands.py#l883
@@ -144,8 +156,7 @@ class PostBuildCommands(CommandBase):
             if not debugger_cmd:
                 # No debugger name was provided. Look for the default ones on
                 # current OS.
-                debugger_cmd = mozdebug.get_default_debugger_name(
-                    mozdebug.DebuggerSearch.KeepLooking)
+                debugger_cmd = mozdebug.get_default_debugger_name(mozdebug.DebuggerSearch.KeepLooking)
 
             debugger_info = mozdebug.get_debugger_info(debugger_cmd)
             if not debugger_info:
@@ -153,17 +164,17 @@ class PostBuildCommands(CommandBase):
                 return 1
 
             command = debugger_info.path
-            if debugger_cmd == 'gdb' or debugger_cmd == 'lldb':
-                rust_command = 'rust-' + debugger_cmd
+            if debugger_cmd == "gdb" or debugger_cmd == "lldb":
+                rust_command = "rust-" + debugger_cmd
                 try:
-                    subprocess.check_call([rust_command, '--version'], env=env, stdout=open(os.devnull, 'w'))
+                    subprocess.check_call([rust_command, "--version"], env=env, stdout=open(os.devnull, "w"))
                 except (OSError, subprocess.CalledProcessError):
                     pass
                 else:
                     command = rust_command
 
             # Prepend the debugger args.
-            args = ([command] + debugger_info.args + args + params)
+            args = [command] + debugger_info.args + args + params
         else:
             args = args + params
 
@@ -177,36 +188,28 @@ class PostBuildCommands(CommandBase):
             return exception.returncode
         except OSError as exception:
             if exception.errno == 2:
-                print("Servo Binary can't be found! Run './mach build'"
-                      " and try again!")
+                print("Servo Binary can't be found! Run './mach build' and try again!")
             else:
                 raise exception
 
-    @Command('android-emulator',
-             description='Run the Android emulator',
-             category='post-build')
-    @CommandArgument(
-        'args', nargs='...',
-        help="Command-line arguments to be passed through to the emulator")
-    def android_emulator(self, args=None):
+    @Command("android-emulator", description="Run the Android emulator", category="post-build")
+    @CommandArgument("args", nargs="...", help="Command-line arguments to be passed through to the emulator")
+    def android_emulator(self, args: list[str] | None = None) -> int:
         if not args:
+            args = []
             print("AVDs created by `./mach bootstrap-android` are servo-arm and servo-x86.")
         emulator = self.android_emulator_path(self.build_env())
         return subprocess.call([emulator] + args)
 
-    @Command('rr-record',
-             description='Run Servo whilst recording execution with rr',
-             category='post-build')
-    @CommandArgument(
-        'params', nargs='...',
-        help="Command-line arguments to be passed through to Servo")
+    @Command("rr-record", description="Run Servo whilst recording execution with rr", category="post-build")
+    @CommandArgument("params", nargs="...", help="Command-line arguments to be passed through to Servo")
     @CommandBase.common_command_arguments(binary_selection=True)
-    def rr_record(self, servo_binary: str, params=[]):
+    def rr_record(self, servo_binary: str, params: list[str] = []) -> None:
         env = self.build_env()
         env["RUST_BACKTRACE"] = "1"
 
         servo_cmd = [servo_binary] + params
-        rr_cmd = ['rr', '--fatal-errors', 'record']
+        rr_cmd = ["rr", "--fatal-errors", "record"]
         try:
             check_call(rr_cmd + servo_cmd)
         except OSError as e:
@@ -215,26 +218,24 @@ class PostBuildCommands(CommandBase):
             else:
                 raise e
 
-    @Command('rr-replay',
-             description='Replay the most recent execution of Servo that was recorded with rr',
-             category='post-build')
-    def rr_replay(self):
+    @Command(
+        "rr-replay",
+        description="Replay the most recent execution of Servo that was recorded with rr",
+        category="post-build",
+    )
+    def rr_replay(self) -> None:
         try:
-            check_call(['rr', '--fatal-errors', 'replay'])
+            check_call(["rr", "--fatal-errors", "replay"])
         except OSError as e:
             if e.errno == 2:
                 print("rr binary can't be found!")
             else:
                 raise e
 
-    @Command('doc',
-             description='Generate documentation',
-             category='post-build')
-    @CommandArgument(
-        'params', nargs='...',
-        help="Command-line arguments to be passed through to cargo doc")
+    @Command("doc", description="Generate documentation", category="post-build")
+    @CommandArgument("params", nargs="...", help="Command-line arguments to be passed through to cargo doc")
     @CommandBase.common_command_arguments(build_configuration=True, build_type=False)
-    def doc(self, params: List[str], **kwargs):
+    def doc(self, params: list[str], **kwargs: Any) -> CompletedProcess[bytes] | int | None:
         self.ensure_bootstrapped()
 
         docs = path.join(servo.util.get_target_dir(), "doc")

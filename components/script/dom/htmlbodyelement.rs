@@ -55,17 +55,6 @@ impl HTMLBodyElement {
             can_gc,
         )
     }
-
-    /// <https://drafts.csswg.org/cssom-view/#the-html-body-element>
-    pub(crate) fn is_the_html_body_element(&self) -> bool {
-        let self_node = self.upcast::<Node>();
-        let root_elem = self.upcast::<Element>().root_element();
-        let root_node = root_elem.upcast::<Node>();
-        root_node.is_parent_of(self_node) &&
-            self_node
-                .preceding_siblings()
-                .all(|n| !n.is::<HTMLBodyElement>())
-    }
 }
 
 impl HTMLBodyElementMethods<crate::DomTypeHolder> for HTMLBodyElement {
@@ -208,7 +197,7 @@ impl VirtualMethods for HTMLBodyElement {
                     &local_name!("onunload") => {
                         let source = &**attr.value();
                         let evtarget = window.upcast::<EventTarget>(); // forwarded event
-                        let source_line = 1; //TODO(#9604) obtain current JS execution line
+                        let source_line = 1; // TODO(#9604) obtain current JS execution line
                         evtarget.set_event_handler_uncompiled(
                             window.get_url(),
                             source_line,

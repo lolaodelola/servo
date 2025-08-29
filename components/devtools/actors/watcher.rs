@@ -14,14 +14,18 @@ use std::collections::HashMap;
 use std::net::TcpStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base::id::BrowsingContextId;
 use log::warn;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use servo_url::ServoUrl;
 
 use self::network_parent::{NetworkParentActor, NetworkParentActorMsg};
+use super::breakpoint::BreakpointListActor;
 use super::thread::ThreadActor;
 use super::worker::WorkerMsg;
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::actor::{Actor, ActorError, ActorRegistry};
+use crate::actors::breakpoint::BreakpointListActorMsg;
 use crate::actors::browsing_context::{BrowsingContextActor, BrowsingContextActorMsg};
 use crate::actors::root::RootActor;
 use crate::actors::watcher::target_configuration::{
@@ -30,9 +34,9 @@ use crate::actors::watcher::target_configuration::{
 use crate::actors::watcher::thread_configuration::{
     ThreadConfigurationActor, ThreadConfigurationActorMsg,
 };
-use crate::protocol::JsonPacketStream;
-use crate::resource::ResourceAvailable;
-use crate::{EmptyReplyMsg, StreamId, WorkerActor};
+use crate::protocol::{ClientRequest, JsonPacketStream};
+use crate::resource::{ResourceArrayType, ResourceAvailable};
+use crate::{EmptyReplyMsg, IdMap, StreamId, WorkerActor};
 
 pub mod network_parent;
 pub mod target_configuration;
@@ -78,7 +82,7 @@ impl SessionContext {
                 ("local-storage", false),
                 ("session-storage", false),
                 ("platform-message", false),
-                ("network-event", false),
+                ("network-event", true),
                 ("network-event-stacktrace", false),
                 ("reflow", false),
                 ("stylesheet", false),
@@ -148,12 +152,7 @@ struct GetThreadConfigurationActorReply {
 #[serde(rename_all = "camelCase")]
 struct GetBreakpointListActorReply {
     from: String,
-    breakpoint_list: GetBreakpointListActorReplyInner,
-}
-
-#[derive(Serialize)]
-struct GetBreakpointListActorReplyInner {
-    actor: String,
+    breakpoint_list: BreakpointListActorMsg,
 }
 
 #[derive(Serialize)]
@@ -188,7 +187,21 @@ pub struct WatcherActor {
     network_parent: String,
     target_configuration: String,
     thread_configuration: String,
+    breakpoint_list: String,
     session_context: SessionContext,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WillNavigateMessage {
+    #[serde(rename = "browsingContextID")]
+    browsing_context_id: u32,
+    inner_window_id: u32,
+    name: String,
+    time: u128,
+    is_frame_switching: bool,
+    #[serde(rename = "newURI")]
+    new_uri: ServoUrl,
 }
 
 impl Actor for WatcherActor {
@@ -214,15 +227,15 @@ impl Actor for WatcherActor {
     /// - `getThreadConfigurationActor`: The same but with the configuration actor for the thread
     fn handle_message(
         &self,
+        mut request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
+    ) -> Result<(), ActorError> {
         let target = registry.find::<BrowsingContextActor>(&self.browsing_context_actor);
         let root = registry.find::<RootActor>("root");
-        Ok(match msg_type {
+        match msg_type {
             "watchTargets" => {
                 // As per logs we either get targetType as "frame" or "worker"
                 let target_type = msg
@@ -236,9 +249,9 @@ impl Actor for WatcherActor {
                         type_: "target-available-form".into(),
                         target: TargetActorMsg::BrowsingContext(target.encodable()),
                     };
-                    let _ = stream.write_json_packet(&msg);
+                    let _ = request.write_json_packet(&msg);
 
-                    target.frame_update(stream);
+                    target.frame_update(&mut request);
                 } else if target_type == "worker" {
                     for worker_name in &root.workers {
                         let worker = registry.find::<WorkerActor>(worker_name);
@@ -247,11 +260,10 @@ impl Actor for WatcherActor {
                             type_: "target-available-form".into(),
                             target: TargetActorMsg::Worker(worker.encodable()),
                         };
-                        let _ = stream.write_json_packet(&worker_msg);
+                        let _ = request.write_json_packet(&worker_msg);
                     }
                 } else {
                     warn!("Unexpected target_type: {}", target_type);
-                    return Ok(ActorMessageStatus::Ignored);
                 }
 
                 // Messages that contain a `type` field are used to send event callbacks, but they
@@ -259,15 +271,14 @@ impl Actor for WatcherActor {
                 // extra empty packet to the devtools host to inform that we successfully received
                 // and processed the message so that it can continue
                 let msg = EmptyReplyMsg { from: self.name() };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
             "watchResources" => {
                 let Some(resource_types) = msg.get("resourceTypes") else {
-                    return Ok(ActorMessageStatus::Ignored);
+                    return Err(ActorError::MissingParameter);
                 };
                 let Some(resource_types) = resource_types.as_array() else {
-                    return Ok(ActorMessageStatus::Ignored);
+                    return Err(ActorError::BadParameterType);
                 };
 
                 for resource in resource_types {
@@ -291,46 +302,49 @@ impl Actor for WatcherActor {
                                     title: Some(target.title.borrow().clone()),
                                     url: Some(target.url.borrow().clone()),
                                 };
-                                target.resource_available(event, "document-event".into(), stream);
+                                target.resource_array(
+                                    event,
+                                    "document-event".into(),
+                                    ResourceArrayType::Available,
+                                    &mut request,
+                                );
                             }
                         },
                         "source" => {
                             let thread_actor = registry.find::<ThreadActor>(&target.thread);
-                            let sources = thread_actor.source_manager.sources();
-                            target.resources_available(
-                                sources.iter().collect(),
+                            target.resources_array(
+                                thread_actor.source_manager.source_forms(registry),
                                 "source".into(),
-                                stream,
+                                ResourceArrayType::Available,
+                                &mut request,
                             );
 
                             for worker_name in &root.workers {
                                 let worker = registry.find::<WorkerActor>(worker_name);
                                 let thread = registry.find::<ThreadActor>(&worker.thread);
-                                let worker_sources = thread.source_manager.sources();
 
-                                worker.resources_available(
-                                    worker_sources.iter().collect(),
+                                worker.resources_array(
+                                    thread.source_manager.source_forms(registry),
                                     "source".into(),
-                                    stream,
+                                    ResourceArrayType::Available,
+                                    &mut request,
                                 );
                             }
                         },
                         "console-message" | "error-message" => {},
+                        "network-event" => {},
                         _ => warn!("resource {} not handled yet", resource),
                     }
-
-                    let msg = EmptyReplyMsg { from: self.name() };
-                    let _ = stream.write_json_packet(&msg);
                 }
-                ActorMessageStatus::Processed
+                let msg = EmptyReplyMsg { from: self.name() };
+                request.reply_final(&msg)?
             },
             "getParentBrowsingContextID" => {
                 let msg = GetParentBrowsingContextIDReply {
                     from: self.name(),
                     browsing_context_id: target.browsing_context_id.value(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
             "getNetworkParentActor" => {
                 let network_parent = registry.find::<NetworkParentActor>(&self.network_parent);
@@ -338,8 +352,7 @@ impl Actor for WatcherActor {
                     from: self.name(),
                     network: network_parent.encodable(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
             "getTargetConfigurationActor" => {
                 let target_configuration =
@@ -348,8 +361,7 @@ impl Actor for WatcherActor {
                     from: self.name(),
                     configuration: target_configuration.encodable(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
             "getThreadConfigurationActor" => {
                 let thread_configuration =
@@ -358,20 +370,24 @@ impl Actor for WatcherActor {
                     from: self.name(),
                     configuration: thread_configuration.encodable(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
             "getBreakpointListActor" => {
-                let _ = stream.write_json_packet(&GetBreakpointListActorReply {
+                let breakpoint_list = registry.find::<BreakpointListActor>(&self.breakpoint_list);
+                request.reply_final(&GetBreakpointListActorReply {
                     from: self.name(),
-                    breakpoint_list: GetBreakpointListActorReplyInner {
-                        actor: registry.new_name("breakpoint-list"),
-                    },
-                });
-                ActorMessageStatus::Processed
+                    breakpoint_list: breakpoint_list.encodable(),
+                })?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
+    }
+}
+
+impl ResourceAvailable for WatcherActor {
+    fn actor_name(&self) -> String {
+        self.name.clone()
     }
 }
 
@@ -386,6 +402,7 @@ impl WatcherActor {
             TargetConfigurationActor::new(actors.new_name("target-configuration"));
         let thread_configuration =
             ThreadConfigurationActor::new(actors.new_name("thread-configuration"));
+        let breakpoint_list = BreakpointListActor::new(actors.new_name("breakpoint-list"));
 
         let watcher = Self {
             name: actors.new_name("watcher"),
@@ -393,12 +410,14 @@ impl WatcherActor {
             network_parent: network_parent.name(),
             target_configuration: target_configuration.name(),
             thread_configuration: thread_configuration.name(),
+            breakpoint_list: breakpoint_list.name(),
             session_context,
         };
 
         actors.register(Box::new(network_parent));
         actors.register(Box::new(target_configuration));
         actors.register(Box::new(thread_configuration));
+        actors.register(Box::new(breakpoint_list));
 
         watcher
     }
@@ -410,6 +429,35 @@ impl WatcherActor {
                 resources: self.session_context.supported_resources.clone(),
                 targets: self.session_context.supported_targets.clone(),
             },
+        }
+    }
+
+    pub fn emit_will_navigate(
+        &self,
+        browsing_context_id: BrowsingContextId,
+        url: ServoUrl,
+        connections: &mut Vec<TcpStream>,
+        id_map: &mut IdMap,
+    ) {
+        let msg = WillNavigateMessage {
+            browsing_context_id: id_map.browsing_context_id(browsing_context_id).value(),
+            inner_window_id: 0, // TODO: set this to the correct value
+            name: "will-navigate".to_string(),
+            time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            is_frame_switching: false, // TODO: Implement frame switching
+            new_uri: url,
+        };
+
+        for stream in connections {
+            self.resource_array(
+                msg.clone(),
+                "document-event".to_string(),
+                ResourceArrayType::Available,
+                stream,
+            );
         }
     }
 }

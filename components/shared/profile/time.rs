@@ -66,7 +66,7 @@ pub enum ProfilerCategory {
     Compositing = 0x00,
 
     /// The script thread is doing layout work.
-    LayoutPerform = 0x10,
+    Layout = 0x10,
 
     ImageSaving = 0x51,
     ScriptAttachLayout = 0x60,
@@ -111,6 +111,8 @@ pub enum ProfilerCategory {
     ScriptPortMessage = 0x7e,
     ScriptWebGPUMsg = 0x7f,
 
+    ScriptDatabaseAccessEvent = 0x80,
+
     /// Web performance metrics.
     TimeToFirstPaint = 0x90,
     TimeToFirstContentfulPaint = 0x91,
@@ -124,10 +126,11 @@ impl ProfilerCategory {
     pub const fn variant_name(&self) -> &'static str {
         match self {
             ProfilerCategory::Compositing => "Compositing",
-            ProfilerCategory::LayoutPerform => "LayoutPerform",
+            ProfilerCategory::Layout => "Layout",
             ProfilerCategory::ImageSaving => "ImageSaving",
             ProfilerCategory::ScriptAttachLayout => "ScriptAttachLayout",
             ProfilerCategory::ScriptConstellationMsg => "ScriptConstellationMsg",
+            ProfilerCategory::ScriptDatabaseAccessEvent => "ScriptDatabaseAccessEvent",
             ProfilerCategory::ScriptDevtoolsMsg => "ScriptDevtoolsMsg",
             ProfilerCategory::ScriptDocumentEvent => "ScriptDocumentEvent",
             ProfilerCategory::ScriptEvaluate => "ScriptEvaluate",

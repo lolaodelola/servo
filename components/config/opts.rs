@@ -7,7 +7,7 @@
 
 use std::default::Default;
 use std::path::PathBuf;
-use std::sync::{LazyLock, RwLock, RwLockReadGuard};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use servo_url::ServoUrl;
@@ -44,12 +44,12 @@ pub struct Opts {
     /// behavior for debugging purposes.
     pub debug: DebugOptions,
 
-    /// `None` to disable WebDriver or `Some` with a port number to start a server to listen to
-    /// remote WebDriver commands.
-    pub webdriver_port: Option<u16>,
-
     /// Whether we're running in multiprocess mode.
     pub multiprocess: bool,
+
+    /// Whether to force using ipc_channel instead of crossbeam_channel in singleprocess mode. Does
+    /// nothing in multiprocess mode.
+    pub force_ipc: bool,
 
     /// Whether we want background hang monitor enabled or not
     pub background_hang_monitor: bool,
@@ -110,6 +110,9 @@ pub struct DebugOptions {
     /// Print the stacking context tree after each layout.
     pub dump_stacking_context_tree: bool,
 
+    /// Print the scroll tree after each layout.
+    pub dump_scroll_tree: bool,
+
     /// Print the display list after each layout.
     pub dump_display_list: bool,
 
@@ -156,6 +159,7 @@ impl DebugOptions {
                 "dump-flow-tree" => self.dump_flow_tree = true,
                 "dump-rule-tree" => self.dump_rule_tree = true,
                 "dump-style-tree" => self.dump_style_tree = true,
+                "dump-scroll-tree" => self.dump_scroll_tree = true,
                 "gc-profile" => self.gc_profile = true,
                 "profile-script-events" => self.profile_script_events = true,
                 "relayout-event" => self.relayout_event = true,
@@ -188,8 +192,8 @@ impl Default for Opts {
             nonincremental_layout: false,
             user_stylesheets: Vec::new(),
             hard_fail: true,
-            webdriver_port: None,
             multiprocess: false,
+            force_ipc: false,
             background_hang_monitor: false,
             random_pipeline_closure_probability: None,
             random_pipeline_closure_seed: None,
@@ -210,13 +214,27 @@ impl Default for Opts {
 // Make Opts available globally. This saves having to clone and pass
 // opts everywhere it is used, which gets particularly cumbersome
 // when passing through the DOM structures.
-static OPTIONS: LazyLock<RwLock<Opts>> = LazyLock::new(|| RwLock::new(Opts::default()));
+static OPTIONS: OnceLock<Opts> = OnceLock::new();
 
-pub fn set_options(opts: Opts) {
-    *OPTIONS.write().unwrap() = opts;
+/// Initialize options.
+///
+/// Should only be called once at process startup.
+/// Must be called before the first call to [get].
+pub fn initialize_options(opts: Opts) {
+    OPTIONS.set(opts).expect("Already initialized");
 }
 
+/// Get the servo options
+///
+/// If the servo options have not been initialized by calling [initialize_options], then the
+/// options will be initialized to default values. Outside of tests the options should
+/// be explicitly initialized.
 #[inline]
-pub fn get() -> RwLockReadGuard<'static, Opts> {
-    OPTIONS.read().unwrap()
+pub fn get() -> &'static Opts {
+    // In unit-tests using default options reduces boilerplate.
+    // We can't use `cfg(test)` since that only is enabled when this crate
+    // is compiled in test mode.
+    // We rely on the `expect` in `initialize_options` to inform us if refactoring
+    // causes a `get` call to move before `initialize_options`.
+    OPTIONS.get_or_init(Default::default)
 }

@@ -1,5 +1,6 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::RefCell;
 use std::error::Error;
@@ -7,8 +8,7 @@ use std::rc::Rc;
 
 use euclid::{Scale, Size2D};
 use servo::{
-    RenderingContext, Servo, ServoBuilder, TouchEventType, WebView, WebViewBuilder,
-    WindowRenderingContext,
+    RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder, WindowRenderingContext,
 };
 use tracing::warn;
 use url::Url;
@@ -58,8 +58,7 @@ impl ::servo::WebViewDelegate for AppState {
             .hidpi_scale_factor(Scale::new(self.window.scale_factor() as f32))
             .delegate(parent_webview.delegate())
             .build();
-        webview.focus();
-        webview.raise_to_top(true);
+        webview.focus_and_raise_to_top(true);
 
         self.webviews.borrow_mut().push(webview.clone());
         Some(webview)
@@ -117,8 +116,7 @@ impl ApplicationHandler<WakerEvent> for App {
                 .delegate(app_state.clone())
                 .build();
 
-            webview.focus();
-            webview.raise_to_top(true);
+            webview.focus_and_raise_to_top(true);
 
             app_state.webviews.borrow_mut().push(webview);
             *self = Self::Running(app_state);
@@ -165,7 +163,6 @@ impl ApplicationHandler<WakerEvent> for App {
                         webview.notify_scroll_event(
                             ScrollLocation::Delta(moved_by),
                             DeviceIntPoint::new(10, 10),
-                            TouchEventType::Down,
                         );
                     }
                 }

@@ -10,7 +10,6 @@ use std::time::Duration;
 use std::{fmt, mem};
 
 use base::id::PipelineId;
-use ipc_channel::ipc::IpcSender;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -18,6 +17,7 @@ use serde::{Deserialize, Serialize};
 pub enum ScriptHangAnnotation {
     AttachLayout,
     ConstellationMsg,
+    DatabaseAccessEvent,
     DevtoolsMsg,
     DocumentEvent,
     FileRead,
@@ -169,7 +169,7 @@ pub trait BackgroundHangMonitorRegister: BackgroundHangMonitorClone + Send {
         component: MonitoredComponentId,
         transient_hang_timeout: Duration,
         permanent_hang_timeout: Duration,
-        exit_signal: Option<Box<dyn BackgroundHangMonitorExitSignal>>,
+        exit_signal: Box<dyn BackgroundHangMonitorExitSignal>,
     ) -> Box<dyn BackgroundHangMonitor>;
 }
 
@@ -207,6 +207,6 @@ pub trait BackgroundHangMonitorExitSignal: Send {
 pub enum BackgroundHangMonitorControlMsg {
     /// Toggle the sampler, with a given sampling rate and max total sampling duration.
     ToggleSampler(Duration, Duration),
-    /// Exit, and propagate the signal to monitored components.
-    Exit(IpcSender<()>),
+    /// Propagate exit signal to monitored components, and shutdown when they have.
+    Exit,
 }

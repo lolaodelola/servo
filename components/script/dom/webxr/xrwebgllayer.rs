@@ -24,10 +24,10 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::webglframebuffer::WebGLFramebuffer;
-use crate::dom::webglobject::WebGLObject;
-use crate::dom::webglrenderingcontext::WebGLRenderingContext;
-use crate::dom::webgltexture::WebGLTexture;
+use crate::dom::webgl::webglframebuffer::WebGLFramebuffer;
+use crate::dom::webgl::webglobject::WebGLObject;
+use crate::dom::webgl::webglrenderingcontext::WebGLRenderingContext;
+use crate::dom::webgl::webgltexture::WebGLTexture;
 use crate::dom::window::Window;
 use crate::dom::xrframe::XRFrame;
 use crate::dom::xrlayer::XRLayer;
@@ -129,10 +129,7 @@ impl XRWebGLLayer {
                 HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) => canvas.get_size(),
                 HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(canvas) => {
                     let size = canvas.get_size();
-                    Size2D::new(
-                        size.width.try_into().unwrap_or(0),
-                        size.height.try_into().unwrap_or(0),
-                    )
+                    Size2D::new(size.width, size.height)
                 },
             };
             Size2D::from_untyped(size)

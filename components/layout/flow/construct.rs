@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::borrow::Cow;
-use std::convert::TryFrom;
 
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use servo_arc::Arc;
@@ -172,11 +171,10 @@ impl BlockContainer {
             if let Some((marker_info, marker_contents)) = crate::lists::make_marker(context, info) {
                 match marker_info.style.clone_list_style_position() {
                     ListStylePosition::Inside => {
-                        builder.handle_list_item_marker_inside(&marker_info, info, marker_contents)
+                        builder.handle_list_item_marker_inside(&marker_info, marker_contents)
                     },
                     ListStylePosition::Outside => builder.handle_list_item_marker_outside(
                         &marker_info,
-                        info,
                         marker_contents,
                         info.style.clone(),
                     ),
@@ -229,8 +227,8 @@ impl<'dom, 'style> BlockContainerBuilder<'dom, 'style> {
         self.inline_formatting_context_builder.take()?.finish(
             self.context,
             !self.have_already_seen_first_line_for_text_indent,
-            self.info.is_single_line_text_input(),
-            self.info.style.writing_mode.to_bidi_level(),
+            self.info.node.is_single_line_text_input(),
+            self.info.style.to_bidi_level(),
         )
     }
 
@@ -291,7 +289,7 @@ impl<'dom, 'style> BlockContainerBuilder<'dom, 'style> {
 
         if inline_table {
             self.ensure_inline_formatting_context_builder()
-                .push_atomic(ifc);
+                .push_atomic(|| ArcRefCell::new(ifc), None);
         } else {
             let table_block = ArcRefCell::new(BlockLevelBox::Independent(ifc));
 
@@ -300,9 +298,10 @@ impl<'dom, 'style> BlockContainerBuilder<'dom, 'style> {
                 self.push_block_level_job_for_inline_formatting_context(inline_formatting_context);
             }
 
+            let box_slot = table_info.node.box_slot();
             self.block_level_boxes.push(BlockLevelJob {
                 info: table_info,
-                box_slot: BoxSlot::dummy(),
+                box_slot,
                 kind: BlockLevelCreator::AnonymousTable { table_block },
                 propagated_data: self.propagated_data,
             });
@@ -406,19 +405,9 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
     fn handle_list_item_marker_inside(
         &mut self,
         marker_info: &NodeAndStyleInfo<'dom>,
-        container_info: &NodeAndStyleInfo<'dom>,
         contents: Vec<crate::dom_traversal::PseudoElementContentItem>,
     ) {
-        // TODO: We do not currently support saving box slots for ::marker pseudo-elements
-        // that are part nested in ::before and ::after pseudo elements. For now, just
-        // forget about them once they are built.
-        let box_slot = match container_info.pseudo_element_type {
-            Some(_) => BoxSlot::dummy(),
-            None => marker_info
-                .node
-                .pseudo_element_box_slot(PseudoElement::Marker),
-        };
-
+        let box_slot = marker_info.node.box_slot();
         self.handle_inline_level_element(
             marker_info,
             DisplayInside::Flow {
@@ -432,20 +421,10 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
     fn handle_list_item_marker_outside(
         &mut self,
         marker_info: &NodeAndStyleInfo<'dom>,
-        container_info: &NodeAndStyleInfo<'dom>,
         contents: Vec<crate::dom_traversal::PseudoElementContentItem>,
         list_item_style: Arc<ComputedValues>,
     ) {
-        // TODO: We do not currently support saving box slots for ::marker pseudo-elements
-        // that are part nested in ::before and ::after pseudo elements. For now, just
-        // forget about them once they are built.
-        let box_slot = match container_info.pseudo_element_type {
-            Some(_) => BoxSlot::dummy(),
-            None => marker_info
-                .node
-                .pseudo_element_box_slot(PseudoElement::Marker),
-        };
-
+        let box_slot = marker_info.node.box_slot();
         self.block_level_boxes.push(BlockLevelJob {
             info: marker_info.clone(),
             box_slot,
@@ -464,29 +443,43 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
         contents: Contents,
         box_slot: BoxSlot<'dom>,
     ) {
-        let (DisplayInside::Flow { is_list_item }, false) =
-            (display_inside, contents.is_replaced())
-        else {
-            // If this inline element is an atomic, handle it and return.
-            let context = self.context;
-            let propagated_data = self.propagated_data;
-            let atomic = self.ensure_inline_formatting_context_builder().push_atomic(
-                IndependentFormattingContext::construct(
-                    context,
-                    info,
-                    display_inside,
-                    contents,
-                    propagated_data,
-                ),
-            );
-            box_slot.set(LayoutBox::InlineLevel(vec![atomic]));
-            return;
+        let old_layout_box = box_slot.take_layout_box_if_undamaged(info.damage);
+        let (is_list_item, non_replaced_contents) = match (display_inside, contents) {
+            (
+                DisplayInside::Flow { is_list_item },
+                Contents::NonReplaced(non_replaced_contents),
+            ) => (is_list_item, non_replaced_contents),
+            (_, contents) => {
+                // If this inline element is an atomic, handle it and return.
+                let context = self.context;
+                let propagated_data = self.propagated_data;
+
+                let construction_callback = || {
+                    ArcRefCell::new(IndependentFormattingContext::construct(
+                        context,
+                        info,
+                        display_inside,
+                        contents,
+                        propagated_data,
+                    ))
+                };
+
+                let atomic = self
+                    .ensure_inline_formatting_context_builder()
+                    .push_atomic(construction_callback, old_layout_box);
+                box_slot.set(LayoutBox::InlineLevel(vec![atomic]));
+                return;
+            },
         };
 
         // Otherwise, this is just a normal inline box. Whatever happened before, all we need to do
         // before recurring is to remember this ongoing inline level box.
         self.ensure_inline_formatting_context_builder()
-            .start_inline_box(InlineBox::new(info), None);
+            .start_inline_box(
+                || ArcRefCell::new(InlineBox::new(info)),
+                None,
+                old_layout_box,
+            );
 
         if is_list_item {
             if let Some((marker_info, marker_contents)) =
@@ -495,14 +488,12 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
                 // Ignore `list-style-position` here:
                 // “If the list item is an inline box: this value is equivalent to `inside`.”
                 // https://drafts.csswg.org/css-lists/#list-style-position-outside
-                self.handle_list_item_marker_inside(&marker_info, info, marker_contents)
+                self.handle_list_item_marker_inside(&marker_info, marker_contents)
             }
         }
 
         // `unwrap` doesn’t panic here because `is_replaced` returned `false`.
-        NonReplacedContents::try_from(contents)
-            .unwrap()
-            .traverse(self.context, info, self);
+        non_replaced_contents.traverse(self.context, info, self);
 
         self.finish_anonymous_table_if_needed();
 
@@ -539,7 +530,7 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
                 builder.split_around_block_and_finish(
                     self.context,
                     !self.have_already_seen_first_line_for_text_indent,
-                    self.info.style.writing_mode.to_bidi_level(),
+                    self.info.style.to_bidi_level(),
                 )
             })
         {
@@ -598,13 +589,17 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
     ) {
         if let Some(builder) = self.inline_formatting_context_builder.as_mut() {
             if !builder.is_empty() {
-                let inline_level_box =
-                    builder.push_absolutely_positioned_box(AbsolutelyPositionedBox::construct(
+                let constructor = || {
+                    ArcRefCell::new(AbsolutelyPositionedBox::construct(
                         self.context,
                         info,
                         display_inside,
                         contents,
-                    ));
+                    ))
+                };
+                let old_layout_box = box_slot.take_layout_box_if_undamaged(info.damage);
+                let inline_level_box =
+                    builder.push_absolutely_positioned_box(constructor, old_layout_box);
                 box_slot.set(LayoutBox::InlineLevel(vec![inline_level_box]));
                 return;
             }
@@ -631,13 +626,17 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
     ) {
         if let Some(builder) = self.inline_formatting_context_builder.as_mut() {
             if !builder.is_empty() {
-                let inline_level_box = builder.push_float_box(FloatBox::construct(
-                    self.context,
-                    info,
-                    display_inside,
-                    contents,
-                    self.propagated_data,
-                ));
+                let constructor = || {
+                    ArcRefCell::new(FloatBox::construct(
+                        self.context,
+                        info,
+                        display_inside,
+                        contents,
+                        self.propagated_data,
+                    ))
+                };
+                let old_layout_box = box_slot.take_layout_box_if_undamaged(info.damage);
+                let inline_level_box = builder.push_float_box(constructor, old_layout_box);
                 box_slot.set(LayoutBox::InlineLevel(vec![inline_level_box]));
                 return;
             }
@@ -660,19 +659,19 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
         inline_formatting_context: InlineFormattingContext,
     ) {
         let layout_context = self.context;
-        let info = self
+        let anonymous_info = self
             .anonymous_box_info
             .get_or_insert_with(|| {
                 self.info
-                    .pseudo(layout_context, PseudoElement::ServoAnonymousBox)
+                    .with_pseudo_element(layout_context, PseudoElement::ServoAnonymousBox)
                     .expect("Should never fail to create anonymous box")
             })
             .clone();
 
+        let box_slot = anonymous_info.node.box_slot();
         self.block_level_boxes.push(BlockLevelJob {
-            info,
-            // FIXME(nox): We should be storing this somewhere.
-            box_slot: BoxSlot::dummy(),
+            info: anonymous_info,
+            box_slot,
             kind: BlockLevelCreator::SameFormattingContextBlock(
                 IntermediateBlockContainer::InlineFormattingContext(
                     BlockContainer::InlineFormattingContext(inline_formatting_context),
@@ -688,6 +687,21 @@ impl<'dom> BlockContainerBuilder<'dom, '_> {
 impl BlockLevelJob<'_> {
     fn finish(self, context: &LayoutContext) -> ArcRefCell<BlockLevelBox> {
         let info = &self.info;
+
+        // If this `BlockLevelBox` is undamaged and it has been laid out before, reuse
+        // the old one, while being sure to clear the layout cache.
+        if !info.damage.has_box_damage() {
+            if let Some(block_level_box) = match self.box_slot.slot.as_ref() {
+                Some(box_slot) => match &*box_slot.borrow() {
+                    Some(LayoutBox::BlockLevel(block_level_box)) => Some(block_level_box.clone()),
+                    _ => None,
+                },
+                None => None,
+            } {
+                return block_level_box;
+            }
+        }
+
         let block_level_box = match self.kind {
             BlockLevelCreator::SameFormattingContextBlock(intermediate_block_container) => {
                 let contents = intermediate_block_container.finish(context, info);
@@ -744,9 +758,14 @@ impl BlockLevelJob<'_> {
                     self.propagated_data,
                     false, /* is_list_item */
                 );
+                // An outside ::marker must establish a BFC, and can't contain floats.
+                let block_formatting_context = BlockFormattingContext {
+                    contents: block_container,
+                    contains_floats: false,
+                };
                 ArcRefCell::new(BlockLevelBox::OutsideMarker(OutsideMarker {
                     base: LayoutBoxBase::new(info.into(), info.style.clone()),
-                    block_container,
+                    block_formatting_context,
                     list_item_style,
                 }))
             },

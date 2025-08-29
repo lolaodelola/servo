@@ -3,15 +3,17 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use content_security_policy as csp;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix};
 use js::rust::HandleObject;
 use net_traits::ReferrerPolicy;
+use script_bindings::root::Dom;
 use servo_arc::Arc;
 use style::media_queries::MediaList as StyleMediaList;
-use style::stylesheets::{AllowImportRules, Origin, Stylesheet, UrlExtraData};
+use style::shared_lock::DeepCloneWithLock;
+use style::stylesheets::{AllowImportRules, Origin, Stylesheet, StylesheetContents, UrlExtraData};
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::cell::DomRefCell;
@@ -20,13 +22,16 @@ use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::csp::{CspReporting, InlineCheckType};
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::document::Document;
+use crate::dom::documentorshadowroot::StylesheetSource;
 use crate::dom::element::{AttributeMutation, Element, ElementCreator};
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::medialist::MediaList;
 use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeTraits, UnbindContext};
 use crate::dom::stylesheet::StyleSheet as DOMStyleSheet;
+use crate::dom::stylesheetcontentscache::{StylesheetContentsCache, StylesheetContentsCacheKey};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::script_runtime::CanGc;
 use crate::stylesheet_loader::{StylesheetLoader, StylesheetOwner};
@@ -37,6 +42,8 @@ pub(crate) struct HTMLStyleElement {
     #[conditional_malloc_size_of]
     #[no_trace]
     stylesheet: DomRefCell<Option<Arc<Stylesheet>>>,
+    #[no_trace]
+    stylesheetcontents_cache_key: DomRefCell<Option<StylesheetContentsCacheKey>>,
     cssom_stylesheet: MutNullableDom<CSSStyleSheet>,
     /// <https://html.spec.whatwg.org/multipage/#a-style-sheet-that-is-blocking-scripts>
     parser_inserted: Cell<bool>,
@@ -55,6 +62,7 @@ impl HTMLStyleElement {
         HTMLStyleElement {
             htmlelement: HTMLElement::new_inherited(local_name, prefix, document),
             stylesheet: DomRefCell::new(None),
+            stylesheetcontents_cache_key: DomRefCell::new(None),
             cssom_stylesheet: MutNullableDom::new(None),
             parser_inserted: Cell::new(creator.is_parser_created()),
             in_stack_of_open_elements: Cell::new(creator.is_parser_created()),
@@ -99,15 +107,19 @@ impl HTMLStyleElement {
         }
 
         let doc = self.owner_document();
+        let global = &self.owner_global();
 
         // Step 5: If the Should element's inline behavior be blocked by Content Security Policy? algorithm
         // returns "Blocked" when executed upon the style element, "style",
         // and the style element's child text content, then return. [CSP]
-        if doc.should_elements_inline_type_behavior_be_blocked(
-            self.upcast(),
-            csp::InlineCheckType::Style,
-            &node.child_text_content(),
-        ) == csp::CheckResult::Blocked
+        if global
+            .get_csp_list()
+            .should_elements_inline_type_behavior_be_blocked(
+                global,
+                self.upcast(),
+                InlineCheckType::Style,
+                &node.child_text_content(),
+            )
         {
             return;
         }
@@ -119,19 +131,41 @@ impl HTMLStyleElement {
         let shared_lock = node.owner_doc().style_shared_lock().clone();
         let mq = Arc::new(shared_lock.wrap(self.create_media_list(&self.Media())));
         let loader = StylesheetLoader::for_element(self.upcast());
-        let sheet = Stylesheet::from_str(
+
+        let stylesheetcontents_create_callback = || {
+            #[cfg(feature = "tracing")]
+            let _span = tracing::trace_span!("ParseStylesheet", servo_profiling = true).entered();
+            StylesheetContents::from_str(
+                &data,
+                UrlExtraData(window.get_url().get_arc()),
+                Origin::Author,
+                &shared_lock,
+                Some(&loader),
+                window.css_error_reporter(),
+                doc.quirks_mode(),
+                AllowImportRules::Yes,
+                /* sanitized_output = */ None,
+            )
+        };
+
+        // For duplicate style sheets with identical content, `StylesheetContents` can be reused
+        // to avoid reedundant parsing of the style sheets. Additionally, the cache hit rate of
+        // stylo's `CascadeDataCache` can now be significantly improved. When shared `StylesheetContents`
+        // is modified, copy-on-write will occur, see `CSSStyleSheet::will_modify`.
+        let (cache_key, contents) = StylesheetContentsCache::get_or_insert_with(
             &data,
+            &shared_lock,
             UrlExtraData(window.get_url().get_arc()),
-            Origin::Author,
-            mq,
-            shared_lock,
-            Some(&loader),
-            window.css_error_reporter(),
             doc.quirks_mode(),
-            AllowImportRules::Yes,
+            stylesheetcontents_create_callback,
         );
 
-        let sheet = Arc::new(sheet);
+        let sheet = Arc::new(Stylesheet {
+            contents,
+            shared_lock,
+            media: mq,
+            disabled: AtomicBool::new(false),
+        });
 
         // No subresource loads were triggered, queue load event
         if self.pending_loads.get() == 0 {
@@ -141,19 +175,42 @@ impl HTMLStyleElement {
                 .queue_simple_event(self.upcast(), atom!("load"));
         }
 
-        self.set_stylesheet(sheet);
+        self.set_stylesheet(sheet, cache_key, true);
     }
 
     // FIXME(emilio): This is duplicated with HTMLLinkElement::set_stylesheet.
+    //
+    // With the reuse of `StylesheetContent` for same stylesheet string content,
+    // this function has a bit difference with `HTMLLinkElement::set_stylesheet` now.
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    pub(crate) fn set_stylesheet(&self, s: Arc<Stylesheet>) {
+    pub(crate) fn set_stylesheet(
+        &self,
+        s: Arc<Stylesheet>,
+        cache_key: Option<StylesheetContentsCacheKey>,
+        need_clean_cssom: bool,
+    ) {
         let stylesheets_owner = self.stylesheet_list_owner();
         if let Some(ref s) = *self.stylesheet.borrow() {
-            stylesheets_owner.remove_stylesheet(self.upcast(), s)
+            stylesheets_owner
+                .remove_stylesheet(StylesheetSource::Element(Dom::from_ref(self.upcast())), s);
         }
+
+        if need_clean_cssom {
+            self.clean_stylesheet_ownership();
+        } else if let Some(cssom_stylesheet) = self.cssom_stylesheet.get() {
+            let guard = s.shared_lock.read();
+            cssom_stylesheet.update_style_stylesheet(&s, &guard);
+        }
+
         *self.stylesheet.borrow_mut() = Some(s.clone());
-        self.clean_stylesheet_ownership();
-        stylesheets_owner.add_stylesheet(self.upcast(), s);
+        *self.stylesheetcontents_cache_key.borrow_mut() = cache_key;
+        stylesheets_owner.add_owned_stylesheet(self.upcast(), s);
+    }
+
+    pub(crate) fn will_modify_stylesheet(&self) {
+        if let Some(stylesheet_with_owned_contents) = self.create_owned_contents_stylesheet() {
+            self.set_stylesheet(stylesheet_with_owned_contents, None, false);
+        }
     }
 
     pub(crate) fn get_stylesheet(&self) -> Option<Arc<Stylesheet>> {
@@ -170,25 +227,62 @@ impl HTMLStyleElement {
                     None, // todo handle location
                     None, // todo handle title
                     sheet,
-                    false, // is_constructed
+                    None, // constructor_document
                     CanGc::note(),
                 )
             })
         })
     }
 
+    fn create_owned_contents_stylesheet(&self) -> Option<Arc<Stylesheet>> {
+        let cache_key = self.stylesheetcontents_cache_key.borrow_mut().take()?;
+        if cache_key.is_uniquely_owned() {
+            StylesheetContentsCache::remove(cache_key);
+            return None;
+        }
+
+        let stylesheet_with_shared_contents = self.stylesheet.borrow().clone()?;
+        let lock = stylesheet_with_shared_contents.shared_lock.clone();
+        let guard = stylesheet_with_shared_contents.shared_lock.read();
+        let stylesheet_with_owned_contents = Arc::new(Stylesheet {
+            contents: Arc::new(
+                stylesheet_with_shared_contents
+                    .contents
+                    .deep_clone_with_lock(&lock, &guard),
+            ),
+            shared_lock: lock,
+            media: stylesheet_with_shared_contents.media.clone(),
+            disabled: AtomicBool::new(
+                stylesheet_with_shared_contents
+                    .disabled
+                    .load(Ordering::SeqCst),
+            ),
+        });
+
+        Some(stylesheet_with_owned_contents)
+    }
+
     fn clean_stylesheet_ownership(&self) {
         if let Some(cssom_stylesheet) = self.cssom_stylesheet.get() {
-            cssom_stylesheet.set_owner(None);
+            // If the CSSOMs change from having an owner node to being ownerless, they may still
+            // potentially modify shared stylesheets. Thus, create an new `Stylesheet` with owned
+            // `StylesheetContents` to ensure that the potentially modifications are only made on
+            // the owned `StylesheetContents`.
+            if let Some(stylesheet) = self.create_owned_contents_stylesheet() {
+                let guard = stylesheet.shared_lock.read();
+                cssom_stylesheet.update_style_stylesheet(&stylesheet, &guard);
+            }
+            cssom_stylesheet.set_owner_node(None);
         }
         self.cssom_stylesheet.set(None);
     }
 
     fn remove_stylesheet(&self) {
+        self.clean_stylesheet_ownership();
         if let Some(s) = self.stylesheet.borrow_mut().take() {
-            self.clean_stylesheet_ownership();
             self.stylesheet_list_owner()
-                .remove_stylesheet(self.upcast(), &s)
+                .remove_stylesheet(StylesheetSource::Element(Dom::from_ref(self.upcast())), &s);
+            let _ = self.stylesheetcontents_cache_key.borrow_mut().take();
         }
     }
 }

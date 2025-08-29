@@ -4,14 +4,15 @@
 
 use std::sync::Arc;
 
+use base::generic_channel::GenericSender;
 use base::id::PipelineId;
 use constellation_traits::{ScriptToConstellationChan, ScriptToConstellationMessage};
 use crossbeam_channel::Sender;
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use dom_struct::dom_struct;
+use embedder_traits::JavaScriptEvaluationError;
 use ipc_channel::ipc::IpcSender;
 use js::jsval::UndefinedValue;
-use js::rust::Runtime;
 use net_traits::ResourceThreads;
 use net_traits::image_cache::ImageCache;
 use profile_traits::{mem, time};
@@ -34,7 +35,7 @@ use crate::dom::worklet::WorkletExecutor;
 use crate::messaging::MainThreadScriptMsg;
 use crate::realms::enter_realm;
 use crate::script_module::ScriptFetchOptions;
-use crate::script_runtime::{CanGc, JSContext};
+use crate::script_runtime::{CanGc, IntroductionType, JSContext};
 
 #[dom_struct]
 /// <https://drafts.css-houdini.org/worklets/#workletglobalscope>
@@ -54,7 +55,6 @@ impl WorkletGlobalScope {
     /// Create a new heap-allocated `WorkletGlobalScope`.
     pub(crate) fn new(
         scope_type: WorkletGlobalScopeType,
-        runtime: &Runtime,
         pipeline_id: PipelineId,
         base_url: ServoUrl,
         executor: WorkletExecutor,
@@ -63,14 +63,12 @@ impl WorkletGlobalScope {
         let scope: DomRoot<WorkletGlobalScope> = match scope_type {
             #[cfg(feature = "testbinding")]
             WorkletGlobalScopeType::Test => DomRoot::upcast(TestWorkletGlobalScope::new(
-                runtime,
                 pipeline_id,
                 base_url,
                 executor,
                 init,
             )),
             WorkletGlobalScopeType::Paint => DomRoot::upcast(PaintWorkletGlobalScope::new(
-                runtime,
                 pipeline_id,
                 base_url,
                 executor,
@@ -104,12 +102,14 @@ impl WorkletGlobalScope {
                 script_to_constellation_chan,
                 init.resource_threads.clone(),
                 MutableOrigin::new(ImmutableOrigin::new_opaque()),
+                base_url.clone(),
                 None,
                 Default::default(),
                 #[cfg(feature = "webgpu")]
                 init.gpu_id_hub.clone(),
                 init.inherited_secure_context,
                 false,
+                None, // font_context
             ),
             base_url,
             to_script_thread_sender: init.to_script_thread_sender.clone(),
@@ -123,7 +123,11 @@ impl WorkletGlobalScope {
     }
 
     /// Evaluate a JS script in this global.
-    pub(crate) fn evaluate_js(&self, script: &str, can_gc: CanGc) -> bool {
+    pub(crate) fn evaluate_js(
+        &self,
+        script: &str,
+        can_gc: CanGc,
+    ) -> Result<(), JavaScriptEvaluationError> {
         debug!("Evaluating Dom in a worklet.");
         rooted!(in (*GlobalScope::get_cx()) let mut rval = UndefinedValue());
         self.globalscope.evaluate_js_on_global_with_result(
@@ -132,6 +136,7 @@ impl WorkletGlobalScope {
             ScriptFetchOptions::default_classic_script(&self.globalscope),
             self.globalscope.api_base_url(),
             can_gc,
+            Some(IntroductionType::WORKLET),
         )
     }
 
@@ -192,7 +197,7 @@ pub(crate) struct WorkletGlobalScopeInit {
     /// Channel to devtools
     pub(crate) devtools_chan: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
     /// Messages to send to constellation
-    pub(crate) to_constellation_sender: IpcSender<(PipelineId, ScriptToConstellationMessage)>,
+    pub(crate) to_constellation_sender: GenericSender<(PipelineId, ScriptToConstellationMessage)>,
     /// The image cache
     pub(crate) image_cache: Arc<dyn ImageCache>,
     /// Identity manager for WebGPU resources

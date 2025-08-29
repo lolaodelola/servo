@@ -21,9 +21,8 @@ app_units = { workspace = true }
 atomic_refcell = { workspace = true }
 base = { workspace = true }
 bitflags = { workspace = true }
-canvas_traits = { workspace = true }
 compositing_traits = { workspace = true }
-constellation_traits = { workspace = true }
+cssparser = { workspace = true }
 data-url = { workspace = true }
 embedder_traits = { workspace = true }
 euclid = { workspace = true }
@@ -36,6 +35,8 @@ icu_locid = { workspace = true }
 icu_segmenter = { workspace = true }
 ipc-channel = { workspace = true }
 itertools = { workspace = true }
+kurbo = { workspace = true }
+layout_api = { workspace = true }
 log = { workspace = true }
 malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }
@@ -46,13 +47,13 @@ profile_traits = { workspace = true }
 range = { path = "../range" }
 rayon = { workspace = true }
 script = { path = "../script" }
-script_layout_interface = { workspace = true }
 script_traits = { workspace = true }
 selectors = { workspace = true }
 servo_arc = { workspace = true }
 servo_config = { path = "../config" }
 servo_geometry = { path = "../geometry" }
 servo_url = { path = "../url" }
+smallvec = { workspace = true }
 stylo = { workspace = true }
 stylo_atoms = { workspace = true }
 stylo_traits = { workspace = true }
@@ -63,6 +64,7 @@ unicode-script = { workspace = true }
 url = { workspace = true }
 webrender_api = { workspace = true }
 xi-unicode = { workspace = true }
+servo-tracing = { workspace = true }
 
 [dev-dependencies]
 num-traits = { workspace = true }

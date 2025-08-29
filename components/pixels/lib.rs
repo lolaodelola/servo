@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+mod snapshot;
+
 use std::borrow::Cow;
 use std::io::Cursor;
 use std::ops::Range;
@@ -9,13 +11,31 @@ use std::time::Duration;
 use std::{cmp, fmt, vec};
 
 use euclid::default::{Point2D, Rect, Size2D};
-use image::codecs::gif::GifDecoder;
-use image::{AnimationDecoder as _, ImageFormat};
+use image::codecs::{bmp, gif, ico, jpeg, png, webp};
+use image::error::ImageFormatHint;
+use image::imageops::{self, FilterType};
+use image::{
+    AnimationDecoder, DynamicImage, ImageBuffer, ImageDecoder, ImageError, ImageFormat,
+    ImageResult, Limits, Rgba,
+};
 use ipc_channel::ipc::IpcSharedMemory;
 use log::debug;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
+pub use snapshot::*;
 use webrender_api::ImageKey;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum FilterQuality {
+    /// No image interpolation (Nearest-neighbor)
+    None,
+    /// Low-quality image interpolation (Bilinear)
+    Low,
+    /// Medium-quality image interpolation (CatmullRom, Mitchell)
+    Medium,
+    /// High-quality image interpolation (Lanczos)
+    High,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
 pub enum PixelFormat {
@@ -31,7 +51,104 @@ pub enum PixelFormat {
     BGRA8,
 }
 
-pub fn rgba8_get_rect(pixels: &[u8], size: Size2D<u64>, rect: Rect<u64>) -> Cow<[u8]> {
+/// Computes image byte length, returning None if overflow occurred or the total length exceeds
+/// the maximum image allocation size.
+pub fn compute_rgba8_byte_length_if_within_limit(width: usize, height: usize) -> Option<usize> {
+    // Maximum allowed image allocation size (2^31-1 ~ 2GB).
+    const MAX_IMAGE_BYTE_LENGTH: usize = 2147483647;
+
+    // The color components of each pixel must be stored in four sequential
+    // elements in the order of red, green, blue, and then alpha.
+    4usize
+        .checked_mul(width)
+        .and_then(|v| v.checked_mul(height))
+        .filter(|v| *v <= MAX_IMAGE_BYTE_LENGTH)
+}
+
+/// Copies the rectangle of the source image to the destination image.
+pub fn copy_rgba8_image(
+    src_size: Size2D<u32>,
+    src_rect: Rect<u32>,
+    src_pixels: &[u8],
+    dest_size: Size2D<u32>,
+    dest_rect: Rect<u32>,
+    dest_pixels: &mut [u8],
+) {
+    assert!(!src_rect.is_empty());
+    assert!(!dest_rect.is_empty());
+    assert!(Rect::from_size(src_size).contains_rect(&src_rect));
+    assert!(Rect::from_size(dest_size).contains_rect(&dest_rect));
+    assert!(src_rect.size == dest_rect.size);
+    assert_eq!(src_pixels.len() % 4, 0);
+    assert_eq!(dest_pixels.len() % 4, 0);
+
+    if src_size == dest_size && src_rect == dest_rect {
+        dest_pixels.copy_from_slice(src_pixels);
+        return;
+    }
+
+    let src_first_column_start = src_rect.origin.x as usize * 4;
+    let src_row_length = src_size.width as usize * 4;
+    let src_first_row_start = src_rect.origin.y as usize * src_row_length;
+
+    let dest_first_column_start = dest_rect.origin.x as usize * 4;
+    let dest_row_length = dest_size.width as usize * 4;
+    let dest_first_row_start = dest_rect.origin.y as usize * dest_row_length;
+
+    let (chunk_length, chunk_count) = (
+        src_rect.size.width as usize * 4,
+        src_rect.size.height as usize,
+    );
+
+    for i in 0..chunk_count {
+        let src = &src_pixels[src_first_row_start + i * src_row_length..][src_first_column_start..]
+            [..chunk_length];
+        let dest = &mut dest_pixels[dest_first_row_start + i * dest_row_length..]
+            [dest_first_column_start..][..chunk_length];
+        dest.copy_from_slice(src);
+    }
+}
+
+/// Scales the source image to the required size, performing sampling filter algorithm.
+pub fn scale_rgba8_image(
+    size: Size2D<u32>,
+    pixels: &[u8],
+    required_size: Size2D<u32>,
+    quality: FilterQuality,
+) -> Option<Vec<u8>> {
+    let filter = match quality {
+        FilterQuality::None => FilterType::Nearest,
+        FilterQuality::Low => FilterType::Triangle,
+        FilterQuality::Medium => FilterType::CatmullRom,
+        FilterQuality::High => FilterType::Lanczos3,
+    };
+
+    let buffer: ImageBuffer<Rgba<u8>, &[u8]> =
+        ImageBuffer::from_raw(size.width, size.height, pixels)?;
+
+    let scaled_buffer =
+        imageops::resize(&buffer, required_size.width, required_size.height, filter);
+
+    Some(scaled_buffer.into_vec())
+}
+
+/// Flips the source image vertically in place.
+pub fn flip_y_rgba8_image_inplace(size: Size2D<u32>, pixels: &mut [u8]) {
+    assert_eq!(pixels.len() % 4, 0);
+
+    let row_length = size.width as usize * 4;
+    let half_height = (size.height / 2) as usize;
+
+    let (left, right) = pixels.split_at_mut(pixels.len() - row_length * half_height);
+
+    for i in 0..half_height {
+        let top = &mut left[i * row_length..][..row_length];
+        let bottom = &mut right[(half_height - i - 1) * row_length..][..row_length];
+        top.swap_with_slice(bottom);
+    }
+}
+
+pub fn rgba8_get_rect(pixels: &[u8], size: Size2D<u32>, rect: Rect<u32>) -> Cow<'_, [u8]> {
     assert!(!rect.is_empty());
     assert!(Rect::from_size(size).contains_rect(&rect));
     assert_eq!(pixels.len() % 4, 0);
@@ -85,28 +202,68 @@ pub fn rgba8_premultiply_inplace(pixels: &mut [u8]) -> bool {
     is_opaque
 }
 
+/// Returns a*b/255, rounding any fractional bits to nearest integer
+/// to reduce the loss of precision after multiple consequence alpha
+/// (un)premultiply operations.
 #[inline(always)]
 pub fn multiply_u8_color(a: u8, b: u8) -> u8 {
-    (a as u32 * b as u32 / 255) as u8
+    let c = a as u32 * b as u32 + 128;
+    ((c + (c >> 8)) >> 8) as u8
 }
 
 pub fn clip(
     mut origin: Point2D<i32>,
-    mut size: Size2D<u64>,
-    surface: Size2D<u64>,
-) -> Option<Rect<u64>> {
+    mut size: Size2D<u32>,
+    surface: Size2D<u32>,
+) -> Option<Rect<u32>> {
     if origin.x < 0 {
-        size.width = size.width.saturating_sub(-origin.x as u64);
+        size.width = size.width.saturating_sub(-origin.x as u32);
         origin.x = 0;
     }
     if origin.y < 0 {
-        size.height = size.height.saturating_sub(-origin.y as u64);
+        size.height = size.height.saturating_sub(-origin.y as u32);
         origin.y = 0;
     }
-    let origin = Point2D::new(origin.x as u64, origin.y as u64);
+    let origin = Point2D::new(origin.x as u32, origin.y as u32);
     Rect::new(origin, size)
         .intersection(&Rect::from_size(surface))
         .filter(|rect| !rect.is_empty())
+}
+
+#[derive(PartialEq)]
+pub enum EncodedImageType {
+    Png,
+    Jpeg,
+    Webp,
+}
+
+impl From<String> for EncodedImageType {
+    // From: https://html.spec.whatwg.org/multipage/#serialising-bitmaps-to-a-file
+    // User agents must support PNG ("image/png"). User agents may support other
+    // types. If the user agent does not support the requested type, then it
+    // must create the file using the PNG format.
+    // Anything different than image/jpeg or image/webp is thus treated as PNG.
+    fn from(mime_type: String) -> Self {
+        let mime = mime_type.to_lowercase();
+        if mime == "image/jpeg" {
+            Self::Jpeg
+        } else if mime == "image/webp" {
+            Self::Webp
+        } else {
+            Self::Png
+        }
+    }
+}
+
+impl EncodedImageType {
+    pub fn as_mime_type(&self) -> String {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Webp => "image/webp",
+        }
+        .to_owned()
+    }
 }
 
 /// Whether this response passed any CORS checks, and is thus safe to read from
@@ -121,9 +278,8 @@ pub enum CorsStatus {
 }
 
 #[derive(Clone, Deserialize, MallocSizeOf, Serialize)]
-pub struct Image {
-    pub width: u32,
-    pub height: u32,
+pub struct RasterImage {
+    pub metadata: ImageMetadata,
     pub format: PixelFormat,
     pub id: Option<ImageKey>,
     pub cors_status: CorsStatus,
@@ -149,38 +305,41 @@ pub struct ImageFrameView<'a> {
     pub height: u32,
 }
 
-impl Image {
+impl RasterImage {
     pub fn should_animate(&self) -> bool {
         self.frames.len() > 1
     }
 
-    pub fn frames(&self) -> impl Iterator<Item = ImageFrameView> {
-        self.frames.iter().map(|frame| ImageFrameView {
+    fn frame_view<'image>(&'image self, frame: &ImageFrame) -> ImageFrameView<'image> {
+        ImageFrameView {
             delay: frame.delay,
             bytes: self.bytes.get(frame.byte_range.clone()).unwrap(),
             width: frame.width,
             height: frame.height,
-        })
+        }
     }
 
-    pub fn first_frame(&self) -> ImageFrameView {
-        self.frames()
-            .next()
+    pub fn frame(&self, index: usize) -> Option<ImageFrameView<'_>> {
+        self.frames.get(index).map(|frame| self.frame_view(frame))
+    }
+
+    pub fn first_frame(&self) -> ImageFrameView<'_> {
+        self.frame(0)
             .expect("All images should have at least one frame")
     }
 }
 
-impl fmt::Debug for Image {
+impl fmt::Debug for RasterImage {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "Image {{ width: {}, height: {}, format: {:?}, ..., id: {:?} }}",
-            self.width, self.height, self.format, self.id
+            self.metadata.width, self.metadata.height, self.format, self.id
         )
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
 pub struct ImageMetadata {
     pub width: u32,
     pub height: u32,
@@ -189,7 +348,7 @@ pub struct ImageMetadata {
 // FIXME: Images must not be copied every frame. Instead we should atomically
 // reference count them.
 
-pub fn load_from_memory(buffer: &[u8], cors_status: CorsStatus) -> Option<Image> {
+pub fn load_from_memory(buffer: &[u8], cors_status: CorsStatus) -> Option<RasterImage> {
     if buffer.is_empty() {
         return None;
     }
@@ -200,33 +359,41 @@ pub fn load_from_memory(buffer: &[u8], cors_status: CorsStatus) -> Option<Image>
             debug!("{}", msg);
             None
         },
-        Ok(format) => match format {
-            ImageFormat::Gif => decode_gif(buffer, cors_status),
-            _ => match image::load_from_memory(buffer) {
-                Ok(image) => {
-                    let mut rgba = image.into_rgba8();
-                    rgba8_byte_swap_colors_inplace(&mut rgba);
-                    let frame = ImageFrame {
-                        delay: None,
-                        byte_range: 0..rgba.len(),
-                        width: rgba.width(),
-                        height: rgba.height(),
-                    };
-                    Some(Image {
-                        width: rgba.width(),
-                        height: rgba.height(),
-                        format: PixelFormat::BGRA8,
-                        frames: vec![frame],
-                        bytes: IpcSharedMemory::from_bytes(&rgba),
-                        id: None,
-                        cors_status,
-                    })
+        Ok(format) => {
+            let Ok(image_decoder) = make_decoder(format, buffer) else {
+                return None;
+            };
+            match image_decoder {
+                GenericImageDecoder::Png(png_decoder) => {
+                    if png_decoder.is_apng().unwrap_or_default() {
+                        let Ok(apng_decoder) = png_decoder.apng() else {
+                            return None;
+                        };
+                        decode_animated_image(cors_status, apng_decoder)
+                    } else {
+                        decode_static_image(cors_status, *png_decoder)
+                    }
                 },
-                Err(e) => {
-                    debug!("Image decoding error: {:?}", e);
-                    None
+                GenericImageDecoder::Gif(animation_decoder) => {
+                    decode_animated_image(cors_status, *animation_decoder)
                 },
-            },
+                GenericImageDecoder::Webp(webp_decoder) => {
+                    if webp_decoder.has_animation() {
+                        decode_animated_image(cors_status, *webp_decoder)
+                    } else {
+                        decode_static_image(cors_status, *webp_decoder)
+                    }
+                },
+                GenericImageDecoder::Bmp(image_decoder) => {
+                    decode_static_image(cors_status, *image_decoder)
+                },
+                GenericImageDecoder::Jpeg(image_decoder) => {
+                    decode_static_image(cors_status, *image_decoder)
+                },
+                GenericImageDecoder::Ico(image_decoder) => {
+                    decode_static_image(cors_status, *image_decoder)
+                },
+            }
         },
     }
 }
@@ -374,10 +541,74 @@ fn is_webp(buffer: &[u8]) -> bool {
     buffer[8..].len() >= len && &buffer[8..12] == b"WEBP"
 }
 
-fn decode_gif(buffer: &[u8], cors_status: CorsStatus) -> Option<Image> {
-    let Ok(decoded_gif) = GifDecoder::new(Cursor::new(buffer)) else {
+enum GenericImageDecoder<R: std::io::BufRead + std::io::Seek> {
+    Png(Box<png::PngDecoder<R>>),
+    Gif(Box<gif::GifDecoder<R>>),
+    Webp(Box<webp::WebPDecoder<R>>),
+    Jpeg(Box<jpeg::JpegDecoder<R>>),
+    Bmp(Box<bmp::BmpDecoder<R>>),
+    Ico(Box<ico::IcoDecoder<R>>),
+}
+
+fn make_decoder(
+    format: ImageFormat,
+    buffer: &[u8],
+) -> ImageResult<GenericImageDecoder<Cursor<&[u8]>>> {
+    let limits = Limits::default();
+    let reader = Cursor::new(buffer);
+    Ok(match format {
+        ImageFormat::Png => {
+            GenericImageDecoder::Png(Box::new(png::PngDecoder::with_limits(reader, limits)?))
+        },
+        ImageFormat::Gif => GenericImageDecoder::Gif(Box::new(gif::GifDecoder::new(reader)?)),
+        ImageFormat::WebP => GenericImageDecoder::Webp(Box::new(webp::WebPDecoder::new(reader)?)),
+        ImageFormat::Jpeg => GenericImageDecoder::Jpeg(Box::new(jpeg::JpegDecoder::new(reader)?)),
+        ImageFormat::Bmp => GenericImageDecoder::Bmp(Box::new(bmp::BmpDecoder::new(reader)?)),
+        ImageFormat::Ico => GenericImageDecoder::Ico(Box::new(ico::IcoDecoder::new(reader)?)),
+        _ => {
+            return Err(ImageError::Unsupported(
+                ImageFormatHint::Exact(format).into(),
+            ));
+        },
+    })
+}
+
+fn decode_static_image(
+    cors_status: CorsStatus,
+    image_decoder: impl ImageDecoder,
+) -> Option<RasterImage> {
+    let Ok(dynamic_image) = DynamicImage::from_decoder(image_decoder) else {
+        debug!("Image decoding error");
         return None;
     };
+    let mut rgba = dynamic_image.into_rgba8();
+    rgba8_byte_swap_colors_inplace(&mut rgba);
+    let frame = ImageFrame {
+        delay: None,
+        byte_range: 0..rgba.len(),
+        width: rgba.width(),
+        height: rgba.height(),
+    };
+    Some(RasterImage {
+        metadata: ImageMetadata {
+            width: rgba.width(),
+            height: rgba.height(),
+        },
+        format: PixelFormat::BGRA8,
+        frames: vec![frame],
+        bytes: IpcSharedMemory::from_bytes(&rgba),
+        id: None,
+        cors_status,
+    })
+}
+
+fn decode_animated_image<'a, T>(
+    cors_status: CorsStatus,
+    animated_image_decoder: T,
+) -> Option<RasterImage>
+where
+    T: AnimationDecoder<'a>,
+{
     let mut width = 0;
     let mut height = 0;
 
@@ -386,34 +617,34 @@ fn decode_gif(buffer: &[u8], cors_status: CorsStatus) -> Option<Image> {
     // <https://github.com/image-rs/image/issues/2442>.
     let mut frame_data = vec![];
     let mut total_number_of_bytes = 0;
-    let frames: Vec<ImageFrame> = decoded_gif
+    let frames: Vec<ImageFrame> = animated_image_decoder
         .into_frames()
         .map_while(|decoded_frame| {
-            let mut gif_frame = match decoded_frame {
+            let mut animated_frame = match decoded_frame {
                 Ok(decoded_frame) => decoded_frame,
                 Err(error) => {
-                    debug!("decode GIF frame error: {error}");
+                    debug!("decode Animated frame error: {error}");
                     return None;
                 },
             };
-            rgba8_byte_swap_colors_inplace(gif_frame.buffer_mut());
+            rgba8_byte_swap_colors_inplace(animated_frame.buffer_mut());
             let frame_start = total_number_of_bytes;
-            total_number_of_bytes += gif_frame.buffer().len();
+            total_number_of_bytes += animated_frame.buffer().len();
 
             // The image size should be at least as large as the largest frame.
-            let frame_width = gif_frame.buffer().width();
-            let frame_height = gif_frame.buffer().height();
+            let frame_width = animated_frame.buffer().width();
+            let frame_height = animated_frame.buffer().height();
             width = cmp::max(width, frame_width);
             height = cmp::max(height, frame_height);
 
             let frame = ImageFrame {
                 byte_range: frame_start..total_number_of_bytes,
-                delay: Some(Duration::from(gif_frame.delay())),
+                delay: Some(Duration::from(animated_frame.delay())),
                 width: frame_width,
                 height: frame_height,
             };
 
-            frame_data.push(gif_frame);
+            frame_data.push(animated_frame);
 
             Some(frame)
         })
@@ -430,9 +661,8 @@ fn decode_gif(buffer: &[u8], cors_status: CorsStatus) -> Option<Image> {
         bytes.extend_from_slice(frame.buffer());
     }
 
-    Some(Image {
-        width,
-        height,
+    Some(RasterImage {
+        metadata: ImageMetadata { width, height },
         cors_status,
         frames,
         id: None,

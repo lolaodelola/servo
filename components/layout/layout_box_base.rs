@@ -13,9 +13,8 @@ use style::properties::ComputedValues;
 use crate::context::LayoutContext;
 use crate::formatting_contexts::Baselines;
 use crate::fragment_tree::{BaseFragmentInfo, CollapsedBlockMargins, Fragment, SpecificLayoutInfo};
-use crate::geom::SizeConstraint;
 use crate::positioned::PositioningContext;
-use crate::sizing::{ComputeInlineContentSizes, InlineContentSizesResult};
+use crate::sizing::{ComputeInlineContentSizes, InlineContentSizesResult, SizeConstraint};
 use crate::{ConstraintSpace, ContainingBlockSize};
 
 /// A box tree node that handles containing information about style and the original DOM
@@ -70,8 +69,12 @@ impl LayoutBoxBase {
         result
     }
 
-    pub(crate) fn invalidate_cached_fragment(&self) {
-        let _ = self.cached_layout_result.borrow_mut().take();
+    /// Clear cached data accumulated during fragment tree layout, either fragments and
+    /// the cached inline content size, or just fragments.
+    pub(crate) fn clear_fragment_layout_cache(&self) {
+        self.fragments.borrow_mut().clear();
+        *self.cached_layout_result.borrow_mut() = None;
+        *self.cached_inline_content_size.borrow_mut() = None;
     }
 
     pub(crate) fn fragments(&self) -> Vec<Fragment> {

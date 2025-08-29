@@ -4,6 +4,8 @@
 
 use std::borrow::ToOwned;
 use std::collections::HashMap;
+use std::hash::Hash;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -13,9 +15,12 @@ use app_units::Au;
 use bitflags::bitflags;
 use euclid::default::{Point2D, Rect, Size2D};
 use euclid::num::Zero;
+use fonts_traits::FontDescriptor;
 use log::debug;
 use malloc_size_of_derive::MallocSizeOf;
 use parking_lot::RwLock;
+use read_fonts::tables::os2::{Os2, SelectionFlags};
+use read_fonts::types::Tag;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use style::computed_values::font_variant_caps;
@@ -25,30 +30,24 @@ use style::values::computed::font::{
 };
 use style::values::computed::{FontStretch, FontStyle, FontWeight};
 use unicode_script::Script;
-use webrender_api::{FontInstanceFlags, FontInstanceKey};
+use webrender_api::{FontInstanceFlags, FontInstanceKey, FontVariation};
 
 use crate::platform::font::{FontTable, PlatformFont};
 pub use crate::platform::font_list::fallback_font_families;
 use crate::{
     ByteIndex, EmojiPresentationPreference, FallbackFontSelectionOptions, FontContext, FontData,
-    FontIdentifier, FontTemplateDescriptor, FontTemplateRef, FontTemplateRefMethods, GlyphData,
-    GlyphId, GlyphStore, LocalFontIdentifier, Shaper,
+    FontDataAndIndex, FontDataError, FontIdentifier, FontTemplateDescriptor, FontTemplateRef,
+    FontTemplateRefMethods, GlyphData, GlyphId, GlyphStore, LocalFontIdentifier, Shaper,
 };
 
-#[macro_export]
-macro_rules! ot_tag {
-    ($t1:expr, $t2:expr, $t3:expr, $t4:expr) => {
-        (($t1 as u32) << 24) | (($t2 as u32) << 16) | (($t3 as u32) << 8) | ($t4 as u32)
-    };
-}
-
-pub const GPOS: u32 = ot_tag!('G', 'P', 'O', 'S');
-pub const GSUB: u32 = ot_tag!('G', 'S', 'U', 'B');
-pub const KERN: u32 = ot_tag!('k', 'e', 'r', 'n');
-pub const SBIX: u32 = ot_tag!('s', 'b', 'i', 'x');
-pub const CBDT: u32 = ot_tag!('C', 'B', 'D', 'T');
-pub const COLR: u32 = ot_tag!('C', 'O', 'L', 'R');
-pub const BASE: u32 = ot_tag!('B', 'A', 'S', 'E');
+pub const GPOS: Tag = Tag::new(b"GPOS");
+pub const GSUB: Tag = Tag::new(b"GSUB");
+pub const KERN: Tag = Tag::new(b"kern");
+pub const SBIX: Tag = Tag::new(b"sbix");
+pub const CBDT: Tag = Tag::new(b"CBDT");
+pub const COLR: Tag = Tag::new(b"COLR");
+pub const BASE: Tag = Tag::new(b"BASE");
+pub const LIGA: Tag = Tag::new(b"liga");
 
 pub const LAST_RESORT_GLYPH_ADVANCE: FractionalPixel = 10.0;
 
@@ -61,18 +60,11 @@ static TEXT_SHAPING_PERFORMANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 // resources needed by the graphics layer to draw glyphs.
 
 pub trait PlatformFontMethods: Sized {
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            name = "PlatformFontMethods::new_from_template",
-            skip_all,
-            fields(servo_profiling = true),
-            level = "trace",
-        )
-    )]
+    #[servo_tracing::instrument(name = "PlatformFontMethods::new_from_template", skip_all)]
     fn new_from_template(
         template: FontTemplateRef,
         pt_size: Option<Au>,
+        variations: &[FontVariation],
         data: &Option<FontData>,
     ) -> Result<PlatformFont, &'static str> {
         let template = template.borrow();
@@ -80,13 +72,14 @@ pub trait PlatformFontMethods: Sized {
 
         match font_identifier {
             FontIdentifier::Local(font_identifier) => {
-                Self::new_from_local_font_identifier(font_identifier, pt_size)
+                Self::new_from_local_font_identifier(font_identifier, pt_size, variations)
             },
             FontIdentifier::Web(_) => Self::new_from_data(
                 font_identifier,
                 data.as_ref()
                     .expect("Should never create a web font without data."),
                 pt_size,
+                variations,
             ),
         }
     }
@@ -94,12 +87,14 @@ pub trait PlatformFontMethods: Sized {
     fn new_from_local_font_identifier(
         font_identifier: LocalFontIdentifier,
         pt_size: Option<Au>,
+        variations: &[FontVariation],
     ) -> Result<PlatformFont, &'static str>;
 
     fn new_from_data(
         font_identifier: FontIdentifier,
         data: &FontData,
         pt_size: Option<Au>,
+        variations: &[FontVariation],
     ) -> Result<PlatformFont, &'static str>;
 
     /// Get a [`FontTemplateDescriptor`] from a [`PlatformFont`]. This is used to get
@@ -111,39 +106,47 @@ pub trait PlatformFontMethods: Sized {
     fn glyph_h_kerning(&self, glyph0: GlyphId, glyph1: GlyphId) -> FractionalPixel;
 
     fn metrics(&self) -> FontMetrics;
-    fn table_for_tag(&self, _: FontTableTag) -> Option<FontTable>;
+    fn table_for_tag(&self, _: Tag) -> Option<FontTable>;
     fn typographic_bounds(&self, _: GlyphId) -> Rect<f32>;
 
     /// Get the necessary [`FontInstanceFlags`]` for this font.
     fn webrender_font_instance_flags(&self) -> FontInstanceFlags;
+
+    /// Return all the variation values that the font was instantiated with.
+    fn variations(&self) -> &[FontVariation];
+
+    fn descriptor_from_os2_table(os2: &Os2) -> FontTemplateDescriptor {
+        let mut style = FontStyle::NORMAL;
+        if os2.fs_selection().contains(SelectionFlags::ITALIC) {
+            style = FontStyle::ITALIC;
+        }
+
+        let weight = FontWeight::from_float(os2.us_weight_class() as f32);
+        let stretch = match os2.us_width_class() {
+            1 => FontStretch::ULTRA_CONDENSED,
+            2 => FontStretch::EXTRA_CONDENSED,
+            3 => FontStretch::CONDENSED,
+            4 => FontStretch::SEMI_CONDENSED,
+            5 => FontStretch::NORMAL,
+            6 => FontStretch::SEMI_EXPANDED,
+            7 => FontStretch::EXPANDED,
+            8 => FontStretch::EXTRA_EXPANDED,
+            9 => FontStretch::ULTRA_EXPANDED,
+            _ => FontStretch::NORMAL,
+        };
+
+        FontTemplateDescriptor::new(weight, stretch, style)
+    }
 }
 
 // Used to abstract over the shaper's choice of fixed int representation.
 pub type FractionalPixel = f64;
 
-pub type FontTableTag = u32;
-
-trait FontTableTagConversions {
-    fn tag_to_str(&self) -> String;
-}
-
-impl FontTableTagConversions for FontTableTag {
-    fn tag_to_str(&self) -> String {
-        let bytes = [
-            (self >> 24) as u8,
-            (self >> 16) as u8,
-            (self >> 8) as u8,
-            *self as u8,
-        ];
-        str::from_utf8(&bytes).unwrap().to_owned()
-    }
-}
-
 pub trait FontTableMethods {
     fn buffer(&self) -> &[u8];
 }
 
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub struct FontMetrics {
     pub underline_size: Au,
     pub underline_offset: Au,
@@ -188,33 +191,6 @@ impl FontMetrics {
     }
 }
 
-/// `FontDescriptor` describes the parameters of a `Font`. It represents rendering a given font
-/// template at a particular size, with a particular font-variant-caps applied, etc. This contrasts
-/// with `FontTemplateDescriptor` in that the latter represents only the parameters inherent in the
-/// font data (weight, stretch, etc.).
-#[derive(Clone, Debug, Deserialize, Hash, MallocSizeOf, PartialEq, Serialize)]
-pub struct FontDescriptor {
-    pub weight: FontWeight,
-    pub stretch: FontStretch,
-    pub style: FontStyle,
-    pub variant: font_variant_caps::T,
-    pub pt_size: Au,
-}
-
-impl Eq for FontDescriptor {}
-
-impl<'a> From<&'a FontStyleStruct> for FontDescriptor {
-    fn from(style: &'a FontStyleStruct) -> Self {
-        FontDescriptor {
-            weight: style.font_weight,
-            stretch: style.font_stretch,
-            style: style.font_style,
-            variant: style.font_variant_caps,
-            pt_size: Au::from_f32_px(style.font_size.computed_size().px()),
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 struct CachedShapeData {
     glyph_advances: HashMap<GlyphId, FractionalPixel>,
@@ -241,8 +217,9 @@ pub struct Font {
     pub metrics: FontMetrics,
     pub descriptor: FontDescriptor,
 
-    /// The data for this font. This might be uninitialized for system fonts.
-    data: OnceLock<FontData>,
+    /// The data for this font. And the index of the font within the data (in case it's a TTC)
+    /// This might be uninitialized for system fonts.
+    data_and_index: OnceLock<FontDataAndIndex>,
 
     shaper: OnceLock<Shaper>,
     cached_shape_data: RwLock<CachedShapeData>,
@@ -287,8 +264,12 @@ impl Font {
         data: Option<FontData>,
         synthesized_small_caps: Option<FontRef>,
     ) -> Result<Font, &'static str> {
-        let handle =
-            PlatformFont::new_from_template(template.clone(), Some(descriptor.pt_size), &data)?;
+        let handle = PlatformFont::new_from_template(
+            template.clone(),
+            Some(descriptor.pt_size),
+            &descriptor.variation_settings,
+            &data,
+        )?;
         let metrics = handle.metrics();
 
         Ok(Font {
@@ -296,7 +277,9 @@ impl Font {
             template,
             metrics,
             descriptor,
-            data: data.map(OnceLock::from).unwrap_or_default(),
+            data_and_index: data
+                .map(|data| OnceLock::from(FontDataAndIndex { data, index: 0 }))
+                .unwrap_or_default(),
             shaper: OnceLock::new(),
             cached_shape_data: Default::default(),
             font_instance_key: Default::default(),
@@ -331,17 +314,24 @@ impl Font {
 
     /// Return the data for this `Font`. Note that this is currently highly inefficient for system
     /// fonts and should not be used except in legacy canvas code.
-    pub fn data(&self) -> &FontData {
-        self.data.get_or_init(|| {
-            let FontIdentifier::Local(local_font_identifier) = self.identifier() else {
-                unreachable!("All web fonts should already have initialized data");
-            };
-            FontData::from_bytes(
-                &local_font_identifier
-                    .read_data_from_file()
-                    .unwrap_or_default(),
-            )
-        })
+    pub fn font_data_and_index(&self) -> Result<&FontDataAndIndex, FontDataError> {
+        if let Some(data_and_index) = self.data_and_index.get() {
+            return Ok(data_and_index);
+        }
+
+        let FontIdentifier::Local(local_font_identifier) = self.identifier() else {
+            unreachable!("All web fonts should already have initialized data");
+        };
+        let Some(data_and_index) = local_font_identifier.font_data_and_index() else {
+            return Err(FontDataError::FailedToLoad);
+        };
+
+        let data_and_index = self.data_and_index.get_or_init(move || data_and_index);
+        Ok(data_and_index)
+    }
+
+    pub fn variations(&self) -> &[FontVariation] {
+        self.handle.variations()
     }
 }
 
@@ -433,9 +423,8 @@ impl Font {
     }
 
     fn shape_text_harfbuzz(&self, text: &str, options: &ShapingOptions, glyphs: &mut GlyphStore) {
-        let this = self as *const Font;
         self.shaper
-            .get_or_init(|| Shaper::new(this))
+            .get_or_init(|| Shaper::new(self))
             .shape_text(text, options, glyphs);
     }
 
@@ -464,14 +453,11 @@ impl Font {
                 None => continue,
             };
 
-            let mut advance = Au::from_f64_px(self.glyph_h_advance(glyph_id));
-            if character == ' ' {
-                // https://drafts.csswg.org/css-text-3/#word-spacing-property
-                advance += options.word_spacing;
-            }
-            if let Some(letter_spacing) = options.letter_spacing {
-                advance += letter_spacing;
-            }
+            let mut advance = advance_for_shaped_glyph(
+                Au::from_f64_px(self.glyph_h_advance(glyph_id)),
+                character,
+                options,
+            );
             let offset = prev_glyph_id.map(|prev| {
                 let h_kerning = Au::from_f64_px(self.glyph_h_kerning(prev, glyph_id));
                 advance += h_kerning;
@@ -485,7 +471,7 @@ impl Font {
         glyphs.finalize_changes();
     }
 
-    pub fn table_for_tag(&self, tag: FontTableTag) -> Option<FontTable> {
+    pub fn table_for_tag(&self, tag: Tag) -> Option<FontTable> {
         let result = self.handle.table_for_tag(tag);
         let status = if result.is_some() {
             "Found"
@@ -496,7 +482,7 @@ impl Font {
         debug!(
             "{} font table[{}] in {:?},",
             status,
-            tag.tag_to_str(),
+            str::from_utf8(tag.as_ref()).unwrap(),
             self.identifier()
         );
         result
@@ -554,12 +540,19 @@ impl Font {
 
     /// Get the [`FontBaseline`] for this font.
     pub fn baseline(&self) -> Option<FontBaseline> {
-        let this = self as *const Font;
-        self.shaper.get_or_init(|| Shaper::new(this)).baseline()
+        self.shaper.get_or_init(|| Shaper::new(self)).baseline()
     }
 }
 
-pub type FontRef = Arc<Font>;
+#[derive(Clone, MallocSizeOf)]
+pub struct FontRef(#[conditional_malloc_size_of] pub(crate) Arc<Font>);
+
+impl Deref for FontRef {
+    type Target = Arc<Font>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 /// A `FontGroup` is a prioritised list of fonts for a given set of font styles. It is used by
 /// `TextRun` to decide which font to render a character with. If none of the fonts listed in the
@@ -922,7 +915,10 @@ pub struct FontBaseline {
 /// ];
 /// let mapped_weight = apply_font_config_to_style_mapping(&mapping, weight as f64);
 /// ```
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    not(target_env = "ohos")
+))]
 pub(crate) fn map_platform_values_to_style_values(mapping: &[(f64, f64)], value: f64) -> f64 {
     if value < mapping[0].0 {
         return mapping[0].1;
@@ -939,4 +935,26 @@ pub(crate) fn map_platform_values_to_style_values(mapping: &[(f64, f64)], value:
     }
 
     mapping[mapping.len() - 1].1
+}
+
+/// Computes the total advance for a glyph, taking `letter-spacing` and `word-spacing` into account.
+pub(super) fn advance_for_shaped_glyph(
+    mut advance: Au,
+    character: char,
+    options: &ShapingOptions,
+) -> Au {
+    if let Some(letter_spacing) = options.letter_spacing {
+        advance += letter_spacing;
+    };
+
+    // CSS 2.1 § 16.4 states that "word spacing affects each space (U+0020) and non-breaking
+    // space (U+00A0) left in the text after the white space processing rules have been
+    // applied. The effect of the property on other word-separator characters is undefined."
+    // We elect to only space the two required code points.
+    if character == ' ' || character == '\u{a0}' {
+        // https://drafts.csswg.org/css-text-3/#word-spacing-property
+        advance += options.word_spacing;
+    }
+
+    advance
 }

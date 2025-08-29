@@ -17,18 +17,18 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::trustedtypepolicy::TrustedType;
-use crate::dom::trustedtypepolicyfactory::TrustedTypePolicyFactory;
+use crate::dom::trustedtypepolicyfactory::{DEFAULT_SCRIPT_SINK_GROUP, TrustedTypePolicyFactory};
 use crate::script_runtime::CanGc;
 
 #[dom_struct]
 pub struct TrustedHTML {
     reflector_: Reflector,
 
-    data: String,
+    data: DOMString,
 }
 
 impl TrustedHTML {
-    fn new_inherited(data: String) -> Self {
+    fn new_inherited(data: DOMString) -> Self {
         Self {
             reflector_: Reflector::new(),
             data,
@@ -36,32 +36,34 @@ impl TrustedHTML {
     }
 
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    pub(crate) fn new(data: String, global: &GlobalScope, can_gc: CanGc) -> DomRoot<Self> {
+    pub(crate) fn new(data: DOMString, global: &GlobalScope, can_gc: CanGc) -> DomRoot<Self> {
         reflect_dom_object(Box::new(Self::new_inherited(data)), global, can_gc)
     }
 
     pub(crate) fn get_trusted_script_compliant_string(
         global: &GlobalScope,
         value: TrustedHTMLOrString,
-        containing_class: &str,
-        field: &str,
+        sink: &str,
         can_gc: CanGc,
-    ) -> Fallible<String> {
+    ) -> Fallible<DOMString> {
         match value {
             TrustedHTMLOrString::String(value) => {
-                let sink = format!("{} {}", containing_class, field);
                 TrustedTypePolicyFactory::get_trusted_type_compliant_string(
                     TrustedType::TrustedHTML,
                     global,
-                    value.as_ref().to_owned(),
-                    &sink,
-                    "'script'",
+                    value,
+                    sink,
+                    DEFAULT_SCRIPT_SINK_GROUP,
                     can_gc,
                 )
             },
 
-            TrustedHTMLOrString::TrustedHTML(trusted_html) => Ok(trusted_html.to_string()),
+            TrustedHTMLOrString::TrustedHTML(trusted_html) => Ok(trusted_html.data.clone()),
         }
+    }
+
+    pub(crate) fn data(&self) -> DOMString {
+        self.data.clone()
     }
 }
 
@@ -75,12 +77,12 @@ impl fmt::Display for TrustedHTML {
 impl TrustedHTMLMethods<crate::DomTypeHolder> for TrustedHTML {
     /// <https://www.w3.org/TR/trusted-types/#trustedhtml-stringification-behavior>
     fn Stringifier(&self) -> DOMString {
-        DOMString::from(&*self.data)
+        self.data.clone()
     }
 
     /// <https://www.w3.org/TR/trusted-types/#dom-trustedhtml-tojson>
     fn ToJSON(&self) -> DOMString {
-        DOMString::from(&*self.data)
+        self.data.clone()
     }
 }
 

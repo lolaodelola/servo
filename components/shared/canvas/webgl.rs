@@ -20,7 +20,7 @@ use glow::{
 };
 use ipc_channel::ipc::{IpcBytesReceiver, IpcBytesSender, IpcSender, IpcSharedMemory};
 use malloc_size_of_derive::MallocSizeOf;
-use pixels::PixelFormat;
+use pixels::{PixelFormat, SnapshotAlphaMode};
 use serde::{Deserialize, Serialize};
 use webrender_api::ImageKey;
 use webxr_api::{
@@ -33,7 +33,7 @@ pub fn webgl_channel<T>() -> Option<(WebGLSender<T>, WebGLReceiver<T>)>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
-    base::generic_channel::channel(servo_config::opts::get().multiprocess)
+    base::generic_channel::channel()
 }
 
 /// Entry point channel type used for sending WebGLMsg messages to the WebGL renderer.
@@ -302,7 +302,7 @@ pub enum WebGLCommand {
         Rect<u32>,
         u32,
         u32,
-        IpcSender<(IpcSharedMemory, snapshot::AlphaMode)>,
+        IpcSender<(IpcSharedMemory, SnapshotAlphaMode)>,
     ),
     ReadPixelsPP(Rect<i32>, u32, u32, usize),
     SampleCoverage(f32, bool),
@@ -364,6 +364,22 @@ pub enum WebGLCommand {
     VertexAttribPointer(u32, i32, u32, bool, i32, u32),
     VertexAttribPointer2f(u32, i32, bool, i32, u32),
     SetViewport(i32, i32, i32, i32),
+    TexImage3D {
+        target: u32,
+        level: u32,
+        internal_format: TexFormat,
+        size: Size2D<u32>,
+        depth: u32,
+        format: TexFormat,
+        data_type: TexDataType,
+        // FIXME: This should be computed on the WebGL thread.
+        effective_data_type: u32,
+        unpacking_alignment: u32,
+        alpha_treatment: Option<AlphaTreatment>,
+        y_axis_treatment: YAxisTreatment,
+        pixel_format: Option<PixelFormat>,
+        data: TruncatedDebug<IpcSharedMemory>,
+    },
     TexImage2D {
         target: u32,
         level: u32,
@@ -753,7 +769,7 @@ pub struct ActiveUniformInfo {
 }
 
 impl ActiveUniformInfo {
-    pub fn name(&self) -> Cow<str> {
+    pub fn name(&self) -> Cow<'_, str> {
         if self.size.is_some() {
             let mut name = String::from(&*self.base_name);
             name.push_str("[0]");
@@ -1437,6 +1453,7 @@ pub struct GLContextAttributes {
 pub struct GLLimits {
     pub max_vertex_attribs: u32,
     pub max_tex_size: u32,
+    pub max_3d_tex_size: u32,
     pub max_cube_map_tex_size: u32,
     pub max_combined_texture_image_units: u32,
     pub max_fragment_uniform_vectors: u32,

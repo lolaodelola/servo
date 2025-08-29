@@ -5,17 +5,19 @@
 use std::default::Default;
 use std::iter;
 
-use webrender_api::units::DeviceIntRect;
-use ipc_channel::ipc;
 use dom_struct::dom_struct;
+use embedder_traits::{EmbedderMsg, FormControl as EmbedderFormControl};
+use embedder_traits::{SelectElementOption, SelectElementOptionOrOptgroup};
+use euclid::{Point2D, Rect, Size2D};
 use html5ever::{LocalName, Prefix, local_name};
+use ipc_channel::ipc;
 use js::rust::HandleObject;
 use style::attr::AttrValue;
 use stylo_dom::ElementState;
-use embedder_traits::{SelectElementOptionOrOptgroup, SelectElementOption};
-use euclid::{Size2D, Point2D, Rect};
-use embedder_traits::{FormControl as EmbedderFormControl, EmbedderMsg};
+use webrender_api::units::DeviceIntRect;
 
+use crate::dom::bindings::refcounted::Trusted;
+use crate::dom::event::{EventBubbles, EventCancelable, EventComposed};
 use crate::dom::bindings::codegen::GenericBindings::HTMLOptGroupElementBinding::HTMLOptGroupElement_Binding::HTMLOptGroupElementMethods;
 use crate::dom::activation::Activatable;
 use crate::dom::attr::Attr;
@@ -26,9 +28,6 @@ use crate::dom::bindings::codegen::Bindings::HTMLOptionElementBinding::HTMLOptio
 use crate::dom::bindings::codegen::Bindings::HTMLOptionsCollectionBinding::HTMLOptionsCollectionMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLSelectElementBinding::HTMLSelectElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
-use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::{
-    ShadowRootMode, SlotAssignmentMode,
-};
 use crate::dom::bindings::codegen::GenericBindings::CharacterDataBinding::CharacterData_Binding::CharacterDataMethods;
 use crate::dom::bindings::codegen::UnionTypes::{
     HTMLElementOrLong, HTMLOptionElementOrHTMLOptGroupElement,
@@ -52,7 +51,6 @@ use crate::dom::htmloptionelement::HTMLOptionElement;
 use crate::dom::htmloptionscollection::HTMLOptionsCollection;
 use crate::dom::node::{BindContext, ChildrenMutation, Node, NodeTraits, UnbindContext};
 use crate::dom::nodelist::NodeList;
-use crate::dom::shadowroot::IsUserAgentWidget;
 use crate::dom::text::Text;
 use crate::dom::validation::{Validatable, is_barred_by_datalist_ancestor};
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
@@ -258,18 +256,7 @@ impl HTMLSelectElement {
 
     fn create_shadow_tree(&self, can_gc: CanGc) {
         let document = self.owner_document();
-        let root = self
-            .upcast::<Element>()
-            .attach_shadow(
-                IsUserAgentWidget::Yes,
-                ShadowRootMode::Closed,
-                false,
-                false,
-                false,
-                SlotAssignmentMode::Manual,
-                can_gc,
-            )
-            .expect("Attaching UA shadow root failed");
+        let root = self.upcast::<Element>().attach_ua_shadow_root(true, can_gc);
 
         let select_box = HTMLDivElement::new(local_name!("div"), None, &document, None, can_gc);
         select_box.upcast::<Element>().set_string_attribute(
@@ -307,7 +294,7 @@ impl HTMLSelectElement {
         );
         chevron_container
             .upcast::<Node>()
-            .SetTextContent(Some("▾".into()), can_gc);
+            .set_text_content_for_element(Some("▾".into()), can_gc);
         select_box
             .upcast::<Node>()
             .AppendChild(chevron_container.upcast::<Node>(), can_gc)
@@ -346,20 +333,13 @@ impl HTMLSelectElement {
             .SetData(displayed_text.trim().into());
     }
 
-    pub(crate) fn selection_changed(&self, can_gc: CanGc) {
-        self.update_shadow_tree(can_gc);
-
-        self.upcast::<EventTarget>()
-            .fire_bubbling_event(atom!("change"), can_gc);
-    }
-
     pub(crate) fn selected_option(&self) -> Option<DomRoot<HTMLOptionElement>> {
         self.list_of_options()
             .find(|opt_elem| opt_elem.Selected())
             .or_else(|| self.list_of_options().next())
     }
 
-    pub(crate) fn show_menu(&self, can_gc: CanGc) -> Option<usize> {
+    pub(crate) fn show_menu(&self) -> Option<usize> {
         let (ipc_sender, ipc_receiver) = ipc::channel().expect("Failed to create IPC channel!");
 
         // Collect list of optgroups and options
@@ -397,7 +377,7 @@ impl HTMLSelectElement {
             })
             .collect();
 
-        let rect = self.upcast::<Node>().bounding_content_box_or_zero(can_gc);
+        let rect = self.upcast::<Node>().border_box().unwrap_or_default();
         let rect = Rect::new(
             Point2D::new(rect.origin.x.to_px(), rect.origin.y.to_px()),
             Size2D::new(rect.size.width.to_px(), rect.size.height.to_px()),
@@ -417,11 +397,38 @@ impl HTMLSelectElement {
             return None;
         };
 
-        if response.is_some() && response != selected_index {
-            self.selection_changed(can_gc);
-        }
-
         response
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#send-select-update-notifications>
+    fn send_update_notifications(&self) {
+        // > When the user agent is to send select update notifications, queue an element task on the
+        // > user interaction task source given the select element to run these steps:
+        let this = Trusted::new(self);
+        self.owner_global()
+            .task_manager()
+            .user_interaction_task_source()
+            .queue(task!(send_select_update_notification: move || {
+                let this = this.root();
+
+                // TODO: Step 1. Set the select element's user validity to true.
+
+                // Step 2. Fire an event named input at the select element, with the bubbles and composed
+                // attributes initialized to true.
+                this.upcast::<EventTarget>()
+                    .fire_event_with_params(
+                        atom!("input"),
+                        EventBubbles::Bubbles,
+                        EventCancelable::NotCancelable,
+                        EventComposed::Composed,
+                        CanGc::note(),
+                    );
+
+                // Step 3. Fire an event named change at the select element, with the bubbles attribute initialized
+                // to true.
+                this.upcast::<EventTarget>()
+                    .fire_bubbling_event(atom!("change"), CanGc::note());
+            }));
     }
 }
 
@@ -578,21 +585,28 @@ impl HTMLSelectElementMethods<crate::DomTypeHolder> for HTMLSelectElement {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-select-selectedindex>
     fn SetSelectedIndex(&self, index: i32, can_gc: CanGc) {
+        let mut selection_did_change = false;
+
         let mut opt_iter = self.list_of_options();
         for opt in opt_iter.by_ref().take(index as usize) {
+            selection_did_change |= opt.Selected();
             opt.set_selectedness(false);
         }
-        if let Some(opt) = opt_iter.next() {
-            opt.set_selectedness(true);
-            opt.set_dirtiness(true);
+        if let Some(selected_option) = opt_iter.next() {
+            selection_did_change |= !selected_option.Selected();
+            selected_option.set_selectedness(true);
+            selected_option.set_dirtiness(true);
+
             // Reset remaining <option> elements
             for opt in opt_iter {
+                selection_did_change |= opt.Selected();
                 opt.set_selectedness(false);
             }
         }
 
-        // TODO: Track whether the selected element actually changed
-        self.update_shadow_tree(can_gc);
+        if selection_did_change {
+            self.update_shadow_tree(can_gc);
+        }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-willvalidate>
@@ -767,14 +781,14 @@ impl Activatable for HTMLSelectElement {
         true
     }
 
-    /// <https://html.spec.whatwg.org/multipage/#input-activation-behavior>
     fn activation_behavior(&self, _event: &Event, _target: &EventTarget, can_gc: CanGc) {
-        let Some(selected_value) = self.show_menu(can_gc) else {
+        let Some(selected_value) = self.show_menu() else {
             // The user did not select a value
             return;
         };
 
         self.SetSelectedIndex(selected_value as i32, can_gc);
+        self.send_update_notifications();
     }
 }
 

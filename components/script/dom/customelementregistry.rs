@@ -10,12 +10,12 @@ use std::{mem, ptr};
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Namespace, Prefix, ns};
-use js::conversions::ToJSValConvertible;
 use js::glue::UnwrapObjectStatic;
 use js::jsapi::{HandleValueArray, Heap, IsCallable, IsConstructor, JSAutoRealm, JSObject};
 use js::jsval::{BooleanValue, JSVal, NullValue, ObjectValue, UndefinedValue};
 use js::rust::wrappers::{Construct1, JS_GetProperty, SameValue};
-use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+use js::rust::{HandleObject, MutableHandleValue};
+use script_bindings::conversions::{SafeFromJSValConvertible, SafeToJSValConvertible};
 
 use super::bindings::trace::HashMapTracedValues;
 use crate::dom::bindings::callback::{CallbackContainer, ExceptionHandling};
@@ -26,15 +26,13 @@ use crate::dom::bindings::codegen::Bindings::CustomElementRegistryBinding::{
 use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
-use crate::dom::bindings::conversions::{
-    ConversionResult, FromJSValConvertible, StringificationBehavior,
-};
+use crate::dom::bindings::conversions::{ConversionResult, StringificationBehavior};
 use crate::dom::bindings::error::{
     Error, ErrorResult, Fallible, report_pending_exception, throw_dom_exception,
 };
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{DomGlobal, DomObject, Reflector, reflect_dom_object};
-use crate::dom::bindings::root::{Dom, DomRoot};
+use crate::dom::bindings::root::{AsHandleValue, Dom, DomRoot};
 use crate::dom::bindings::settings_stack::is_execution_stack_empty;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
@@ -222,13 +220,11 @@ impl CustomElementRegistry {
             return Ok(Vec::new());
         }
 
-        let conversion = unsafe {
-            FromJSValConvertible::from_jsval(
-                *cx,
-                observed_attributes.handle(),
-                StringificationBehavior::Default,
-            )
-        };
+        let conversion = SafeFromJSValConvertible::safe_from_jsval(
+            cx,
+            observed_attributes.handle(),
+            StringificationBehavior::Default,
+        );
         match conversion {
             Ok(ConversionResult::Success(attributes)) => Ok(attributes),
             Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into())),
@@ -258,7 +254,7 @@ impl CustomElementRegistry {
         }
 
         let conversion =
-            unsafe { FromJSValConvertible::from_jsval(*cx, form_associated_value.handle(), ()) };
+            SafeFromJSValConvertible::safe_from_jsval(cx, form_associated_value.handle(), ());
         match conversion {
             Ok(ConversionResult::Success(flag)) => Ok(flag),
             Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into())),
@@ -287,13 +283,11 @@ impl CustomElementRegistry {
             return Ok(Vec::new());
         }
 
-        let conversion = unsafe {
-            FromJSValConvertible::from_jsval(
-                *cx,
-                disabled_features.handle(),
-                StringificationBehavior::Default,
-            )
-        };
+        let conversion = SafeFromJSValConvertible::safe_from_jsval(
+            cx,
+            disabled_features.handle(),
+            StringificationBehavior::Default,
+        );
         match conversion {
             Ok(ConversionResult::Success(attributes)) => Ok(attributes),
             Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into())),
@@ -349,7 +343,7 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
         rooted!(in(*cx) let constructor = constructor_.callback());
         let name = LocalName::from(&*name);
 
-        // Step 1
+        // Step 1. If IsConstructor(constructor) is false, then throw a TypeError.
         // We must unwrap the constructor as all wrappers are constructable if they are callable.
         rooted!(in(*cx) let unwrapped_constructor = unsafe { UnwrapObjectStatic(constructor.get()) });
 
@@ -364,17 +358,19 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
             ));
         }
 
-        // Step 2
+        // Step 2. If name is not a valid custom element name, then throw a "SyntaxError" DOMException.
         if !is_valid_custom_element_name(&name) {
             return Err(Error::Syntax);
         }
 
-        // Step 3
+        // Step 3. If this's custom element definition set contains an item with name name,
+        // then throw a "NotSupportedError" DOMException.
         if self.definitions.borrow().contains_key(&name) {
             return Err(Error::NotSupported);
         }
 
-        // Step 4
+        // Step 4. If this's custom element definition set contains an
+        // item with constructor constructor, then throw a "NotSupportedError" DOMException.
         if self
             .definitions
             .borrow()
@@ -384,24 +380,29 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
             return Err(Error::NotSupported);
         }
 
-        // Step 6
+        // Step 6. Let extends be options["extends"] if it exists; otherwise null.
         let extends = &options.extends;
 
         // Steps 5, 7
         let local_name = if let Some(ref extended_name) = *extends {
-            // Step 7.1
+            // TODO Step 7.1 If this's is scoped is true, then throw a "NotSupportedError" DOMException.
+
+            // Step 7.2 If extends is a valid custom element name, then throw a "NotSupportedError" DOMException.
             if is_valid_custom_element_name(extended_name) {
                 return Err(Error::NotSupported);
             }
 
-            // Step 7.2
+            // Step 7.3 If the element interface for extends and the HTML namespace is HTMLUnknownElement
+            // (e.g., if extends does not indicate an element definition in this specification)
+            // then throw a "NotSupportedError" DOMException.
             if !is_extendable_element_interface(extended_name) {
                 return Err(Error::NotSupported);
             }
 
+            // Step 7.4 Set localName to extends.
             LocalName::from(&**extended_name)
         } else {
-            // Step 7.3
+            // Step 5. Let localName be name.
             name.clone()
         };
 
@@ -434,7 +435,8 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
         rooted!(in(*cx) let proto_object = prototype.to_object());
         let mut callbacks = {
             let _ac = JSAutoRealm::new(*cx, proto_object.get());
-            match unsafe { self.get_callbacks(proto_object.handle()) } {
+            let callbacks = unsafe { self.get_callbacks(proto_object.handle()) };
+            match callbacks {
                 Ok(callbacks) => callbacks,
                 Err(error) => {
                     self.element_definition_is_running.set(false);
@@ -539,24 +541,19 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
         // Step 16, 16.3
         let promise = self.when_defined.borrow_mut().remove(&name);
         if let Some(promise) = promise {
-            unsafe {
-                rooted!(in(*cx) let mut constructor = UndefinedValue());
-                definition
-                    .constructor
-                    .to_jsval(*cx, constructor.handle_mut());
-                promise.resolve_native(&constructor.get(), can_gc);
-            }
+            rooted!(in(*cx) let mut constructor = UndefinedValue());
+            definition
+                .constructor
+                .safe_to_jsval(cx, constructor.handle_mut());
+            promise.resolve_native(&constructor.get(), can_gc);
         }
         Ok(())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-get>
-    #[allow(unsafe_code)]
     fn Get(&self, cx: JSContext, name: DOMString, mut retval: MutableHandleValue) {
         match self.definitions.borrow().get(&LocalName::from(&*name)) {
-            Some(definition) => unsafe {
-                definition.constructor.to_jsval(*cx, retval);
-            },
+            Some(definition) => definition.constructor.safe_to_jsval(cx, retval),
             None => retval.set(UndefinedValue()),
         }
     }
@@ -572,7 +569,6 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-whendefined>
-    #[allow(unsafe_code)]
     fn WhenDefined(&self, name: DOMString, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let name = LocalName::from(&*name);
 
@@ -592,28 +588,23 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
 
         // Step 2
         if let Some(definition) = self.definitions.borrow().get(&LocalName::from(&*name)) {
-            unsafe {
-                let cx = GlobalScope::get_cx();
-                rooted!(in(*cx) let mut constructor = UndefinedValue());
-                definition
-                    .constructor
-                    .to_jsval(*cx, constructor.handle_mut());
-                let promise = Promise::new_in_current_realm(comp, can_gc);
-                promise.resolve_native(&constructor.get(), can_gc);
-                return promise;
-            }
+            let cx = GlobalScope::get_cx();
+            rooted!(in(*cx) let mut constructor = UndefinedValue());
+            definition
+                .constructor
+                .safe_to_jsval(cx, constructor.handle_mut());
+            let promise = Promise::new_in_current_realm(comp, can_gc);
+            promise.resolve_native(&constructor.get(), can_gc);
+            return promise;
         }
 
-        // Steps 3, 4, 5
+        // Steps 3, 4, 5, 6
         let existing_promise = self.when_defined.borrow().get(&name).cloned();
-        let promise = existing_promise.unwrap_or_else(|| {
+        existing_promise.unwrap_or_else(|| {
             let promise = Promise::new_in_current_realm(comp, can_gc);
             self.when_defined.borrow_mut().insert(name, promise.clone());
             promise
-        });
-
-        // Step 6
-        promise
+        })
     }
     /// <https://html.spec.whatwg.org/multipage/#dom-customelementregistry-upgrade>
     fn Upgrade(&self, node: &Node) {
@@ -630,28 +621,28 @@ impl CustomElementRegistryMethods<crate::DomTypeHolder> for CustomElementRegistr
 
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 pub(crate) struct LifecycleCallbacks {
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     connected_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     disconnected_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     adopted_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     attribute_changed_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     form_associated_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     form_reset_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     form_disabled_callback: Option<Rc<Function>>,
 
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     form_state_restore_callback: Option<Rc<Function>>,
 }
 
@@ -673,7 +664,7 @@ pub(crate) struct CustomElementDefinition {
     pub(crate) local_name: LocalName,
 
     /// <https://html.spec.whatwg.org/multipage/#concept-custom-element-definition-constructor>
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     pub(crate) constructor: Rc<CustomElementConstructor>,
 
     /// <https://html.spec.whatwg.org/multipage/#concept-custom-element-definition-observed-attributes>
@@ -758,7 +749,7 @@ impl CustomElementDefinition {
 
         rooted!(in(*cx) let element_val = ObjectValue(element.get()));
         let element: DomRoot<Element> =
-            match unsafe { DomRoot::from_jsval(*cx, element_val.handle(), ()) } {
+            match SafeFromJSValConvertible::safe_from_jsval(cx, element_val.handle(), ()) {
                 Ok(ConversionResult::Success(element)) => element,
                 Ok(ConversionResult::Failure(..)) => {
                     return Err(Error::Type(
@@ -927,9 +918,7 @@ fn run_upgrade_constructor(
     let cx = GlobalScope::get_cx();
     rooted!(in(*cx) let constructor_val = ObjectValue(constructor.callback()));
     rooted!(in(*cx) let mut element_val = UndefinedValue());
-    unsafe {
-        element.to_jsval(*cx, element_val.handle_mut());
-    }
+    element.safe_to_jsval(cx, element_val.handle_mut());
     rooted!(in(*cx) let mut construct_result = ptr::null_mut::<JSObject>());
     {
         // Step 8.1. If definition's disable shadow is true and element's shadow root is non-null,
@@ -1006,16 +995,15 @@ pub(crate) fn try_upgrade_element(element: &Element) {
 #[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) enum CustomElementReaction {
-    Upgrade(#[ignore_malloc_size_of = "Rc"] Rc<CustomElementDefinition>),
+    Upgrade(#[conditional_malloc_size_of] Rc<CustomElementDefinition>),
     Callback(
-        #[ignore_malloc_size_of = "Rc"] Rc<Function>,
+        #[conditional_malloc_size_of] Rc<Function>,
         #[ignore_malloc_size_of = "mozjs"] Box<[Heap<JSVal>]>,
     ),
 }
 
 impl CustomElementReaction {
     /// <https://html.spec.whatwg.org/multipage/#invoke-custom-element-reactions>
-    #[allow(unsafe_code)]
     pub(crate) fn invoke(&self, element: &Element, can_gc: CanGc) {
         // Step 2.1
         match *self {
@@ -1024,10 +1012,7 @@ impl CustomElementReaction {
             },
             CustomElementReaction::Callback(ref callback, ref arguments) => {
                 // We're rooted, so it's safe to hand out a handle to objects in Heap
-                let arguments = arguments
-                    .iter()
-                    .map(|arg| unsafe { HandleValue::from_raw(arg.handle()) })
-                    .collect();
+                let arguments = arguments.iter().map(|arg| arg.as_handle_value()).collect();
                 rooted!(in(*GlobalScope::get_cx()) let mut value: JSVal);
                 let _ = callback.Call_(
                     element,
@@ -1128,7 +1113,7 @@ impl CustomElementReactionStack {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#enqueue-a-custom-element-callback-reaction>
-    #[allow(unsafe_code)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn enqueue_callback_reaction(
         &self,
         element: &Element,
@@ -1174,30 +1159,22 @@ impl CustomElementReactionStack {
 
                 let local_name = DOMString::from(&*local_name);
                 rooted!(in(*cx) let mut name_value = UndefinedValue());
-                unsafe {
-                    local_name.to_jsval(*cx, name_value.handle_mut());
-                }
+                local_name.safe_to_jsval(cx, name_value.handle_mut());
 
                 rooted!(in(*cx) let mut old_value = NullValue());
                 if let Some(old_val) = old_val {
-                    unsafe {
-                        old_val.to_jsval(*cx, old_value.handle_mut());
-                    }
+                    old_val.safe_to_jsval(cx, old_value.handle_mut());
                 }
 
                 rooted!(in(*cx) let mut value = NullValue());
                 if let Some(val) = val {
-                    unsafe {
-                        val.to_jsval(*cx, value.handle_mut());
-                    }
+                    val.safe_to_jsval(cx, value.handle_mut());
                 }
 
                 rooted!(in(*cx) let mut namespace_value = NullValue());
                 if namespace != ns!() {
                     let namespace = DOMString::from(&*namespace);
-                    unsafe {
-                        namespace.to_jsval(*cx, namespace_value.handle_mut());
-                    }
+                    namespace.safe_to_jsval(cx, namespace_value.handle_mut());
                 }
 
                 let args = vec![

@@ -6,7 +6,6 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use base::id::WebViewId;
-use content_security_policy as csp;
 use ipc_channel::ipc;
 use net_traits::policy_container::{PolicyContainer, RequestPolicyContainer};
 use net_traits::request::{
@@ -31,6 +30,7 @@ use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::trace::RootedTraceableBox;
+use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::headers::Guard;
 use crate::dom::performanceresourcetiming::InitiatorType;
@@ -48,21 +48,27 @@ struct FetchContext {
     resource_timing: ResourceFetchTiming,
 }
 
-/// RAII fetch canceller object. By default initialized to not having a canceller
-/// in it, however you can ask it for a cancellation receiver to send to Fetch
-/// in which case it will store the sender. You can manually cancel it
-/// or let it cancel on Drop in that case.
+/// RAII fetch canceller object.
+/// By default initialized to having a
+/// request associated with it, which can be manually cancelled with `cancel`,
+/// or automatically cancelled on drop.
+/// Calling `ignore` will sever the relationship with the request,
+/// meaning it cannot be cancelled through this canceller from that point on.
 #[derive(Default, JSTraceable, MallocSizeOf)]
 pub(crate) struct FetchCanceller {
     #[no_trace]
     request_id: Option<RequestId>,
+    #[no_trace]
+    core_resource_thread: Option<CoreResourceThread>,
 }
 
 impl FetchCanceller {
-    /// Create an empty FetchCanceller
-    pub(crate) fn new(request_id: RequestId) -> Self {
+    /// Create a FetchCanceller associated with a request,
+    // and a particular(public vs private) resource thread.
+    pub(crate) fn new(request_id: RequestId, core_resource_thread: CoreResourceThread) -> Self {
         Self {
             request_id: Some(request_id),
+            core_resource_thread: Some(core_resource_thread),
         }
     }
 
@@ -72,9 +78,11 @@ impl FetchCanceller {
             // stop trying to make fetch happen
             // it's not going to happen
 
-            // No error handling here. Cancellation is a courtesy call,
-            // we don't actually care if the other side heard.
-            cancel_async_fetch(vec![request_id]);
+            if let Some(ref core_resource_thread) = self.core_resource_thread {
+                // No error handling here. Cancellation is a courtesy call,
+                // we don't actually care if the other side heard.
+                cancel_async_fetch(vec![request_id], core_resource_thread);
+            }
         }
     }
 
@@ -311,9 +319,9 @@ impl FetchResponseListener for FetchContext {
         }
     }
 
-    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
+    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
         let global = &self.resource_timing_global();
-        global.report_csp_violations(violations, None);
+        global.report_csp_violations(violations, None, None);
     }
 }
 
@@ -337,11 +345,16 @@ fn fill_headers_with_metadata(r: DomRoot<Response>, m: Metadata, can_gc: CanGc) 
     r.set_redirected(m.redirected);
 }
 
+pub(crate) trait CspViolationsProcessor {
+    fn process_csp_violations(&self, violations: Vec<Violation>);
+}
+
 /// Convenience function for synchronously loading a whole resource.
 pub(crate) fn load_whole_resource(
     request: RequestBuilder,
     core_resource_thread: &CoreResourceThread,
     global: &GlobalScope,
+    csp_violations_processor: &dyn CspViolationsProcessor,
     can_gc: CanGc,
 ) -> Result<(Metadata, Vec<u8>), NetworkError> {
     let request = request.https_state(global.get_https_state());
@@ -358,9 +371,8 @@ pub(crate) fn load_whole_resource(
     let mut metadata = None;
     loop {
         match action_receiver.recv().unwrap() {
-            FetchResponseMsg::ProcessRequestBody(..) |
-            FetchResponseMsg::ProcessRequestEOF(..) |
-            FetchResponseMsg::ProcessCspViolations(..) => {},
+            FetchResponseMsg::ProcessRequestBody(..) | FetchResponseMsg::ProcessRequestEOF(..) => {
+            },
             FetchResponseMsg::ProcessResponse(_, Ok(m)) => {
                 metadata = Some(match m {
                     FetchMetadata::Unfiltered(m) => m,
@@ -377,6 +389,9 @@ pub(crate) fn load_whole_resource(
             },
             FetchResponseMsg::ProcessResponse(_, Err(e)) |
             FetchResponseMsg::ProcessResponseEOF(_, Err(e)) => return Err(e),
+            FetchResponseMsg::ProcessCspViolations(_, violations) => {
+                csp_violations_processor.process_csp_violations(violations);
+            },
         }
     }
 }

@@ -9,19 +9,21 @@
 #![deny(missing_docs)]
 #![deny(unsafe_code)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
 use background_hang_monitor_api::BackgroundHangMonitorRegister;
 use base::cross_process_instant::CrossProcessInstant;
+use base::generic_channel::{GenericReceiver, GenericSender};
 use base::id::{BrowsingContextId, HistoryStateId, PipelineId, PipelineNamespaceId, WebViewId};
 #[cfg(feature = "bluetooth")]
 use bluetooth_traits::BluetoothRequest;
 use canvas_traits::webgl::WebGLPipeline;
 use compositing_traits::CrossProcessCompositorApi;
 use constellation_traits::{
-    LoadData, NavigationHistoryBehavior, ScriptToConstellationChan, ScrollState,
-    StructuredSerializedData, WindowSizeType,
+    LoadData, NavigationHistoryBehavior, ScriptToConstellationChan, StructuredSerializedData,
+    WindowSizeType,
 };
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use devtools_traits::ScriptToDevtoolsControlMsg;
@@ -41,14 +43,15 @@ use net_traits::storage_thread::StorageType;
 use pixels::PixelFormat;
 use profile_traits::mem;
 use serde::{Deserialize, Serialize};
+use servo_config::prefs::PrefValue;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use strum_macros::IntoStaticStr;
 use style_traits::{CSSPixel, SpeculativePainter};
 use stylo_atoms::Atom;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::WebGPUMsg;
-use webrender_api::ImageKey;
-use webrender_api::units::DevicePixel;
+use webrender_api::units::{DevicePixel, LayoutVector2D};
+use webrender_api::{ExternalScrollId, ImageKey};
 
 /// The initial data required to create a new layout attached to an existing script thread.
 #[derive(Debug, Deserialize, Serialize)]
@@ -68,6 +71,8 @@ pub struct NewLayoutInfo {
     pub load_data: LoadData,
     /// Initial [`ViewportDetails`] for this layout.
     pub viewport_details: ViewportDetails,
+    /// The [`Theme`] of the new layout.
+    pub theme: Theme,
 }
 
 /// When a pipeline is closed, should its browsing context be discarded too?
@@ -137,11 +142,15 @@ pub enum ScriptThreadMessage {
     /// Notifies the script that the document associated with this pipeline should 'unload'.
     UnloadDocument(PipelineId),
     /// Notifies the script that a pipeline should be closed.
-    ExitPipeline(PipelineId, DiscardBrowsingContext),
+    ExitPipeline(WebViewId, PipelineId, DiscardBrowsingContext),
     /// Notifies the script that the whole thread should be closed.
     ExitScriptThread,
     /// Sends a DOM event.
     SendInputEvent(PipelineId, ConstellationInputEvent),
+    /// Request that the given pipeline refresh the cursor by doing a hit test at the most
+    /// recently hovered cursor position and resetting the cursor. This happens after a
+    /// display list update is rendered.
+    RefreshCursor(PipelineId),
     /// Notifies script of the viewport.
     Viewport(PipelineId, Rect<f32, UnknownUnit>),
     /// Requests that the script thread immediately send the constellation the title of a pipeline.
@@ -174,7 +183,7 @@ pub enum ScriptThreadMessage {
         /// <https://html.spec.whatwg.org/multipage/#dom-messageevent-origin>
         source_origin: ImmutableOrigin,
         /// The data to be posted.
-        data: StructuredSerializedData,
+        data: Box<StructuredSerializedData>,
     },
     /// Updates the current pipeline ID of a given iframe.
     /// First PipelineId is for the parent, second is the new PipelineId for the frame.
@@ -244,10 +253,14 @@ pub enum ScriptThreadMessage {
     SetWebGPUPort(IpcReceiver<WebGPUMsg>),
     /// The compositor scrolled and is updating the scroll states of the nodes in the given
     /// pipeline via the Constellation.
-    SetScrollStates(PipelineId, Vec<ScrollState>),
+    SetScrollStates(PipelineId, HashMap<ExternalScrollId, LayoutVector2D>),
     /// Evaluate the given JavaScript and return a result via a corresponding message
     /// to the Constellation.
     EvaluateJavaScript(PipelineId, JavaScriptEvaluationId, String),
+    /// A new batch of keys for the image cache for the specific pipeline.
+    SendImageKeysBatch(PipelineId, Vec<ImageKey>),
+    /// Preferences were updated in the parent process.
+    PreferencesUpdated(Vec<(String, PrefValue)>),
 }
 
 impl fmt::Debug for ScriptThreadMessage {
@@ -299,9 +312,9 @@ pub struct InitialScriptState {
     /// Loading into a Secure Context
     pub inherited_secure_context: Option<bool>,
     /// A channel with which messages can be sent to us (the script thread).
-    pub constellation_sender: IpcSender<ScriptThreadMessage>,
+    pub constellation_sender: GenericSender<ScriptThreadMessage>,
     /// A port on which messages sent by the constellation to script can be received.
-    pub constellation_receiver: IpcReceiver<ScriptThreadMessage>,
+    pub constellation_receiver: GenericReceiver<ScriptThreadMessage>,
     /// A channel on which messages can be sent to the constellation from script.
     pub pipeline_to_constellation_sender: ScriptToConstellationChan,
     /// A handle to register script-(and associated layout-)threads for hang monitoring.
@@ -321,6 +334,8 @@ pub struct InitialScriptState {
     pub devtools_server_sender: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
     /// Initial [`ViewportDetails`] for the frame that is initiating this `ScriptThread`.
     pub viewport_details: ViewportDetails,
+    /// Initial [`Theme`] for the frame that is initiating this `ScriptThread`.
+    pub theme: Theme,
     /// The ID of the pipeline namespace for this script thread.
     pub pipeline_namespace_id: PipelineNamespaceId,
     /// A ping will be sent on this channel once the script thread shuts down.

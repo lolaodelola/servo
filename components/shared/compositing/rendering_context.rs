@@ -381,6 +381,7 @@ impl RenderingContext for SoftwareRenderingContext {
 /// If you would like to paint to only a portion of the window, consider using
 /// [`OffscreenRenderingContext`] by calling [`WindowRenderingContext::offscreen_context`].
 pub struct WindowRenderingContext {
+    /// The inner size of the window in physical pixels which excludes OS decorations.
     size: Cell<PhysicalSize<u32>>,
     surfman_context: SurfmanRenderingContext,
 }
@@ -465,7 +466,7 @@ impl WindowRenderingContext {
         Ok(())
     }
 
-    pub fn surfman_details(&self) -> (RefMut<Device>, RefMut<Context>) {
+    pub fn surfman_details(&self) -> (RefMut<'_, Device>, RefMut<'_, Context>) {
         (
             self.surfman_context.device.borrow_mut(),
             self.surfman_context.context.borrow_mut(),

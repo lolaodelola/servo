@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use html5ever::{QualName, local_name, namespace_prefix, ns};
+use html5ever::{LocalName, Namespace, Prefix, QualName, local_name, namespace_prefix, ns};
 
 use super::parser::{
     AdditiveOp, Axis, EqualityOp, Expr, FilterExpr, KindTest, Literal, MultiplicativeOp, NodeTest,
@@ -12,13 +12,17 @@ use super::parser::{
     QName as ParserQualName, RelationalOp, StepExpr, UnaryOp,
 };
 use super::{EvaluationCtx, Value};
+use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
+use crate::dom::bindings::domname::namespace_from_domstring;
 use crate::dom::bindings::inheritance::{Castable, CharacterDataTypeId, NodeTypeId};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::xmlname::validate_and_extract;
+use crate::dom::bindings::str::DOMString;
+use crate::dom::bindings::xmlname;
 use crate::dom::element::Element;
 use crate::dom::node::{Node, ShadowIncluding};
 use crate::dom::processinginstruction::ProcessingInstruction;
+use crate::xpath::context::PredicateCtx;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Error {
@@ -80,6 +84,22 @@ where
 
     fn is_primitive(&self) -> bool {
         (**self).is_primitive()
+    }
+}
+
+impl<T> Evaluatable for Option<T>
+where
+    T: Evaluatable,
+{
+    fn evaluate(&self, context: &EvaluationCtx) -> Result<Value, Error> {
+        match self {
+            Some(expr) => expr.evaluate(context),
+            None => Ok(Value::Nodeset(vec![])),
+        }
+    }
+
+    fn is_primitive(&self) -> bool {
+        self.as_ref().is_some_and(|t| T::is_primitive(t))
     }
 }
 
@@ -177,7 +197,12 @@ impl Evaluatable for Expr {
 
 impl Evaluatable for PathExpr {
     fn evaluate(&self, context: &EvaluationCtx) -> Result<Value, Error> {
-        let mut current_nodes = vec![context.context_node.clone()];
+        // Use starting_node for absolute/descendant paths, context_node otherwise
+        let mut current_nodes = if self.is_absolute || self.is_descendant {
+            vec![context.starting_node.clone()]
+        } else {
+            vec![context.context_node.clone()]
+        };
 
         // If path starts with '//', add an implicit descendant-or-self::node() step
         if self.is_descendant {
@@ -230,21 +255,136 @@ impl Evaluatable for PathExpr {
     }
 }
 
-impl TryFrom<&ParserQualName> for QualName {
+/// Error types for validate and extract a qualified name following
+/// the XML naming rules.
+#[derive(Debug)]
+enum ValidationError {
+    InvalidCharacter,
+    Namespace,
+}
+
+/// Validate a qualified name following the XML naming rules.
+///
+/// On success, this returns a tuple `(prefix, local name)`.
+fn validate_and_extract_qualified_name(
+    qualified_name: &str,
+) -> Result<(Option<&str>, &str), ValidationError> {
+    if qualified_name.is_empty() {
+        // Qualified names must not be empty
+        return Err(ValidationError::InvalidCharacter);
+    }
+    let mut colon_offset = None;
+    let mut at_start_of_name = true;
+
+    for (byte_position, c) in qualified_name.char_indices() {
+        if c == ':' {
+            if colon_offset.is_some() {
+                // Qualified names must not contain more than one colon
+                return Err(ValidationError::InvalidCharacter);
+            }
+            colon_offset = Some(byte_position);
+            at_start_of_name = true;
+            continue;
+        }
+
+        if at_start_of_name {
+            if !xmlname::is_valid_start(c) {
+                // Name segments must begin with a valid start character
+                return Err(ValidationError::InvalidCharacter);
+            }
+            at_start_of_name = false;
+        } else if !xmlname::is_valid_continuation(c) {
+            // Name segments must consist of valid characters
+            return Err(ValidationError::InvalidCharacter);
+        }
+    }
+
+    let Some(colon_offset) = colon_offset else {
+        // Simple case: there is no prefix
+        return Ok((None, qualified_name));
+    };
+
+    let (prefix, local_name) = qualified_name.split_at(colon_offset);
+    let local_name = &local_name[1..]; // Remove the colon
+
+    if prefix.is_empty() || local_name.is_empty() {
+        // Neither prefix nor local name can be empty
+        return Err(ValidationError::InvalidCharacter);
+    }
+
+    Ok((Some(prefix), local_name))
+}
+
+/// Validate a namespace and qualified name following the XML naming rules
+/// and extract their parts.
+fn validate_and_extract(
+    namespace: Option<DOMString>,
+    qualified_name: &str,
+) -> Result<(Namespace, Option<Prefix>, LocalName), ValidationError> {
+    // Step 1. If namespace is the empty string, then set it to null.
+    let namespace = namespace_from_domstring(namespace);
+
+    // Step 2. Validate qualifiedName.
+    // Step 3. Let prefix be null.
+    // Step 4. Let localName be qualifiedName.
+    // Step 5. If qualifiedName contains a U+003A (:):
+    // NOTE: validate_and_extract_qualified_name does all of these things for us, because
+    // it's easier to do them together
+    let (prefix, local_name) = validate_and_extract_qualified_name(qualified_name)?;
+    debug_assert!(!local_name.contains(':'));
+
+    match (namespace, prefix) {
+        (ns!(), Some(_)) => {
+            // Step 6. If prefix is non-null and namespace is null, then throw a "NamespaceError" DOMException.
+            Err(ValidationError::Namespace)
+        },
+        (ref ns, Some("xml")) if ns != &ns!(xml) => {
+            // Step 7. If prefix is "xml" and namespace is not the XML namespace,
+            // then throw a "NamespaceError" DOMException.
+            Err(ValidationError::Namespace)
+        },
+        (ref ns, p) if ns != &ns!(xmlns) && (qualified_name == "xmlns" || p == Some("xmlns")) => {
+            // Step 8. If either qualifiedName or prefix is "xmlns" and namespace is not the XMLNS namespace,
+            // then throw a "NamespaceError" DOMException.
+            Err(ValidationError::Namespace)
+        },
+        (ns!(xmlns), p) if qualified_name != "xmlns" && p != Some("xmlns") => {
+            // Step 9. If namespace is the XMLNS namespace and neither qualifiedName nor prefix is "xmlns",
+            // then throw a "NamespaceError" DOMException.
+            Err(ValidationError::Namespace)
+        },
+        (ns, p) => {
+            // Step 10. Return namespace, prefix, and localName.
+            Ok((ns, p.map(Prefix::from), LocalName::from(local_name)))
+        },
+    }
+}
+
+pub(crate) struct QualNameConverter<'a> {
+    qname: &'a ParserQualName,
+    context: &'a EvaluationCtx,
+}
+
+impl<'a> TryFrom<QualNameConverter<'a>> for QualName {
     type Error = Error;
 
-    fn try_from(qname: &ParserQualName) -> Result<Self, Self::Error> {
-        let qname_as_str = qname.to_string();
-        if let Ok((ns, prefix, local)) = validate_and_extract(None, &qname_as_str) {
+    fn try_from(converter: QualNameConverter<'a>) -> Result<Self, Self::Error> {
+        let qname_as_str = converter.qname.to_string();
+        let namespace = converter
+            .context
+            .resolve_namespace(converter.qname.prefix.as_deref());
+
+        if let Ok((ns, prefix, local)) = validate_and_extract(namespace, &qname_as_str) {
             Ok(QualName { prefix, ns, local })
         } else {
             Err(Error::InvalidQName {
-                qname: qname.clone(),
+                qname: converter.qname.clone(),
             })
         }
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum NameTestComparisonMode {
     /// Namespaces must match exactly
     XHtml,
@@ -294,29 +434,41 @@ pub(crate) fn element_name_test(
     }
 }
 
-fn apply_node_test(test: &NodeTest, node: &Node) -> Result<bool, Error> {
+fn apply_node_test(context: &EvaluationCtx, test: &NodeTest, node: &Node) -> Result<bool, Error> {
     let result = match test {
         NodeTest::Name(qname) => {
             // Convert the unvalidated "parser QualName" into the proper QualName structure
-            let wanted_name: QualName = qname.try_into()?;
-            if matches!(node.type_id(), NodeTypeId::Element(_)) {
-                let element = node.downcast::<Element>().unwrap();
-                let comparison_mode = if node.owner_doc().is_xhtml_document() {
-                    NameTestComparisonMode::XHtml
-                } else {
-                    NameTestComparisonMode::Html
-                };
-                let element_qualname = QualName::new(
-                    element.prefix().as_ref().cloned(),
-                    element.namespace().clone(),
-                    element.local_name().clone(),
-                );
-                element_name_test(wanted_name, element_qualname, comparison_mode)
-            } else {
-                false
+            let wanted_name: QualName = QualNameConverter { qname, context }.try_into()?;
+            match node.type_id() {
+                NodeTypeId::Element(_) => {
+                    let element = node.downcast::<Element>().unwrap();
+                    let comparison_mode = if node.owner_doc().is_html_document() {
+                        NameTestComparisonMode::Html
+                    } else {
+                        NameTestComparisonMode::XHtml
+                    };
+                    let element_qualname = QualName::new(
+                        element.prefix().as_ref().cloned(),
+                        element.namespace().clone(),
+                        element.local_name().clone(),
+                    );
+                    element_name_test(wanted_name, element_qualname, comparison_mode)
+                },
+                NodeTypeId::Attr => {
+                    let attr = node.downcast::<Attr>().unwrap();
+                    let attr_qualname = QualName::new(
+                        attr.prefix().cloned(),
+                        attr.namespace().clone(),
+                        attr.local_name().clone(),
+                    );
+                    // attributes are always compared with strict namespace matching
+                    let comparison_mode = NameTestComparisonMode::XHtml;
+                    element_name_test(wanted_name, attr_qualname, comparison_mode)
+                },
+                _ => false,
             }
         },
-        NodeTest::Wildcard => true,
+        NodeTest::Wildcard => matches!(node.type_id(), NodeTypeId::Element(_)),
         NodeTest::Kind(kind) => match kind {
             KindTest::PI(target) => {
                 if NodeTypeId::CharacterData(CharacterDataTypeId::ProcessingInstruction) ==
@@ -411,7 +563,7 @@ impl Evaluatable for StepExpr {
                 let filtered_nodes: Vec<DomRoot<Node>> = nodes
                     .into_iter()
                     .map(|node| {
-                        apply_node_test(&axis_step.node_test, &node)
+                        apply_node_test(context, &axis_step.node_test, &node)
                             .map(|matches| matches.then_some(node))
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -448,18 +600,36 @@ impl Evaluatable for StepExpr {
 impl Evaluatable for PredicateListExpr {
     fn evaluate(&self, context: &EvaluationCtx) -> Result<Value, Error> {
         if let Some(ref predicate_nodes) = context.predicate_nodes {
-            // Initializing: every node the predicates act on is matched
             let mut matched_nodes: Vec<DomRoot<Node>> = predicate_nodes.clone();
 
-            // apply each predicate to the nodes matched by the previous predicate
             for predicate_expr in &self.predicates {
-                let context_for_predicate =
-                    context.update_predicate_nodes(matched_nodes.iter().map(|n| &**n).collect());
+                let size = matched_nodes.len();
+                let mut new_matched = Vec::new();
 
-                let narrowed_nodes = predicate_expr
-                    .evaluate(&context_for_predicate)
-                    .and_then(try_extract_nodeset)?;
-                matched_nodes = narrowed_nodes;
+                for (i, node) in matched_nodes.iter().enumerate() {
+                    // 1-based position, per XPath spec
+                    let predicate_ctx = EvaluationCtx {
+                        starting_node: context.starting_node.clone(),
+                        context_node: node.clone(),
+                        predicate_nodes: context.predicate_nodes.clone(),
+                        predicate_ctx: Some(PredicateCtx { index: i + 1, size }),
+                    };
+
+                    let eval_result = predicate_expr.expr.evaluate(&predicate_ctx);
+
+                    let keep = match eval_result {
+                        Ok(Value::Number(n)) => (i + 1) as f64 == n,
+                        Ok(Value::Boolean(b)) => b,
+                        Ok(v) => v.boolean(),
+                        Err(_) => false,
+                    };
+
+                    if keep {
+                        new_matched.push(node.clone());
+                    }
+                }
+
+                matched_nodes = new_matched;
                 trace!(
                     "[PredicateListExpr] Predicate {:?} matched nodes {:?}",
                     predicate_expr, matched_nodes
@@ -489,6 +659,7 @@ impl Evaluatable for PredicateExpr {
 
                     let v = match eval_result {
                         Ok(Value::Number(v)) => Ok(predicate_ctx.index == v as usize),
+                        Ok(Value::Boolean(v)) => Ok(v),
                         Ok(v) => Ok(v.boolean()),
                         Err(e) => Err(e),
                     };

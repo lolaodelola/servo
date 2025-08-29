@@ -2,14 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::UnsafeCell;
+use std::cell::RefCell;
 use std::cmp::{Ordering, PartialOrd};
 use std::iter;
 
 use dom_struct::dom_struct;
 use js::jsapi::JSTracer;
 use js::rust::HandleObject;
-use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 
 use crate::dom::abstractrange::{AbstractRange, BoundaryPoint, bp_position};
 use crate::dom::bindings::cell::DomRefCell;
@@ -20,6 +19,7 @@ use crate::dom::bindings::codegen::Bindings::NodeListBinding::NodeListMethods;
 use crate::dom::bindings::codegen::Bindings::RangeBinding::{RangeConstants, RangeMethods};
 use crate::dom::bindings::codegen::Bindings::TextBinding::TextMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
+use crate::dom::bindings::codegen::UnionTypes::TrustedHTMLOrString;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::{Castable, CharacterDataTypeId, NodeTypeId};
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
@@ -37,6 +37,7 @@ use crate::dom::htmlscriptelement::HTMLScriptElement;
 use crate::dom::node::{Node, NodeTraits, ShadowIncluding, UnbindContext};
 use crate::dom::selection::Selection;
 use crate::dom::text::Text;
+use crate::dom::trustedhtml::TrustedHTML;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
@@ -330,7 +331,6 @@ impl Range {
 
     fn client_rects(
         &self,
-        can_gc: CanGc,
     ) -> impl Iterator<Item = euclid::Rect<app_units::Au, euclid::UnknownUnit>> {
         // FIXME: For text nodes that are only partially selected, this should return the client
         // rect of the selected part, not the whole text node.
@@ -342,8 +342,60 @@ impl Range {
             .following_nodes(document.upcast::<Node>())
             .take_while(move |node| node != &end)
             .chain(iter::once(end_clone))
-            .flat_map(move |node| node.content_boxes(can_gc))
+            .flat_map(move |node| node.border_boxes())
     }
+
+    /// <https://dom.spec.whatwg.org/#concept-range-bp-set>
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    fn set_the_start_or_end(
+        &self,
+        node: &Node,
+        offset: u32,
+        start_or_end: StartOrEnd,
+    ) -> ErrorResult {
+        // Step 1. If node is a doctype, then throw an "InvalidNodeTypeError" DOMException.
+        if node.is_doctype() {
+            return Err(Error::InvalidNodeType);
+        }
+
+        // Step 2. If offset is greater than node’s length, then throw an "IndexSizeError" DOMException.
+        if offset > node.len() {
+            return Err(Error::IndexSize);
+        }
+
+        // Step 3. Let bp be the boundary point (node, offset).
+        // NOTE: We don't need this part.
+
+        match start_or_end {
+            // If these steps were invoked as "set the start"
+            StartOrEnd::Start => {
+                // Step 4.1  If range’s root is not equal to node’s root, or if bp is after the range’s end,
+                // set range’s end to bp.
+                // Step 4.2 Set range’s start to bp.
+                self.set_start(node, offset);
+                if !(self.start() <= self.end()) {
+                    self.set_end(node, offset);
+                }
+            },
+            // If these steps were invoked as "set the end"
+            StartOrEnd::End => {
+                // Step 4.1 If range’s root is not equal to node’s root, or if bp is before the range’s start,
+                // set range’s start to bp.
+                // Step 4.2 Set range’s end to bp.
+                self.set_end(node, offset);
+                if !(self.end() >= self.start()) {
+                    self.set_start(node, offset);
+                }
+            },
+        }
+
+        Ok(())
+    }
+}
+
+enum StartOrEnd {
+    Start,
+    End,
 }
 
 impl RangeMethods<crate::DomTypeHolder> for Range {
@@ -365,43 +417,13 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-range-setstart>
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     fn SetStart(&self, node: &Node, offset: u32) -> ErrorResult {
-        if node.is_doctype() {
-            // Step 1.
-            Err(Error::InvalidNodeType)
-        } else if offset > node.len() {
-            // Step 2.
-            Err(Error::IndexSize)
-        } else {
-            // Step 3.
-            self.set_start(node, offset);
-            if !(self.start() <= self.end()) {
-                // Step 4.
-                self.set_end(node, offset);
-            }
-            Ok(())
-        }
+        self.set_the_start_or_end(node, offset, StartOrEnd::Start)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-range-setend>
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     fn SetEnd(&self, node: &Node, offset: u32) -> ErrorResult {
-        if node.is_doctype() {
-            // Step 1.
-            Err(Error::InvalidNodeType)
-        } else if offset > node.len() {
-            // Step 2.
-            Err(Error::IndexSize)
-        } else {
-            // Step 3.
-            self.set_end(node, offset);
-            if !(self.end() >= self.start()) {
-                // Step 4.
-                self.set_start(node, offset);
-            }
-            Ok(())
-        }
+        self.set_the_start_or_end(node, offset, StartOrEnd::End)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-range-setstartbefore>
@@ -1086,18 +1108,33 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
         s
     }
 
-    /// <https://dvcs.w3.org/hg/innerhtml/raw-file/tip/index.html#extensions-to-the-range-interface>
+    /// <https://html.spec.whatwg.org/multipage/#dom-range-createcontextualfragment>
     fn CreateContextualFragment(
         &self,
-        fragment: DOMString,
+        fragment: TrustedHTMLOrString,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<DocumentFragment>> {
-        // Step 1.
+        // Step 2. Let node be this's start node.
+        //
+        // Required to obtain the global, so we do this first. Shouldn't be an
+        // observable difference.
         let node = self.start_container();
+        // Step 1. Let compliantString be the result of invoking the
+        // Get Trusted Type compliant string algorithm with TrustedHTML,
+        // this's relevant global object, string, "Range createContextualFragment", and "script".
+        let fragment = TrustedHTML::get_trusted_script_compliant_string(
+            node.owner_window().upcast(),
+            fragment,
+            "Range createContextualFragment",
+            can_gc,
+        )?;
         let owner_doc = node.owner_doc();
         let element = match node.type_id() {
+            // Step 3. Let element be null.
             NodeTypeId::Document(_) | NodeTypeId::DocumentFragment(_) => None,
+            // Step 4. If node implements Element, set element to node.
             NodeTypeId::Element(_) => Some(DomRoot::downcast::<Element>(node).unwrap()),
+            // Step 5. Otherwise, if node implements Text or Comment, set element to node's parent element.
             NodeTypeId::CharacterData(CharacterDataTypeId::Comment) |
             NodeTypeId::CharacterData(CharacterDataTypeId::Text(_)) => node.GetParentElement(),
             NodeTypeId::CharacterData(CharacterDataTypeId::ProcessingInstruction) |
@@ -1105,24 +1142,26 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             NodeTypeId::Attr => unreachable!(),
         };
 
-        // Step 2.
+        // Step 6. If element is null or all of the following are true:
         let element = Element::fragment_parsing_context(&owner_doc, element.as_deref(), can_gc);
 
-        // Step 3.
+        // Step 7. Let fragment node be the result of invoking the fragment parsing algorithm steps with element and compliantString.
         let fragment_node = element.parse_fragment(fragment, can_gc)?;
 
-        // Step 4.
+        // Step 8. For each script of fragment node's script element descendants:
         for node in fragment_node
             .upcast::<Node>()
             .traverse_preorder(ShadowIncluding::No)
         {
             if let Some(script) = node.downcast::<HTMLScriptElement>() {
+                // Step 8.1. Set script's already started to false.
                 script.set_already_started(false);
+                // Step 8.2. Set script's parser document to null.
                 script.set_parser_inserted(false);
             }
         }
 
-        // Step 5.
+        // Step 9. Return fragment node.
         Ok(fragment_node)
     }
 
@@ -1132,7 +1171,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
         let window = start.owner_window();
 
         let client_rects = self
-            .client_rects(can_gc)
+            .client_rects()
             .map(|rect| {
                 DOMRect::new(
                     window.upcast(),
@@ -1153,7 +1192,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
         let window = self.start_container().owner_window();
 
         // Step 1. Let list be the result of invoking getClientRects() on the same range this method was invoked on.
-        let list = self.client_rects(can_gc);
+        let list = self.client_rects();
 
         // Step 2. If list is empty return a DOMRect object whose x, y, width and height members are zero.
         // Step 3. If all rectangles in list have zero width or height, return the first rectangle in list.
@@ -1172,14 +1211,15 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
     }
 }
 
+#[derive(MallocSizeOf)]
 pub(crate) struct WeakRangeVec {
-    cell: UnsafeCell<WeakRefVec<Range>>,
+    cell: RefCell<WeakRefVec<Range>>,
 }
 
 impl Default for WeakRangeVec {
     fn default() -> Self {
         WeakRangeVec {
-            cell: UnsafeCell::new(WeakRefVec::new()),
+            cell: RefCell::new(WeakRefVec::new()),
         }
     }
 }
@@ -1188,7 +1228,7 @@ impl Default for WeakRangeVec {
 impl WeakRangeVec {
     /// Whether that vector of ranges is empty.
     pub(crate) fn is_empty(&self) -> bool {
-        unsafe { (*self.cell.get()).is_empty() }
+        self.cell.borrow().is_empty()
     }
 
     /// Used for steps 2.1-2. when inserting a node.
@@ -1204,6 +1244,7 @@ impl WeakRangeVec {
     }
 
     /// Used for steps 2-3. when removing a node.
+    ///
     /// <https://dom.spec.whatwg.org/#concept-node-remove>
     pub(crate) fn drain_to_parent(&self, context: &UnbindContext, child: &Node) {
         if self.is_empty() {
@@ -1212,58 +1253,59 @@ impl WeakRangeVec {
 
         let offset = context.index();
         let parent = context.parent;
-        unsafe {
-            let ranges = &mut *self.cell.get();
+        let ranges = &mut *self.cell.borrow_mut();
 
-            ranges.update(|entry| {
-                let range = entry.root().unwrap();
-                if range.start().node() == parent || range.end().node() == parent {
-                    entry.remove();
-                }
-                if range.start().node() == child {
-                    range.report_change();
-                    range.start().set(context.parent, offset);
-                }
-                if range.end().node() == child {
-                    range.report_change();
-                    range.end().set(context.parent, offset);
-                }
-            });
+        ranges.update(|entry| {
+            let range = entry.root().unwrap();
+            if range.start().node() == parent || range.end().node() == parent {
+                entry.remove();
+            }
+            if range.start().node() == child {
+                range.report_change();
+                range.start().set(context.parent, offset);
+            }
+            if range.end().node() == child {
+                range.report_change();
+                range.end().set(context.parent, offset);
+            }
+        });
 
-            (*context.parent.ranges().cell.get()).extend(ranges.drain(..));
-        }
+        context
+            .parent
+            .ranges()
+            .cell
+            .borrow_mut()
+            .extend(ranges.drain(..));
     }
 
-    /// Used for steps 7.1-2. when normalizing a node.
+    /// Used for steps 6.1-2. when normalizing a node.
     /// <https://dom.spec.whatwg.org/#dom-node-normalize>
     pub(crate) fn drain_to_preceding_text_sibling(&self, node: &Node, sibling: &Node, length: u32) {
         if self.is_empty() {
             return;
         }
 
-        unsafe {
-            let ranges = &mut *self.cell.get();
+        let ranges = &mut *self.cell.borrow_mut();
 
-            ranges.update(|entry| {
-                let range = entry.root().unwrap();
-                if range.start().node() == sibling || range.end().node() == sibling {
-                    entry.remove();
-                }
-                if range.start().node() == node {
-                    range.report_change();
-                    range.start().set(sibling, range.start_offset() + length);
-                }
-                if range.end().node() == node {
-                    range.report_change();
-                    range.end().set(sibling, range.end_offset() + length);
-                }
-            });
+        ranges.update(|entry| {
+            let range = entry.root().unwrap();
+            if range.start().node() == sibling || range.end().node() == sibling {
+                entry.remove();
+            }
+            if range.start().node() == node {
+                range.report_change();
+                range.start().set(sibling, range.start_offset() + length);
+            }
+            if range.end().node() == node {
+                range.report_change();
+                range.end().set(sibling, range.end_offset() + length);
+            }
+        });
 
-            (*sibling.ranges().cell.get()).extend(ranges.drain(..));
-        }
+        sibling.ranges().cell.borrow_mut().extend(ranges.drain(..));
     }
 
-    /// Used for steps 7.3-4. when normalizing a node.
+    /// Used for steps 6.3-4. when normalizing a node.
     /// <https://dom.spec.whatwg.org/#dom-node-normalize>
     pub(crate) fn move_to_text_child_at(
         &self,
@@ -1272,43 +1314,42 @@ impl WeakRangeVec {
         child: &Node,
         new_offset: u32,
     ) {
-        unsafe {
-            let child_ranges = &mut *child.ranges().cell.get();
+        let child_ranges = child.ranges();
+        let mut child_ranges = child_ranges.cell.borrow_mut();
 
-            (*self.cell.get()).update(|entry| {
-                let range = entry.root().unwrap();
+        self.cell.borrow_mut().update(|entry| {
+            let range = entry.root().unwrap();
 
-                let node_is_start = range.start().node() == node;
-                let node_is_end = range.end().node() == node;
+            let node_is_start = range.start().node() == node;
+            let node_is_end = range.end().node() == node;
 
-                let move_start = node_is_start && range.start_offset() == offset;
-                let move_end = node_is_end && range.end_offset() == offset;
+            let move_start = node_is_start && range.start_offset() == offset;
+            let move_end = node_is_end && range.end_offset() == offset;
 
-                let remove_from_node =
-                    move_start && (move_end || !node_is_end) || move_end && !node_is_start;
+            let remove_from_node =
+                move_start && (move_end || !node_is_end) || move_end && !node_is_start;
 
-                let already_in_child = range.start().node() == child || range.end().node() == child;
-                let push_to_child = !already_in_child && (move_start || move_end);
+            let already_in_child = range.start().node() == child || range.end().node() == child;
+            let push_to_child = !already_in_child && (move_start || move_end);
 
-                if remove_from_node {
-                    let ref_ = entry.remove();
-                    if push_to_child {
-                        child_ranges.push(ref_);
-                    }
-                } else if push_to_child {
-                    child_ranges.push(WeakRef::new(&range));
+            if remove_from_node {
+                let ref_ = entry.remove();
+                if push_to_child {
+                    child_ranges.push(ref_);
                 }
+            } else if push_to_child {
+                child_ranges.push(WeakRef::new(&range));
+            }
 
-                if move_start {
-                    range.report_change();
-                    range.start().set(child, new_offset);
-                }
-                if move_end {
-                    range.report_change();
-                    range.end().set(child, new_offset);
-                }
-            });
-        }
+            if move_start {
+                range.report_change();
+                range.start().set(child, new_offset);
+            }
+            if move_end {
+                range.report_change();
+                range.end().set(child, new_offset);
+            }
+        });
     }
 
     /// Used for steps 8-11. when replacing character data.
@@ -1337,109 +1378,93 @@ impl WeakRangeVec {
         offset: u32,
         sibling: &Node,
     ) {
-        unsafe {
-            let sibling_ranges = &mut *sibling.ranges().cell.get();
+        let sibling_ranges = sibling.ranges();
+        let mut sibling_ranges = sibling_ranges.cell.borrow_mut();
 
-            (*self.cell.get()).update(|entry| {
-                let range = entry.root().unwrap();
-                let start_offset = range.start_offset();
-                let end_offset = range.end_offset();
+        self.cell.borrow_mut().update(|entry| {
+            let range = entry.root().unwrap();
+            let start_offset = range.start_offset();
+            let end_offset = range.end_offset();
 
-                let node_is_start = range.start().node() == node;
-                let node_is_end = range.end().node() == node;
+            let node_is_start = range.start().node() == node;
+            let node_is_end = range.end().node() == node;
 
-                let move_start = node_is_start && start_offset > offset;
-                let move_end = node_is_end && end_offset > offset;
+            let move_start = node_is_start && start_offset > offset;
+            let move_end = node_is_end && end_offset > offset;
 
-                let remove_from_node =
-                    move_start && (move_end || !node_is_end) || move_end && !node_is_start;
+            let remove_from_node =
+                move_start && (move_end || !node_is_end) || move_end && !node_is_start;
 
-                let already_in_sibling =
-                    range.start().node() == sibling || range.end().node() == sibling;
-                let push_to_sibling = !already_in_sibling && (move_start || move_end);
+            let already_in_sibling =
+                range.start().node() == sibling || range.end().node() == sibling;
+            let push_to_sibling = !already_in_sibling && (move_start || move_end);
 
-                if remove_from_node {
-                    let ref_ = entry.remove();
-                    if push_to_sibling {
-                        sibling_ranges.push(ref_);
-                    }
-                } else if push_to_sibling {
-                    sibling_ranges.push(WeakRef::new(&range));
+            if remove_from_node {
+                let ref_ = entry.remove();
+                if push_to_sibling {
+                    sibling_ranges.push(ref_);
                 }
+            } else if push_to_sibling {
+                sibling_ranges.push(WeakRef::new(&range));
+            }
 
-                if move_start {
-                    range.report_change();
-                    range.start().set(sibling, start_offset - offset);
-                }
-                if move_end {
-                    range.report_change();
-                    range.end().set(sibling, end_offset - offset);
-                }
-            });
-        }
+            if move_start {
+                range.report_change();
+                range.start().set(sibling, start_offset - offset);
+            }
+            if move_end {
+                range.report_change();
+                range.end().set(sibling, end_offset - offset);
+            }
+        });
     }
 
     /// Used for steps 7.4-5. when splitting a text node.
     /// <https://dom.spec.whatwg.org/#concept-text-split>
     pub(crate) fn increment_at(&self, node: &Node, offset: u32) {
-        unsafe {
-            (*self.cell.get()).update(|entry| {
-                let range = entry.root().unwrap();
-                if range.start().node() == node && offset == range.start_offset() {
-                    range.report_change();
-                    range.start().set_offset(offset + 1);
-                }
-                if range.end().node() == node && offset == range.end_offset() {
-                    range.report_change();
-                    range.end().set_offset(offset + 1);
-                }
-            });
-        }
+        self.cell.borrow_mut().update(|entry| {
+            let range = entry.root().unwrap();
+            if range.start().node() == node && offset == range.start_offset() {
+                range.report_change();
+                range.start().set_offset(offset + 1);
+            }
+            if range.end().node() == node && offset == range.end_offset() {
+                range.report_change();
+                range.end().set_offset(offset + 1);
+            }
+        });
     }
 
     fn map_offset_above<F: FnMut(u32) -> u32>(&self, node: &Node, offset: u32, mut f: F) {
-        unsafe {
-            (*self.cell.get()).update(|entry| {
-                let range = entry.root().unwrap();
-                let start_offset = range.start_offset();
-                if range.start().node() == node && start_offset > offset {
-                    range.report_change();
-                    range.start().set_offset(f(start_offset));
-                }
-                let end_offset = range.end_offset();
-                if range.end().node() == node && end_offset > offset {
-                    range.report_change();
-                    range.end().set_offset(f(end_offset));
-                }
-            });
-        }
+        self.cell.borrow_mut().update(|entry| {
+            let range = entry.root().unwrap();
+            let start_offset = range.start_offset();
+            if range.start().node() == node && start_offset > offset {
+                range.report_change();
+                range.start().set_offset(f(start_offset));
+            }
+            let end_offset = range.end_offset();
+            if range.end().node() == node && end_offset > offset {
+                range.report_change();
+                range.end().set_offset(f(end_offset));
+            }
+        });
     }
 
     pub(crate) fn push(&self, ref_: WeakRef<Range>) {
-        unsafe {
-            (*self.cell.get()).push(ref_);
-        }
+        self.cell.borrow_mut().push(ref_);
     }
 
     fn remove(&self, range: &Range) -> WeakRef<Range> {
-        unsafe {
-            let ranges = &mut *self.cell.get();
-            let position = ranges.iter().position(|ref_| ref_ == range).unwrap();
-            ranges.swap_remove(position)
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-impl MallocSizeOf for WeakRangeVec {
-    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
-        unsafe { (*self.cell.get()).size_of(ops) }
+        let mut ranges = self.cell.borrow_mut();
+        let position = ranges.iter().position(|ref_| ref_ == range).unwrap();
+        ranges.swap_remove(position)
     }
 }
 
 #[allow(unsafe_code)]
 unsafe impl JSTraceable for WeakRangeVec {
     unsafe fn trace(&self, _: *mut JSTracer) {
-        (*self.cell.get()).retain_alive()
+        self.cell.borrow_mut().retain_alive()
     }
 }

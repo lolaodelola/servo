@@ -7,8 +7,6 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use content_security_policy as csp;
-use content_security_policy::Destination;
 use dom_struct::dom_struct;
 use embedder_traits::{
     EmbedderMsg, Notification as EmbedderNotification,
@@ -21,15 +19,15 @@ use js::jsval::JSVal;
 use js::rust::{HandleObject, MutableHandleValue};
 use net_traits::http_status::HttpStatus;
 use net_traits::image_cache::{
-    ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponder, ImageResponse,
-    PendingImageId, PendingImageResponse, UsePlaceholder,
+    ImageCache, ImageCacheResponseMessage, ImageCacheResult, ImageLoadListener,
+    ImageOrMetadataAvailable, ImageResponse, PendingImageId, UsePlaceholder,
 };
-use net_traits::request::{RequestBuilder, RequestId};
+use net_traits::request::{Destination, RequestBuilder, RequestId};
 use net_traits::{
     FetchMetadata, FetchResponseListener, FetchResponseMsg, NetworkError, ResourceFetchTiming,
     ResourceTimingType,
 };
-use pixels::Image;
+use pixels::RasterImage;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use uuid::Uuid;
 
@@ -55,6 +53,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::bindings::utils::to_frozen_array;
+use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::permissions::{PermissionAlgorithm, Permissions, descriptor_permission_state};
@@ -114,15 +113,15 @@ pub(crate) struct Notification {
     /// <https://notifications.spec.whatwg.org/#image-resource>
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
-    image_resource: DomRefCell<Option<Arc<Image>>>,
+    image_resource: DomRefCell<Option<Arc<RasterImage>>>,
     /// <https://notifications.spec.whatwg.org/#icon-resource>
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
-    icon_resource: DomRefCell<Option<Arc<Image>>>,
+    icon_resource: DomRefCell<Option<Arc<RasterImage>>>,
     /// <https://notifications.spec.whatwg.org/#badge-resource>
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
-    badge_resource: DomRefCell<Option<Arc<Image>>>,
+    badge_resource: DomRefCell<Option<Arc<RasterImage>>>,
 }
 
 impl Notification {
@@ -167,7 +166,6 @@ impl Notification {
     ) -> Self {
         // TODO: missing call to https://html.spec.whatwg.org/multipage/#structuredserializeforstorage
         // may be find in `dom/bindings/structuredclone.rs`
-        let data = Heap::default();
 
         let title = title.clone();
         let dir = options.dir;
@@ -235,7 +233,7 @@ impl Notification {
             serviceworker_registration: None,
             title,
             body,
-            data,
+            data: Heap::default(),
             dir,
             image,
             icon,
@@ -561,7 +559,7 @@ struct Action {
     /// <https://notifications.spec.whatwg.org/#action-icon-resource>
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
-    icon_resource: DomRefCell<Option<Arc<Image>>>,
+    icon_resource: DomRefCell<Option<Arc<RasterImage>>>,
 }
 
 /// <https://notifications.spec.whatwg.org/#create-a-notification-with-a-settings-object>
@@ -793,9 +791,9 @@ impl FetchResponseListener for ResourceFetchListener {
         network_listener::submit_timing(self, CanGc::note())
     }
 
-    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
+    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
         let global = &self.resource_timing_global();
-        global.report_csp_violations(violations, None);
+        global.report_csp_violations(violations, None, None);
     }
 }
 
@@ -886,7 +884,11 @@ impl Notification {
             ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable {
                 image, ..
             }) => {
-                self.set_resource_and_show_when_ready(request_id, &resource_type, Some(image));
+                let image = image.as_raster_image();
+                if image.is_none() {
+                    warn!("Vector images are not supported in notifications yet");
+                };
+                self.set_resource_and_show_when_ready(request_id, &resource_type, image);
             },
             ImageCacheResult::Available(ImageOrMetadataAvailable::MetadataAvailable(
                 _,
@@ -925,8 +927,7 @@ impl Notification {
         pending_image_id: PendingImageId,
         resource_type: ResourceType,
     ) {
-        let (sender, receiver) =
-            ipc::channel::<PendingImageResponse>().expect("ipc channel failure");
+        let (sender, receiver) = ipc::channel().expect("ipc channel failure");
 
         let global: &GlobalScope = &self.global();
 
@@ -942,7 +943,11 @@ impl Notification {
                 task_source.queue(task!(handle_response: move || {
                     let this = trusted_this.root();
                     if let Ok(response) = response {
-                        this.handle_image_cache_response(request_id, response.response, resource_type);
+                        let ImageCacheResponseMessage::NotifyPendingImageLoadStatus(status) = response else {
+                            warn!("Received unexpected message from image cache: {response:?}");
+                            return;
+                        };
+                        this.handle_image_cache_response(request_id, status.response, resource_type);
                     } else {
                         this.handle_image_cache_response(request_id, ImageResponse::None, resource_type);
                     }
@@ -950,7 +955,7 @@ impl Notification {
             }),
         );
 
-        global.image_cache().add_listener(ImageResponder::new(
+        global.image_cache().add_listener(ImageLoadListener::new(
             sender,
             global.pipeline_id(),
             pending_image_id,
@@ -965,7 +970,11 @@ impl Notification {
     ) {
         match response {
             ImageResponse::Loaded(image, _) => {
-                self.set_resource_and_show_when_ready(request_id, &resource_type, Some(image));
+                let image = image.as_raster_image();
+                if image.is_none() {
+                    warn!("Vector images are not yet supported in notification attribute");
+                };
+                self.set_resource_and_show_when_ready(request_id, &resource_type, image);
             },
             ImageResponse::PlaceholderLoaded(image, _) => {
                 self.set_resource_and_show_when_ready(request_id, &resource_type, Some(image));
@@ -981,7 +990,7 @@ impl Notification {
         &self,
         request_id: RequestId,
         resource_type: &ResourceType,
-        image: Option<Arc<Image>>,
+        image: Option<Arc<RasterImage>>,
     ) {
         match resource_type {
             ResourceType::Image => {

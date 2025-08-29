@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::marker::Send;
 
+use base::generic_channel::GenericSender;
 use crossbeam_channel::Sender;
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
@@ -41,6 +42,20 @@ where
 {
     fn send(&self, message: T) {
         if let Err(e) = IpcSender::send(self, message) {
+            warn!(
+                "Error communicating with the target thread from the profiler: {}",
+                e
+            );
+        }
+    }
+}
+
+impl<T> OpaqueSender<T> for GenericSender<T>
+where
+    T: serde::Serialize,
+{
+    fn send(&self, message: T) {
+        if let Err(e) = GenericSender::send(self, message) {
             warn!(
                 "Error communicating with the target thread from the profiler: {}",
                 e
@@ -247,8 +262,19 @@ macro_rules! path {
 /// The results produced by the memory reporter.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MemoryReportResult {
-    /// The stringified output.
-    pub content: String,
+    /// All the results from the MemoryReports
+    pub results: Vec<MemoryReport>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+/// A simple memory report
+pub struct MemoryReport {
+    /// The pid of the report
+    pub pid: u32,
+    /// Is this the main process
+    pub is_main_process: bool,
+    /// All the reports for this pid
+    pub reports: Vec<Report>,
 }
 
 /// Messages that can be sent to the memory profiler thread.
@@ -282,7 +308,7 @@ pub fn perform_memory_report<F: FnOnce(&mut MallocSizeOfOps)>(f: F) {
     let seen_pointer = move |ptr| SEEN_POINTERS.with(|pointers| !pointers.borrow_mut().insert(ptr));
     let mut ops = MallocSizeOfOps::new(
         servo_allocator::usable_size,
-        None,
+        servo_allocator::enclosing_size,
         Some(Box::new(seen_pointer)),
     );
     f(&mut ops);

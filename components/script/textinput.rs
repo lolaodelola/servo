@@ -9,21 +9,19 @@ use std::cmp::min;
 use std::default::Default;
 use std::ops::{Add, AddAssign, Range};
 
-use keyboard_types::{Key, KeyState, Modifiers, ShortcutMatcher};
+use bitflags::bitflags;
+use keyboard_types::{Key, KeyState, Modifiers, NamedKey, ShortcutMatcher};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::clipboard_provider::{ClipboardProvider, EmbedderClipboardProvider};
-use crate::dom::bindings::cell::DomRefCell;
+use crate::clipboard_provider::ClipboardProvider;
 use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::compositionevent::CompositionEvent;
 use crate::dom::event::Event;
 use crate::dom::keyboardevent::KeyboardEvent;
-use crate::dom::node::NodeTraits;
 use crate::dom::types::ClipboardEvent;
-use crate::drag_data_store::{DragDataStore, Kind};
-use crate::script_runtime::CanGc;
+use crate::drag_data_store::Kind;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Selection {
@@ -206,6 +204,15 @@ pub enum KeyReaction {
     Nothing,
 }
 
+bitflags! {
+    /// Resulting action to be taken by the owner of a text input that is handling a clipboard
+    /// event.
+    pub struct ClipboardEventReaction: u8 {
+        const QueueInputEvent = 1 << 0;
+        const FireClipboardChangedEvent = 1 << 1;
+    }
+}
+
 impl Default for TextPoint {
     fn default() -> TextPoint {
         TextPoint {
@@ -319,11 +326,18 @@ impl<T: ClipboardProvider> TextInput<T> {
     }
 
     /// Remove a character at the current editing point
-    pub fn delete_char(&mut self, dir: Direction) {
+    ///
+    /// Returns true if any character was deleted
+    pub fn delete_char(&mut self, dir: Direction) -> bool {
         if self.selection_origin.is_none() || self.selection_origin == Some(self.edit_point) {
             self.adjust_horizontal_by_one(dir, Selection::Selected);
         }
-        self.replace_selection(DOMString::new());
+        if self.selection_start() == self.selection_end() {
+            false
+        } else {
+            self.replace_selection(DOMString::new());
+            true
+        }
     }
 
     /// Insert a character at the current editing point
@@ -331,7 +345,8 @@ impl<T: ClipboardProvider> TextInput<T> {
         self.insert_string(ch.to_string());
     }
 
-    /// Insert a string at the current editing point
+    /// Insert a string at the current editing point or replace the selection if
+    /// one exists.
     pub fn insert_string<S: Into<String>>(&mut self, s: S) {
         if self.selection_origin.is_none() {
             self.selection_origin = Some(self.edit_point);
@@ -902,6 +917,7 @@ impl<T: ClipboardProvider> TextInput<T> {
                 KeyReaction::DispatchInput
             })
             .shortcut(CMD_OR_CONTROL, 'C', || {
+                // TODO(stevennovaryo): we should not provide text to clipboard for type=password
                 if let Some(text) = self.get_selection_text() {
                     self.clipboard_provider.set_text(text);
                 }
@@ -913,75 +929,111 @@ impl<T: ClipboardProvider> TextInput<T> {
                 }
                 KeyReaction::DispatchInput
             })
-            .shortcut(Modifiers::empty(), Key::Delete, || {
-                self.delete_char(Direction::Forward);
-                KeyReaction::DispatchInput
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::Delete), || {
+                if self.delete_char(Direction::Forward) {
+                    KeyReaction::DispatchInput
+                } else {
+                    KeyReaction::Nothing
+                }
             })
-            .shortcut(Modifiers::empty(), Key::Backspace, || {
-                self.delete_char(Direction::Backward);
-                KeyReaction::DispatchInput
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::Backspace), || {
+                if self.delete_char(Direction::Backward) {
+                    KeyReaction::DispatchInput
+                } else {
+                    KeyReaction::Nothing
+                }
             })
-            .optional_shortcut(macos, Modifiers::META, Key::ArrowLeft, || {
-                self.adjust_horizontal_to_line_end(Direction::Backward, maybe_select);
-                KeyReaction::RedrawSelection
-            })
-            .optional_shortcut(macos, Modifiers::META, Key::ArrowRight, || {
-                self.adjust_horizontal_to_line_end(Direction::Forward, maybe_select);
-                KeyReaction::RedrawSelection
-            })
-            .optional_shortcut(macos, Modifiers::META, Key::ArrowUp, || {
-                self.adjust_horizontal_to_limit(Direction::Backward, maybe_select);
-                KeyReaction::RedrawSelection
-            })
-            .optional_shortcut(macos, Modifiers::META, Key::ArrowDown, || {
-                self.adjust_horizontal_to_limit(Direction::Forward, maybe_select);
-                KeyReaction::RedrawSelection
-            })
-            .shortcut(Modifiers::ALT, Key::ArrowLeft, || {
+            .optional_shortcut(
+                macos,
+                Modifiers::META,
+                Key::Named(NamedKey::ArrowLeft),
+                || {
+                    self.adjust_horizontal_to_line_end(Direction::Backward, maybe_select);
+                    KeyReaction::RedrawSelection
+                },
+            )
+            .optional_shortcut(
+                macos,
+                Modifiers::META,
+                Key::Named(NamedKey::ArrowRight),
+                || {
+                    self.adjust_horizontal_to_line_end(Direction::Forward, maybe_select);
+                    KeyReaction::RedrawSelection
+                },
+            )
+            .optional_shortcut(
+                macos,
+                Modifiers::META,
+                Key::Named(NamedKey::ArrowUp),
+                || {
+                    self.adjust_horizontal_to_limit(Direction::Backward, maybe_select);
+                    KeyReaction::RedrawSelection
+                },
+            )
+            .optional_shortcut(
+                macos,
+                Modifiers::META,
+                Key::Named(NamedKey::ArrowDown),
+                || {
+                    self.adjust_horizontal_to_limit(Direction::Forward, maybe_select);
+                    KeyReaction::RedrawSelection
+                },
+            )
+            .shortcut(Modifiers::ALT, Key::Named(NamedKey::ArrowLeft), || {
                 self.adjust_horizontal_by_word(Direction::Backward, maybe_select);
                 KeyReaction::RedrawSelection
             })
-            .shortcut(Modifiers::ALT, Key::ArrowRight, || {
+            .shortcut(Modifiers::ALT, Key::Named(NamedKey::ArrowRight), || {
                 self.adjust_horizontal_by_word(Direction::Forward, maybe_select);
                 KeyReaction::RedrawSelection
             })
-            .shortcut(Modifiers::empty(), Key::ArrowLeft, || {
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowLeft), || {
                 self.adjust_horizontal_by_one(Direction::Backward, maybe_select);
                 KeyReaction::RedrawSelection
             })
-            .shortcut(Modifiers::empty(), Key::ArrowRight, || {
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowRight), || {
                 self.adjust_horizontal_by_one(Direction::Forward, maybe_select);
                 KeyReaction::RedrawSelection
             })
-            .shortcut(Modifiers::empty(), Key::ArrowUp, || {
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowUp), || {
                 self.adjust_vertical(-1, maybe_select);
                 KeyReaction::RedrawSelection
             })
-            .shortcut(Modifiers::empty(), Key::ArrowDown, || {
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowDown), || {
                 self.adjust_vertical(1, maybe_select);
                 KeyReaction::RedrawSelection
             })
-            .shortcut(Modifiers::empty(), Key::Enter, || self.handle_return())
-            .optional_shortcut(macos, Modifiers::empty(), Key::Home, || {
-                self.edit_point.index = UTF8Bytes::zero();
-                KeyReaction::RedrawSelection
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::Enter), || {
+                self.handle_return()
             })
-            .optional_shortcut(macos, Modifiers::empty(), Key::End, || {
+            .optional_shortcut(
+                macos,
+                Modifiers::empty(),
+                Key::Named(NamedKey::Home),
+                || {
+                    self.edit_point.index = UTF8Bytes::zero();
+                    KeyReaction::RedrawSelection
+                },
+            )
+            .optional_shortcut(macos, Modifiers::empty(), Key::Named(NamedKey::End), || {
                 self.edit_point.index = self.current_line_length();
                 self.assert_ok_selection();
                 KeyReaction::RedrawSelection
             })
-            .shortcut(Modifiers::empty(), Key::PageUp, || {
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::PageUp), || {
                 self.adjust_vertical(-28, maybe_select);
                 KeyReaction::RedrawSelection
             })
-            .shortcut(Modifiers::empty(), Key::PageDown, || {
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::PageDown), || {
                 self.adjust_vertical(28, maybe_select);
                 KeyReaction::RedrawSelection
             })
             .otherwise(|| {
                 if let Key::Character(ref c) = key {
                     self.insert_string(c.as_str());
+                    return KeyReaction::DispatchInput;
+                }
+                if matches!(key, Key::Named(NamedKey::Process)) {
                     return KeyReaction::DispatchInput;
                 }
                 KeyReaction::Nothing
@@ -1155,81 +1207,103 @@ impl<T: ClipboardProvider> TextInput<T> {
         self.edit_point.index = byte_offset;
     }
 
-    fn paste_contents(&mut self, drag_data_store: &DragDataStore) {
-        for item in drag_data_store.iter_item_list() {
-            if let Kind::Text { data, .. } = item {
-                self.insert_string(data.to_string());
-            }
+    /// This implements step 3 onward from:
+    ///
+    ///  - <https://www.w3.org/TR/clipboard-apis/#copy-action>
+    ///  - <https://www.w3.org/TR/clipboard-apis/#cut-action>
+    ///  - <https://www.w3.org/TR/clipboard-apis/#paste-action>
+    ///
+    /// Earlier steps should have already been run by the callers.
+    pub(crate) fn handle_clipboard_event(
+        &mut self,
+        clipboard_event: &ClipboardEvent,
+    ) -> ClipboardEventReaction {
+        let event = clipboard_event.upcast::<Event>();
+        if !event.IsTrusted() {
+            return ClipboardEventReaction::empty();
         }
-    }
-}
 
-/// <https://www.w3.org/TR/clipboard-apis/#clipboard-actions> step 3
-pub(crate) fn handle_text_clipboard_action(
-    owning_node: &impl NodeTraits,
-    textinput: &DomRefCell<TextInput<EmbedderClipboardProvider>>,
-    event: &ClipboardEvent,
-    can_gc: CanGc,
-) -> bool {
-    let e = event.upcast::<Event>();
+        // This step is common to all event types in the specification.
+        // Step 3: If the event was not canceled, then
+        if event.DefaultPrevented() {
+            // Step 4: Else, if the event was canceled
+            // Step 4.1: Return false.
+            return ClipboardEventReaction::empty();
+        }
 
-    if !e.IsTrusted() {
-        return false;
-    }
+        match event.Type().str() {
+            "copy" => {
+                // These steps are from <https://www.w3.org/TR/clipboard-apis/#copy-action>:
+                let selection = self.get_selection_text();
 
-    // Step 3
-    match e.Type().str() {
-        "copy" => {
-            let selection = textinput.borrow().get_selection_text();
+                // Step 3.1 Copy the selected contents, if any, to the clipboard
+                if let Some(text) = selection {
+                    self.clipboard_provider.set_text(text);
+                }
 
-            // Step 3.1 Copy the selected contents, if any, to the clipboard
-            if let Some(text) = selection {
-                textinput.borrow_mut().clipboard_provider.set_text(text);
-            }
+                // Step 3.2 Fire a clipboard event named clipboardchange
+                ClipboardEventReaction::FireClipboardChangedEvent
+            },
+            "cut" => {
+                // These steps are from <https://www.w3.org/TR/clipboard-apis/#cut-action>:
+                let selection = self.get_selection_text();
 
-            // Step 3.2 Fire a clipboard event named clipboardchange
-            owning_node
-                .owner_document()
-                .fire_clipboardchange_event(can_gc);
-        },
-        "cut" => {
-            let selection = textinput.borrow().get_selection_text();
+                // Step 3.1 If there is a selection in an editable context where cutting is enabled, then
+                let Some(text) = selection else {
+                    // Step 3.2 Else, if there is no selection or the context is not editable, then
+                    return ClipboardEventReaction::empty();
+                };
 
-            // Step 3.1 If there is a selection in an editable context where cutting is enabled, then
-            if let Some(text) = selection {
                 // Step 3.1.1 Copy the selected contents, if any, to the clipboard
-                textinput.borrow_mut().clipboard_provider.set_text(text);
+                self.clipboard_provider.set_text(text);
 
                 // Step 3.1.2 Remove the contents of the selection from the document and collapse the selection.
-                textinput.borrow_mut().delete_char(Direction::Backward);
+                self.delete_char(Direction::Backward);
 
                 // Step 3.1.3 Fire a clipboard event named clipboardchange
-                owning_node
-                    .owner_document()
-                    .fire_clipboardchange_event(can_gc);
-
                 // Step 3.1.4 Queue tasks to fire any events that should fire due to the modification.
-            } else {
-                // Step 3.2 Else, if there is no selection or the context is not editable, then
-                return false;
-            }
-        },
-        "paste" => {
-            // Step 3.1 If there is a selection or cursor in an editable context where pasting is enabled, then
-            if let Some(data) = event.get_clipboard_data() {
-                // Step 3.1.1 Insert the most suitable content found on the clipboard, if any, into the context.
-                let drag_data_store = data.data_store().expect("This shouldn't fail");
-                textinput.borrow_mut().paste_contents(&drag_data_store);
+                ClipboardEventReaction::FireClipboardChangedEvent |
+                    ClipboardEventReaction::QueueInputEvent
+            },
+            "paste" => {
+                // These steps are from <https://www.w3.org/TR/clipboard-apis/#paste-action>:
+                let Some(data_transfer) = clipboard_event.get_clipboard_data() else {
+                    return ClipboardEventReaction::empty();
+                };
+                let Some(drag_data_store) = data_transfer.data_store() else {
+                    return ClipboardEventReaction::empty();
+                };
 
-                // Step 3.1.2 Queue tasks to fire any events that should fire due to the modification.
-            } else {
-                // Step 3.2 Else return false.
-                return false;
-            }
-        },
-        _ => (),
+                // Step 3.1: If there is a selection or cursor in an editable context where pasting is
+                // enabled, then:
+                // TODO: Our TextInput always has a selection or an input point. It's likely that this
+                // shouldn't be the case when the entry loses the cursor.
+
+                // Step 3.1.1: Insert the most suitable content found on the clipboard, if any, into the
+                // context.
+                // TODO: Only text content is currently supported, but other data types should be supported
+                // in the future.
+                let Some(text_content) =
+                    drag_data_store
+                        .iter_item_list()
+                        .find_map(|item| match item {
+                            Kind::Text { data, .. } => Some(data.to_string()),
+                            _ => None,
+                        })
+                else {
+                    return ClipboardEventReaction::empty();
+                };
+                if text_content.is_empty() {
+                    return ClipboardEventReaction::empty();
+                }
+
+                self.insert_string(text_content);
+
+                // Step 3.1.2: Queue tasks to fire any events that should fire due to the
+                // modification, see § 5.3 Integration with other scripts and events for details.
+                ClipboardEventReaction::QueueInputEvent
+            },
+            _ => ClipboardEventReaction::empty(),
+        }
     }
-
-    //Step 5
-    true
 }

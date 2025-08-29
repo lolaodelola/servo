@@ -11,32 +11,35 @@
 pub mod input_events;
 pub mod resources;
 pub mod user_content_manager;
-mod webdriver;
+pub mod webdriver;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::{Debug, Display, Error, Formatter};
 use std::hash::Hash;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use base::id::{PipelineId, ScrollTreeNodeId, WebViewId};
+use base::id::{PipelineId, WebViewId};
 use crossbeam_channel::Sender;
-use euclid::{Scale, Size2D};
+use euclid::{Point2D, Scale, Size2D};
 use http::{HeaderMap, Method, StatusCode};
-use ipc_channel::ipc::IpcSender;
-pub use keyboard_types::{KeyboardEvent, Modifiers};
+use ipc_channel::ipc::{IpcSender, IpcSharedMemory};
 use log::warn;
 use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
-use num_derive::FromPrimitive;
-use pixels::Image;
+use pixels::RasterImage;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use servo_geometry::{DeviceIndependentIntRect, DeviceIndependentIntSize};
 use servo_url::ServoUrl;
 use strum_macros::IntoStaticStr;
+use style::queries::values::PrefersColorScheme;
 use style_traits::CSSPixel;
 use url::Url;
-use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel};
+use uuid::Uuid;
+use webrender_api::ExternalScrollId;
+use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize, DevicePixel, LayoutSize};
 
 pub use crate::input_events::*;
 pub use crate::webdriver::*;
@@ -53,9 +56,10 @@ pub enum ShutdownState {
 /// A cursor for the window. This is different from a CSS cursor (see
 /// `CursorKind`) in that it has no `Auto` value.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Deserialize, Eq, FromPrimitive, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
 pub enum Cursor {
     None,
+    #[default]
     Default,
     Pointer,
     ContextMenu,
@@ -160,6 +164,67 @@ pub enum SimpleDialog {
     },
 }
 
+impl SimpleDialog {
+    /// Returns the message of the dialog.
+    pub fn message(&self) -> &str {
+        match self {
+            SimpleDialog::Alert { message, .. } => message,
+            SimpleDialog::Confirm { message, .. } => message,
+            SimpleDialog::Prompt { message, .. } => message,
+        }
+    }
+
+    pub fn set_message(&mut self, text: String) {
+        match self {
+            SimpleDialog::Alert { message, .. } => *message = text,
+            SimpleDialog::Confirm { message, .. } => *message = text,
+            SimpleDialog::Prompt { message, .. } => *message = text,
+        }
+    }
+
+    pub fn dismiss(&self) {
+        match self {
+            SimpleDialog::Alert {
+                response_sender, ..
+            } => {
+                let _ = response_sender.send(AlertResponse::Ok);
+            },
+            SimpleDialog::Confirm {
+                response_sender, ..
+            } => {
+                let _ = response_sender.send(ConfirmResponse::Cancel);
+            },
+            SimpleDialog::Prompt {
+                response_sender, ..
+            } => {
+                let _ = response_sender.send(PromptResponse::Cancel);
+            },
+        }
+    }
+
+    pub fn accept(&self) {
+        match self {
+            SimpleDialog::Alert {
+                response_sender, ..
+            } => {
+                let _ = response_sender.send(AlertResponse::Ok);
+            },
+            SimpleDialog::Confirm {
+                response_sender, ..
+            } => {
+                let _ = response_sender.send(ConfirmResponse::Ok);
+            },
+            SimpleDialog::Prompt {
+                default,
+                response_sender,
+                ..
+            } => {
+                let _ = response_sender.send(PromptResponse::Ok(default.clone()));
+            },
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct AuthenticationResponse {
     /// Username for http request authentication
@@ -256,6 +321,92 @@ pub struct ViewportDetails {
     pub hidpi_scale_factor: Scale<f32, CSSPixel, DevicePixel>,
 }
 
+impl ViewportDetails {
+    /// Convert this [`ViewportDetails`] size to a [`LayoutSize`]. This is the same numerical
+    /// value as [`Self::size`], because a `LayoutPixel` is the same as a `CSSPixel`.
+    pub fn layout_size(&self) -> LayoutSize {
+        Size2D::from_untyped(self.size.to_untyped())
+    }
+}
+
+/// Unlike [`ScreenGeometry`], the data is in device-independent pixels
+/// to be used by DOM APIs
+#[derive(Default, Deserialize, Serialize)]
+pub struct ScreenMetrics {
+    pub screen_size: DeviceIndependentIntSize,
+    pub available_size: DeviceIndependentIntSize,
+}
+
+/// An opaque identifier for a single webview focus operation.
+#[derive(Clone, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct FocusId(String);
+
+impl FocusId {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+}
+
+/// An opaque identifier for a single history traversal operation.
+#[derive(Clone, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct TraversalId(String);
+
+impl TraversalId {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum PixelFormat {
+    /// Luminance channel only
+    K8,
+    /// Luminance + alpha
+    KA8,
+    /// RGB, 8 bits per channel
+    RGB8,
+    /// RGB + alpha, 8 bits per channel
+    RGBA8,
+    /// BGR + alpha, 8 bits per channel
+    BGRA8,
+}
+
+/// A raster image buffer.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct Image {
+    pub width: u32,
+    pub height: u32,
+    pub format: PixelFormat,
+    /// A shared memory block containing the data of one or more image frames.
+    data: IpcSharedMemory,
+    range: Range<usize>,
+}
+
+impl Image {
+    pub fn new(
+        width: u32,
+        height: u32,
+        data: IpcSharedMemory,
+        range: Range<usize>,
+        format: PixelFormat,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            format,
+            data,
+            range,
+        }
+    }
+
+    /// Return the bytes belonging to the first image frame.
+    pub fn data(&self) -> &[u8] {
+        &self.data[self.range.clone()]
+    }
+}
+
 #[derive(Deserialize, IntoStaticStr, Serialize)]
 pub enum EmbedderMsg {
     /// A status message to be displayed by the browser chrome.
@@ -290,8 +441,10 @@ pub enum EmbedderMsg {
     AllowOpeningWebView(WebViewId, IpcSender<Option<(WebViewId, ViewportDetails)>>),
     /// A webview was destroyed.
     WebViewClosed(WebViewId),
-    /// A webview gained focus for keyboard events
-    WebViewFocused(WebViewId),
+    /// A webview potentially gained focus for keyboard events, as initiated
+    /// by the provided focus id. If the boolean value is false, the webiew
+    /// could not be focused.
+    WebViewFocused(WebViewId, FocusId, bool),
     /// All webviews lost focus for keyboard events.
     WebViewBlurred,
     /// Wether or not to unload a document
@@ -307,9 +460,15 @@ pub enum EmbedderMsg {
     /// Changes the cursor.
     SetCursor(WebViewId, Cursor),
     /// A favicon was detected
-    NewFavicon(WebViewId, ServoUrl),
+    NewFavicon(WebViewId, Image),
     /// The history state has changed.
     HistoryChanged(WebViewId, Vec<ServoUrl>, usize),
+    /// A history traversal operation completed.
+    HistoryTraversalComplete(WebViewId, TraversalId),
+    /// Get the device independent window rectangle.
+    GetWindowRect(WebViewId, IpcSender<DeviceIndependentIntRect>),
+    /// Get the device independent screen size and available size.
+    GetScreenMetrics(WebViewId, IpcSender<ScreenMetrics>),
     /// Entered or exited fullscreen.
     NotifyFullscreenStateChanged(WebViewId, bool),
     /// The [`LoadStatus`] of the Given `WebView` has changed.
@@ -598,6 +757,16 @@ pub enum Theme {
     /// Dark theme.
     Dark,
 }
+
+impl From<Theme> for PrefersColorScheme {
+    fn from(value: Theme) -> Self {
+        match value {
+            Theme::Light => PrefersColorScheme::Light,
+            Theme::Dark => PrefersColorScheme::Dark,
+        }
+    }
+}
+
 // The type of MediaSession action.
 /// <https://w3c.github.io/mediasession/#enumdef-mediasessionaction>
 #[derive(Clone, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
@@ -663,16 +832,16 @@ pub struct Notification {
     /// The URL of an icon. The icon will be displayed as part of the notification.
     pub icon_url: Option<ServoUrl>,
     /// Icon's raw image data and metadata.
-    pub icon_resource: Option<Arc<Image>>,
+    pub icon_resource: Option<Arc<RasterImage>>,
     /// The URL of a badge. The badge is used when there is no enough space to display the notification,
     /// such as on a mobile device's notification bar.
     pub badge_url: Option<ServoUrl>,
     /// Badge's raw image data and metadata.
-    pub badge_resource: Option<Arc<Image>>,
+    pub badge_resource: Option<Arc<RasterImage>>,
     /// The URL of an image. The image will be displayed as part of the notification.
     pub image_url: Option<ServoUrl>,
     /// Image's raw image data and metadata.
-    pub image_resource: Option<Arc<Image>>,
+    pub image_resource: Option<Arc<RasterImage>>,
     /// Actions available for users to choose from for interacting with the notification.
     pub actions: Vec<NotificationAction>,
 }
@@ -687,26 +856,30 @@ pub struct NotificationAction {
     /// The URL of an icon. The icon will be displayed with the action.
     pub icon_url: Option<ServoUrl>,
     /// Icon's raw image data and metadata.
-    pub icon_resource: Option<Arc<Image>>,
+    pub icon_resource: Option<Arc<RasterImage>>,
 }
 
 /// Information about a `WebView`'s screen geometry and offset. This is used
-/// for the [Screen](https://drafts.csswg.org/cssom-view/#the-screen-interface)
-/// CSSOM APIs and `window.screenLeft` / `window.screenTop`.
+/// for the [Screen](https://drafts.csswg.org/cssom-view/#the-screen-interface) CSSOM APIs
+/// and `window.screenLeft` / `window.screenX` / `window.screenTop` / `window.screenY` /
+/// `window.moveBy`/ `window.resizeBy` / `window.outerWidth` / `window.outerHeight` /
+/// `window.screen.availHeight` / `window.screen.availWidth`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScreenGeometry {
     /// The size of the screen in device pixels. This will be converted to
     /// CSS pixels based on the pixel scaling of the `WebView`.
     pub size: DeviceIntSize,
-    /// The available size of the screen in device pixels. This size is the size
+    /// The available size of the screen in device pixels for the purposes of
+    /// the `window.screen.availHeight` / `window.screen.availWidth`. This is the size
     /// available for web content on the screen, and should be `size` minus any system
-    /// toolbars, docks, and interface elements of the browser. This will be converted to
+    /// toolbars, docks, and interface elements. This will be converted to
     /// CSS pixels based on the pixel scaling of the `WebView`.
     pub available_size: DeviceIntSize,
-    /// The offset of the `WebView` in device pixels for the purposes of the `window.screenLeft`
-    /// and `window.screenTop` APIs. This will be converted to CSS pixels based on the pixel scaling
-    /// of the `WebView`.
-    pub offset: DeviceIntPoint,
+    /// The rectangle the `WebView`'s containing window (including OS decorations)
+    /// in device pixels for the purposes of the
+    /// `window.screenLeft`, `window.outerHeight` and similar APIs.
+    /// This will be converted to CSS pixels based on the pixel scaling of the `WebView`.
+    pub window_rect: DeviceIntRect,
 }
 
 impl From<SelectElementOption> for SelectElementOptionOrOptgroup {
@@ -759,19 +932,10 @@ pub struct CompositorHitTestResult {
     pub pipeline_id: PipelineId,
 
     /// The hit test point in the item's viewport.
-    pub point_in_viewport: euclid::default::Point2D<f32>,
+    pub point_in_viewport: Point2D<f32, CSSPixel>,
 
-    /// The hit test point relative to the item itself.
-    pub point_relative_to_item: euclid::default::Point2D<f32>,
-
-    /// The node address of the hit test result.
-    pub node: UntrustedNodeAddress,
-
-    /// The cursor that should be used when hovering the item hit by the hit test.
-    pub cursor: Option<Cursor>,
-
-    /// The scroll tree node associated with this hit test item.
-    pub scroll_tree_node: ScrollTreeNodeId,
+    /// The [`ExternalScrollId`] of the scroll tree node associated with this hit test item.
+    pub external_scroll_id: ExternalScrollId,
 }
 
 /// Whether the default action for a touch event was prevented by web content
@@ -883,38 +1047,19 @@ pub enum JSValue {
     Number(f64),
     String(String),
     Element(String),
+    ShadowRoot(String),
     Frame(String),
     Window(String),
     Array(Vec<JSValue>),
     Object(HashMap<String, JSValue>),
 }
 
-impl From<&WebDriverJSValue> for JSValue {
-    fn from(value: &WebDriverJSValue) -> Self {
-        match value {
-            WebDriverJSValue::Undefined => Self::Undefined,
-            WebDriverJSValue::Null => Self::Null,
-            WebDriverJSValue::Boolean(value) => Self::Boolean(*value),
-            WebDriverJSValue::Int(value) => Self::Number(*value as f64),
-            WebDriverJSValue::Number(value) => Self::Number(*value),
-            WebDriverJSValue::String(value) => Self::String(value.clone()),
-            WebDriverJSValue::Element(web_element) => Self::Element(web_element.0.clone()),
-            WebDriverJSValue::Frame(web_frame) => Self::Frame(web_frame.0.clone()),
-            WebDriverJSValue::Window(web_window) => Self::Window(web_window.0.clone()),
-            WebDriverJSValue::ArrayLike(vector) => {
-                Self::Array(vector.iter().map(Into::into).collect())
-            },
-            WebDriverJSValue::Object(map) => Self::Object(
-                map.iter()
-                    .map(|(key, value)| (key.clone(), value.into()))
-                    .collect(),
-            ),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum JavaScriptEvaluationError {
+    /// The script could not be compiled
+    CompilationFailure,
+    /// The script could not be evaluated
+    EvaluationFailure,
     /// An internal Servo error prevented the JavaSript evaluation from completing properly.
     /// This indicates a bug in Servo.
     InternalError,

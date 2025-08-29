@@ -4,7 +4,8 @@
 
 use std::cell::{Cell, OnceCell, Ref};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::CStr;
 use std::ops::Index;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,24 +19,20 @@ use base::id::{
     ServiceWorkerId, ServiceWorkerRegistrationId, WebViewId,
 };
 use constellation_traits::{
-    BlobData, BlobImpl, BroadcastMsg, FileBlob, LoadData, LoadOrigin, MessagePortImpl,
-    MessagePortMsg, PortMessageTask, ScriptToConstellationChan, ScriptToConstellationMessage,
+    BlobData, BlobImpl, BroadcastChannelMsg, FileBlob, MessagePortImpl, MessagePortMsg,
+    PortMessageTask, ScriptToConstellationChan, ScriptToConstellationMessage,
 };
-use content_security_policy::{
-    CheckResult, CspList, Destination, Initiator, NavigationCheckType, ParserMetadata,
-    PolicyDisposition, PolicySource, Request, Violation, ViolationResource,
-};
+use content_security_policy::CspList;
 use crossbeam_channel::Sender;
 use devtools_traits::{PageError, ScriptToDevtoolsControlMsg};
 use dom_struct::dom_struct;
-use embedder_traits::EmbedderMsg;
-use http::HeaderMap;
-use hyper_serde::Serde;
+use embedder_traits::{EmbedderMsg, JavaScriptEvaluationError};
+use fonts::FontContext;
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
 use js::glue::{IsWrapper, UnwrapObjectDynamic};
 use js::jsapi::{
-    Compile1, CurrentGlobalOrNull, GetNonCCWObjectGlobal, HandleObject, Heap,
+    Compile1, CurrentGlobalOrNull, DelazificationOption, GetNonCCWObjectGlobal, HandleObject, Heap,
     InstantiateGlobalStencil, InstantiateOptions, JSContext, JSObject, JSScript, SetScriptPrivate,
 };
 use js::jsval::{PrivateValue, UndefinedValue};
@@ -43,8 +40,7 @@ use js::panic::maybe_resume_unwind;
 use js::rust::wrappers::{JS_ExecuteScript, JS_GetScriptPrivate};
 use js::rust::{
     CompileOptionsWrapper, CustomAutoRooter, CustomAutoRooterGuard, HandleValue,
-    MutableHandleValue, ParentRuntime, Runtime, describe_scripted_caller, get_object_class,
-    transform_str_to_source_text,
+    MutableHandleValue, ParentRuntime, Runtime, get_object_class, transform_str_to_source_text,
 };
 use js::{JSCLASS_IS_DOMJSCLASS, JSCLASS_IS_GLOBAL};
 use net_traits::blob_url_store::{BlobBuf, get_blob_origin};
@@ -62,8 +58,7 @@ use net_traits::{
 use profile_traits::{ipc as profile_ipc, mem as profile_mem, time as profile_time};
 use script_bindings::interfaces::GlobalScopeHelpers;
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
-use timers::{TimerEventId, TimerEventRequest, TimerSource};
-use url::Origin;
+use timers::{TimerEventRequest, TimerId};
 use uuid::Uuid;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{DeviceLostReason, WebGPUDevice};
@@ -74,17 +69,16 @@ use super::bindings::codegen::Bindings::WebGPUBinding::GPUDeviceLostReason;
 use super::bindings::error::Fallible;
 use super::bindings::trace::{HashMapTracedValues, RootedTraceableBox};
 use super::serviceworkerglobalscope::ServiceWorkerGlobalScope;
+use super::transformstream::CrossRealmTransform;
 use crate::dom::bindings::cell::{DomRefCell, RefMut};
 use crate::dom::bindings::codegen::Bindings::BroadcastChannelBinding::BroadcastChannelMethods;
 use crate::dom::bindings::codegen::Bindings::EventSourceBinding::EventSource_Binding::EventSourceMethods;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
-use crate::dom::bindings::codegen::Bindings::ImageBitmapBinding::{
-    ImageBitmapOptions, ImageBitmapSource,
-};
 use crate::dom::bindings::codegen::Bindings::NotificationBinding::NotificationPermissionCallback;
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::{
     PermissionName, PermissionState,
 };
+use crate::dom::bindings::codegen::Bindings::ReportingObserverBinding::Report;
 use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::codegen::Bindings::WorkerGlobalScopeBinding::WorkerGlobalScopeMethods;
@@ -106,25 +100,23 @@ use crate::dom::crypto::Crypto;
 use crate::dom::dedicatedworkerglobalscope::{
     DedicatedWorkerControlMsg, DedicatedWorkerGlobalScope,
 };
-use crate::dom::element::Element;
 use crate::dom::errorevent::ErrorEvent;
-use crate::dom::event::{Event, EventBubbles, EventCancelable, EventStatus};
+use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventsource::EventSource;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::file::File;
 use crate::dom::htmlscriptelement::{ScriptId, SourceCode};
-use crate::dom::imagebitmap::ImageBitmap;
-use crate::dom::messageevent::MessageEvent;
 use crate::dom::messageport::MessagePort;
-use crate::dom::node::Node;
 use crate::dom::paintworkletglobalscope::PaintWorkletGlobalScope;
 use crate::dom::performance::Performance;
 use crate::dom::performanceobserver::VALID_ENTRY_TYPES;
 use crate::dom::promise::Promise;
 use crate::dom::readablestream::{CrossRealmTransformReadable, ReadableStream};
+use crate::dom::reportingobserver::ReportingObserver;
 use crate::dom::serviceworker::ServiceWorker;
 use crate::dom::serviceworkerregistration::ServiceWorkerRegistration;
 use crate::dom::trustedtypepolicyfactory::TrustedTypePolicyFactory;
+use crate::dom::types::{CookieStore, DebuggerGlobalScope, MessageEvent};
 use crate::dom::underlyingsourcecontainer::UnderlyingSourceType;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::gpudevice::GPUDevice;
@@ -137,15 +129,17 @@ use crate::dom::writablestream::CrossRealmTransformWritable;
 use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
 use crate::microtask::{Microtask, MicrotaskQueue, UserMicrotask};
 use crate::network_listener::{NetworkListener, PreInvoke};
-use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
-use crate::script_module::{DynamicModuleList, ModuleScript, ModuleTree, ScriptFetchOptions};
+use crate::realms::{InRealm, enter_realm};
+use crate::script_module::{
+    DynamicModuleList, ImportMap, ModuleScript, ModuleTree, ResolvedModule, ScriptFetchOptions,
+};
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext, ThreadSafeJSContext};
 use crate::script_thread::{ScriptThread, with_script_thread};
-use crate::security_manager::{CSPViolationReportBuilder, CSPViolationReportTask};
 use crate::task_manager::TaskManager;
 use crate::task_source::SendableTaskSource;
 use crate::timers::{
     IsInterval, OneshotTimerCallback, OneshotTimerHandle, OneshotTimers, TimerCallback,
+    TimerEventId, TimerSource,
 };
 use crate::unminify::unminified_path;
 
@@ -216,6 +210,9 @@ pub(crate) struct GlobalScope {
         HashMapTracedValues<ServiceWorkerRegistrationId, Dom<ServiceWorkerRegistration>>,
     >,
 
+    /// <https://cookiestore.spec.whatwg.org/#globals>
+    cookie_store: MutNullableDom<CookieStore>,
+
     /// <https://w3c.github.io/ServiceWorker/#environment-settings-object-service-worker-object-map>
     worker_map: DomRefCell<HashMapTracedValues<ServiceWorkerId, Dom<ServiceWorker>>>,
 
@@ -275,7 +272,11 @@ pub(crate) struct GlobalScope {
 
     /// <https://html.spec.whatwg.org/multipage/#concept-environment-creation-url>
     #[no_trace]
-    creation_url: Option<ServoUrl>,
+    creation_url: ServoUrl,
+
+    /// <https://html.spec.whatwg.org/multipage/#concept-environment-top-level-creation-url>
+    #[no_trace]
+    top_level_creation_url: Option<ServoUrl>,
 
     /// A map for storing the previous permission state read results.
     permission_state_invocation_results: DomRefCell<HashMap<PermissionName, PermissionState>>,
@@ -374,6 +375,22 @@ pub(crate) struct GlobalScope {
     #[ignore_malloc_size_of = "Rc<T> is hard"]
     notification_permission_request_callback_map:
         DomRefCell<HashMap<String, Rc<NotificationPermissionCallback>>>,
+
+    /// An import map allows control over module specifier resolution.
+    /// For now, only Window global objects have their import map modified from the initial empty one.
+    ///
+    /// <https://html.spec.whatwg.org/multipage/#import-maps>
+    import_map: DomRefCell<ImportMap>,
+
+    /// <https://html.spec.whatwg.org/multipage/#resolved-module-set>
+    resolved_module_set: DomRefCell<HashSet<ResolvedModule>>,
+
+    /// The [`FontContext`] for this [`GlobalScope`] if it has one. This is used for
+    /// canvas and layout, so if this [`GlobalScope`] doesn't need to use either, this
+    /// might be `None`.
+    #[conditional_malloc_size_of]
+    #[no_trace]
+    font_context: Option<Arc<FontContext>>,
 }
 
 /// A wrapper for glue-code between the ipc router and the event-loop.
@@ -458,13 +475,9 @@ pub(crate) struct ManagedMessagePort {
     /// Whether the port has been closed by script in this global,
     /// so it can be removed.
     explicitly_closed: bool,
-    /// Note: it may seem strange to use a pair of options, versus for example an enum.
-    /// But it looks like tranform streams will require both of those in their transfer.
-    /// This will be resolved when we reach that point of the implementation.
-    /// <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformreadable>
-    cross_realm_transform_readable: Option<CrossRealmTransformReadable>,
-    /// <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
-    cross_realm_transform_writable: Option<CrossRealmTransformWritable>,
+    /// The handler for `message` or `messageerror` used in the cross realm transform,
+    /// if any was setup with this port.
+    cross_realm_transform: Option<CrossRealmTransform>,
 }
 
 /// State representing whether this global is currently managing broadcast channels.
@@ -500,7 +513,7 @@ pub(crate) enum MessagePortState {
 impl BroadcastListener {
     /// Handle a broadcast coming in over IPC,
     /// by queueing the appropriate task on the relevant event-loop.
-    fn handle(&self, event: BroadcastMsg) {
+    fn handle(&self, event: BroadcastChannelMsg) {
         let context = self.context.clone();
 
         // Note: strictly speaking we should just queue the message event tasks,
@@ -730,11 +743,13 @@ impl GlobalScope {
         script_to_constellation_chan: ScriptToConstellationChan,
         resource_threads: ResourceThreads,
         origin: MutableOrigin,
-        creation_url: Option<ServoUrl>,
+        creation_url: ServoUrl,
+        top_level_creation_url: Option<ServoUrl>,
         microtask_queue: Rc<MicrotaskQueue>,
         #[cfg(feature = "webgpu")] gpu_id_hub: Arc<IdentityHub>,
         inherited_secure_context: Option<bool>,
         unminify_js: bool,
+        font_context: Option<Arc<FontContext>>,
     ) -> Self {
         Self {
             task_manager: Default::default(),
@@ -744,6 +759,7 @@ impl GlobalScope {
             eventtarget: EventTarget::new_inherited(),
             crypto: Default::default(),
             registration_map: DomRefCell::new(HashMapTracedValues::new()),
+            cookie_store: Default::default(),
             worker_map: DomRefCell::new(HashMapTracedValues::new()),
             pipeline_id,
             devtools_wants_updates: Default::default(),
@@ -759,6 +775,7 @@ impl GlobalScope {
             timers: OnceCell::default(),
             origin,
             creation_url,
+            top_level_creation_url,
             permission_state_invocation_results: Default::default(),
             microtask_queue,
             list_auto_close_worker: Default::default(),
@@ -779,6 +796,9 @@ impl GlobalScope {
             byte_length_queuing_strategy_size_function: OnceCell::new(),
             count_queuing_strategy_size_function: OnceCell::new(),
             notification_permission_request_callback_map: Default::default(),
+            import_map: Default::default(),
+            resolved_module_set: Default::default(),
+            font_context,
         }
     }
 
@@ -803,6 +823,10 @@ impl GlobalScope {
 
     fn timers(&self) -> &OneshotTimers {
         self.timers.get_or_init(|| OneshotTimers::new(self))
+    }
+
+    pub(crate) fn font_context(&self) -> Option<&Arc<FontContext>> {
+        self.font_context.as_ref()
     }
 
     /// <https://w3c.github.io/ServiceWorker/#get-the-service-worker-registration-object>
@@ -919,7 +943,7 @@ impl GlobalScope {
         let dom_port = if let MessagePortState::Managed(_id, message_ports) =
             &mut *self.message_port_state.borrow_mut()
         {
-            let dom_port = if let Some(managed_port) = message_ports.get_mut(&port_id) {
+            if let Some(managed_port) = message_ports.get_mut(&port_id) {
                 if managed_port.pending {
                     unreachable!("CompleteDisentanglement msg received for a pending port.");
                 }
@@ -934,8 +958,7 @@ impl GlobalScope {
                 // can happen if the port has already been transferred out of this global,
                 // in which case the disentanglement will complete along with the transfer.
                 return;
-            };
-            dom_port
+            }
         } else {
             return;
         };
@@ -1218,7 +1241,7 @@ impl GlobalScope {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-broadcastchannel-postmessage>
     /// Step 7 and following steps.
-    pub(crate) fn schedule_broadcast(&self, msg: BroadcastMsg, channel_id: &Uuid) {
+    pub(crate) fn schedule_broadcast(&self, msg: BroadcastChannelMsg, channel_id: &Uuid) {
         // First, broadcast locally.
         self.broadcast_message_event(msg.clone(), Some(channel_id));
 
@@ -1239,10 +1262,14 @@ impl GlobalScope {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-broadcastchannel-postmessage>
     /// Step 7 and following steps.
-    pub(crate) fn broadcast_message_event(&self, event: BroadcastMsg, channel_id: Option<&Uuid>) {
+    pub(crate) fn broadcast_message_event(
+        &self,
+        event: BroadcastChannelMsg,
+        channel_id: Option<&Uuid>,
+    ) {
         if let BroadcastChannelState::Managed(_, channels) = &*self.broadcast_channel_state.borrow()
         {
-            let BroadcastMsg {
+            let BroadcastChannelMsg {
                 data,
                 origin,
                 channel_name,
@@ -1345,7 +1372,9 @@ impl GlobalScope {
             unreachable!("Cross realm transform readable must match a managed port");
         };
 
-        managed_port.cross_realm_transform_readable = Some(cross_realm_transform_readable.clone());
+        managed_port.cross_realm_transform = Some(CrossRealmTransform::Readable(
+            cross_realm_transform_readable.clone(),
+        ));
     }
 
     /// <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
@@ -1368,7 +1397,9 @@ impl GlobalScope {
             unreachable!("Cross realm transform writable must match a managed port");
         };
 
-        managed_port.cross_realm_transform_writable = Some(cross_realm_transform_writable.clone());
+        managed_port.cross_realm_transform = Some(CrossRealmTransform::Writable(
+            cross_realm_transform_writable.clone(),
+        ));
     }
 
     /// Custom routing logic, followed by the task steps of
@@ -1380,8 +1411,7 @@ impl GlobalScope {
         can_gc: CanGc,
     ) {
         let cx = GlobalScope::get_cx();
-        rooted!(in(*cx) let mut cross_realm_transform_readable = None);
-        rooted!(in(*cx) let mut cross_realm_transform_writable = None);
+        rooted!(in(*cx) let mut cross_realm_transform = None);
 
         let should_dispatch = if let MessagePortState::Managed(_id, message_ports) =
             &mut *self.message_port_state.borrow_mut()
@@ -1399,10 +1429,7 @@ impl GlobalScope {
                         let to_dispatch = port_impl.handle_incoming(task).map(|to_dispatch| {
                             (DomRoot::from_ref(&*managed_port.dom_port), to_dispatch)
                         });
-                        cross_realm_transform_readable
-                            .set(managed_port.cross_realm_transform_readable.clone());
-                        cross_realm_transform_writable
-                            .set(managed_port.cross_realm_transform_writable.clone());
+                        cross_realm_transform.set(managed_port.cross_realm_transform.clone());
                         to_dispatch
                     } else {
                         panic!("managed-port has no port-impl.");
@@ -1429,10 +1456,6 @@ impl GlobalScope {
             // Re-ordered because we need to pass it to `structuredclone::read`.
             rooted!(in(*cx) let mut message_clone = UndefinedValue());
 
-            // Note: if this port is used to transfer a stream, we handle the events in Rust.
-            let has_cross_realm_tansform = cross_realm_transform_readable.is_some() ||
-                cross_realm_transform_writable.is_some();
-
             let realm = enter_realm(self);
             let comp = InRealm::Entered(&realm);
 
@@ -1447,26 +1470,28 @@ impl GlobalScope {
             // if any, maintaining their relative order.
             // Note: both done in `structuredclone::read`.
             if let Ok(ports) = structuredclone::read(self, data, message_clone.handle_mut()) {
-                // Add a handler for port’s message event with the following steps:
-                // from <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformreadable>
-                if let Some(transform) = cross_realm_transform_readable.as_ref() {
-                    transform.handle_message(
-                        cx,
-                        self,
-                        &dom_port,
-                        message_clone.handle(),
-                        comp,
-                        can_gc,
-                    );
-                }
-
-                // Add a handler for port’s message event with the following steps:
-                // from <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
-                if let Some(transform) = cross_realm_transform_writable.as_ref() {
-                    transform.handle_message(cx, self, message_clone.handle(), comp, can_gc);
-                }
-
-                if !has_cross_realm_tansform {
+                // Note: if this port is used to transfer a stream, we handle the events in Rust.
+                if let Some(transform) = cross_realm_transform.as_ref() {
+                    match transform {
+                        // Add a handler for port’s message event with the following steps:
+                        // from <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformreadable>
+                        CrossRealmTransform::Readable(readable) => {
+                            readable.handle_message(
+                                cx,
+                                self,
+                                &dom_port,
+                                message_clone.handle(),
+                                comp,
+                                can_gc,
+                            );
+                        },
+                        // Add a handler for port’s message event with the following steps:
+                        // from <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
+                        CrossRealmTransform::Writable(writable) => {
+                            writable.handle_message(cx, self, message_clone.handle(), comp, can_gc);
+                        },
+                    }
+                } else {
                     // Fire an event named message at messageEventTarget,
                     // using MessageEvent,
                     // with the data attribute initialized to messageClone
@@ -1481,25 +1506,24 @@ impl GlobalScope {
                         can_gc,
                     );
                 }
+            } else if let Some(transform) = cross_realm_transform.as_ref() {
+                match transform {
+                    // Add a handler for port’s messageerror event with the following steps:
+                    // from <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformreadable>
+                    CrossRealmTransform::Readable(readable) => {
+                        readable.handle_error(cx, self, &dom_port, comp, can_gc);
+                    },
+                    // Add a handler for port’s messageerror event with the following steps:
+                    // from <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
+                    CrossRealmTransform::Writable(writable) => {
+                        writable.handle_error(cx, self, &dom_port, comp, can_gc);
+                    },
+                }
             } else {
-                // Add a handler for port’s messageerror event with the following steps:
-                // from <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformreadable>
-                if let Some(transform) = cross_realm_transform_readable.as_ref() {
-                    transform.handle_error(cx, self, &dom_port, comp, can_gc);
-                }
-
-                // Add a handler for port’s messageerror event with the following steps:
-                // from <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
-                if let Some(transform) = cross_realm_transform_writable.as_ref() {
-                    transform.handle_error(cx, self, &dom_port, comp, can_gc);
-                }
-
-                if !has_cross_realm_tansform {
-                    // If this throws an exception, catch it,
-                    // fire an event named messageerror at messageEventTarget,
-                    // using MessageEvent, and then return.
-                    MessageEvent::dispatch_error(message_event_target, self, can_gc);
-                }
+                // If this throws an exception, catch it,
+                // fire an event named messageerror at messageEventTarget,
+                // using MessageEvent, and then return.
+                MessageEvent::dispatch_error(message_event_target, self, can_gc);
             }
         }
     }
@@ -1615,7 +1639,7 @@ impl GlobalScope {
                 broadcast_control_receiver,
                 Box::new(move |message| match message {
                     Ok(msg) => listener.handle(msg),
-                    Err(err) => warn!("Error receiving a BroadcastMsg: {:?}", err),
+                    Err(err) => warn!("Error receiving a BroadcastChannelMsg: {:?}", err),
                 }),
             );
             let router_id = BroadcastChannelRouterId::new();
@@ -1689,8 +1713,7 @@ impl GlobalScope {
                         dom_port: Dom::from_ref(dom_port),
                         pending: true,
                         explicitly_closed: false,
-                        cross_realm_transform_readable: None,
-                        cross_realm_transform_writable: None,
+                        cross_realm_transform: None,
                     },
                 );
 
@@ -1713,8 +1736,7 @@ impl GlobalScope {
                         dom_port: Dom::from_ref(dom_port),
                         pending: false,
                         explicitly_closed: false,
-                        cross_realm_transform_readable: None,
-                        cross_realm_transform_writable: None,
+                        cross_realm_transform: None,
                     },
                 );
                 let _ = self.script_to_constellation_chan().send(
@@ -2033,8 +2055,8 @@ impl GlobalScope {
     /// Promote non-Slice blob:
     /// 1. Memory-based: The bytes in data slice will be transferred to file manager thread.
     /// 2. File-based: If set_valid, then activate the FileID so it can serve as URL
-    ///     Depending on set_valid, the returned FileID can be part of
-    ///     valid or invalid Blob URL.
+    ///    Depending on set_valid, the returned FileID can be part of
+    ///    valid or invalid Blob URL.
     pub(crate) fn promote(&self, blob_info: &mut BlobInfo, set_valid: bool) -> Uuid {
         let mut bytes = vec![];
         let global_url = self.get_url();
@@ -2245,16 +2267,16 @@ impl GlobalScope {
     #[allow(unsafe_code)]
     pub(crate) unsafe fn from_object(obj: *mut JSObject) -> DomRoot<Self> {
         assert!(!obj.is_null());
-        let global = GetNonCCWObjectGlobal(obj);
-        global_scope_from_global_static(global)
+        let global = unsafe { GetNonCCWObjectGlobal(obj) };
+        unsafe { global_scope_from_global_static(global) }
     }
 
     /// Returns the global scope for the given JSContext
     #[allow(unsafe_code)]
     pub(crate) unsafe fn from_context(cx: *mut JSContext, _realm: InRealm) -> DomRoot<Self> {
-        let global = CurrentGlobalOrNull(cx);
+        let global = unsafe { CurrentGlobalOrNull(cx) };
         assert!(!global.is_null());
-        global_scope_from_global(global, cx)
+        unsafe { global_scope_from_global(global, cx) }
     }
 
     /// Returns the global scope for the given SafeJSContext
@@ -2270,11 +2292,13 @@ impl GlobalScope {
         mut obj: *mut JSObject,
         cx: *mut JSContext,
     ) -> DomRoot<Self> {
-        if IsWrapper(obj) {
-            obj = UnwrapObjectDynamic(obj, cx, /* stopAtWindowProxy = */ false);
-            assert!(!obj.is_null());
+        unsafe {
+            if IsWrapper(obj) {
+                obj = UnwrapObjectDynamic(obj, cx, /* stopAtWindowProxy = */ false);
+                assert!(!obj.is_null());
+            }
+            GlobalScope::from_object(obj)
         }
-        GlobalScope::from_object(obj)
     }
 
     pub(crate) fn add_uncaught_rejection(&self, rejection: HandleObject) {
@@ -2355,6 +2379,10 @@ impl GlobalScope {
 
     pub(crate) fn crypto(&self, can_gc: CanGc) -> DomRoot<Crypto> {
         self.crypto.or_init(|| Crypto::new(self, can_gc))
+    }
+
+    pub(crate) fn cookie_store(&self, can_gc: CanGc) -> DomRoot<CookieStore> {
+        self.cookie_store.or_init(|| CookieStore::new(self, can_gc))
     }
 
     pub(crate) fn live_devtools_updates(&self) -> bool {
@@ -2468,8 +2496,13 @@ impl GlobalScope {
     }
 
     /// Get the creation_url for this global scope
-    pub(crate) fn creation_url(&self) -> &Option<ServoUrl> {
+    pub(crate) fn creation_url(&self) -> &ServoUrl {
         &self.creation_url
+    }
+
+    /// Get the top_level_creation_url for this global scope
+    pub(crate) fn top_level_creation_url(&self) -> &Option<ServoUrl> {
+        &self.top_level_creation_url
     }
 
     pub(crate) fn image_cache(&self) -> Arc<dyn ImageCache> {
@@ -2488,10 +2521,10 @@ impl GlobalScope {
     /// Schedule a [`TimerEventRequest`] on this [`GlobalScope`]'s [`timers::TimerScheduler`].
     /// Every Worker has its own scheduler, which handles events in the Worker event loop,
     /// but `Window`s use a shared scheduler associated with their [`ScriptThread`].
-    pub(crate) fn schedule_timer(&self, request: TimerEventRequest) {
+    pub(crate) fn schedule_timer(&self, request: TimerEventRequest) -> Option<TimerId> {
         match self.downcast::<WorkerGlobalScope>() {
-            Some(worker_global) => worker_global.timer_scheduler().schedule_timer(request),
-            _ => with_script_thread(|script_thread| script_thread.schedule_timer(request)),
+            Some(worker_global) => Some(worker_global.timer_scheduler().schedule_timer(request)),
+            _ => with_script_thread(|script_thread| Some(script_thread.schedule_timer(request))),
         }
     }
 
@@ -2504,41 +2537,6 @@ impl GlobalScope {
             return worker.policy_container().to_owned();
         }
         unreachable!();
-    }
-
-    /// <https://www.w3.org/TR/CSP/#initialize-document-csp>
-    pub(crate) fn parse_csp_list_from_metadata(
-        headers: &Option<Serde<HeaderMap>>,
-    ) -> Option<CspList> {
-        // TODO: Implement step 1 (local scheme special case)
-        let headers = headers.as_ref()?;
-        let mut csp = headers.get_all("content-security-policy").iter();
-        // This silently ignores the CSP if it contains invalid Unicode.
-        // We should probably report an error somewhere.
-        let c = csp.next().and_then(|c| c.to_str().ok())?;
-        let mut csp_list = CspList::parse(c, PolicySource::Header, PolicyDisposition::Enforce);
-        for c in csp {
-            let c = c.to_str().ok()?;
-            csp_list.append(CspList::parse(
-                c,
-                PolicySource::Header,
-                PolicyDisposition::Enforce,
-            ));
-        }
-        let csp_report = headers
-            .get_all("content-security-policy-report-only")
-            .iter();
-        // This silently ignores the CSP if it contains invalid Unicode.
-        // We should probably report an error somewhere.
-        for c in csp_report {
-            let c = c.to_str().ok()?;
-            csp_list.append(CspList::parse(
-                c,
-                PolicySource::Header,
-                PolicyDisposition::Report,
-            ));
-        }
-        Some(csp_list)
     }
 
     /// Get the [base url](https://html.spec.whatwg.org/multipage/#api-base-url)
@@ -2556,6 +2554,9 @@ impl GlobalScope {
             // https://drafts.css-houdini.org/worklets/#script-settings-for-worklets
             return worklet.base_url();
         }
+        if let Some(_debugger_global) = self.downcast::<DebuggerGlobalScope>() {
+            return self.creation_url.clone();
+        }
         unreachable!();
     }
 
@@ -2570,6 +2571,9 @@ impl GlobalScope {
         if let Some(worklet) = self.downcast::<WorkletGlobalScope>() {
             // TODO: is this the right URL to return?
             return worklet.base_url();
+        }
+        if let Some(_debugger_global) = self.downcast::<DebuggerGlobalScope>() {
+            return self.creation_url.clone();
         }
         unreachable!();
     }
@@ -2664,15 +2668,18 @@ impl GlobalScope {
 
     /// <https://html.spec.whatwg.org/multipage/#report-the-error>
     pub(crate) fn report_an_error(&self, error_info: ErrorInfo, value: HandleValue, can_gc: CanGc) {
-        // Step 1.
+        // Step 6. Early return if global is in error reporting mode,
         if self.in_error_reporting_mode.get() {
             return;
         }
 
-        // Step 2.
+        // Step 6.1. Set global's in error reporting mode to true.
         self.in_error_reporting_mode.set(true);
 
-        // Steps 3-6.
+        // Step 6.2. Set notHandled to the result of firing an event named error at global,
+        // using ErrorEvent, with the cancelable attribute initialized to true,
+        // and additional attributes initialized according to errorInfo.
+
         // FIXME(#13195): muted errors.
         let event = ErrorEvent::new(
             self,
@@ -2687,16 +2694,15 @@ impl GlobalScope {
             can_gc,
         );
 
-        // Step 7.
-        let event_status = event
+        let not_handled = event
             .upcast::<Event>()
             .fire(self.upcast::<EventTarget>(), can_gc);
 
-        // Step 8.
+        // Step 6.3. Set global's in error reporting mode to false.
         self.in_error_reporting_mode.set(false);
 
-        // Step 9.
-        if event_status == EventStatus::NotCanceled {
+        // Step 7.
+        if not_handled {
             // https://html.spec.whatwg.org/multipage/#runtime-script-errors-2
             if let Some(dedicated) = self.downcast::<DedicatedWorkerGlobalScope>() {
                 dedicated.forward_error_to_worker_object(error_info);
@@ -2708,7 +2714,7 @@ impl GlobalScope {
                             type_: "PageError".to_string(),
                             error_message: error_info.message.clone(),
                             source_name: error_info.filename.clone(),
-                            line_text: "".to_string(), //TODO
+                            line_text: "".to_string(), // TODO
                             line_number: error_info.lineno,
                             column_number: error_info.column,
                             category: "script".to_string(),
@@ -2778,7 +2784,8 @@ impl GlobalScope {
         fetch_options: ScriptFetchOptions,
         script_base_url: ServoUrl,
         can_gc: CanGc,
-    ) -> bool {
+        introduction_type: Option<&'static CStr>,
+    ) -> Result<(), JavaScriptEvaluationError> {
         let source_code = SourceCode::Text(Rc::new(DOMString::from_string((*code).to_string())));
         self.evaluate_script_on_global_with_result(
             &source_code,
@@ -2788,6 +2795,7 @@ impl GlobalScope {
             fetch_options,
             script_base_url,
             can_gc,
+            introduction_type,
         )
     }
 
@@ -2803,7 +2811,8 @@ impl GlobalScope {
         fetch_options: ScriptFetchOptions,
         script_base_url: ServoUrl,
         can_gc: CanGc,
-    ) -> bool {
+        introduction_type: Option<&'static CStr>,
+    ) -> Result<(), JavaScriptEvaluationError> {
         let cx = GlobalScope::get_cx();
 
         let ar = enter_realm(self);
@@ -2814,7 +2823,10 @@ impl GlobalScope {
             rooted!(in(*cx) let mut compiled_script = std::ptr::null_mut::<JSScript>());
             match code {
                 SourceCode::Text(text_code) => {
-                    let options = CompileOptionsWrapper::new(*cx, filename, line_number);
+                    let mut options = CompileOptionsWrapper::new(*cx, filename, line_number);
+                    if let Some(introduction_type) = introduction_type {
+                        options.set_introduction_type(introduction_type);
+                    }
 
                     debug!("compiling dom string");
                     compiled_script.set(Compile1(
@@ -2826,7 +2838,7 @@ impl GlobalScope {
                     if compiled_script.is_null() {
                         debug!("error compiling Dom string");
                         report_pending_exception(cx, true, InRealm::Entered(&ar), can_gc);
-                        return false;
+                        return Err(JavaScriptEvaluationError::CompilationFailure);
                     }
                 },
                 SourceCode::Compiled(pre_compiled_script) => {
@@ -2834,6 +2846,7 @@ impl GlobalScope {
                         skipFilenameValidation: false,
                         hideScriptFromDebugger: false,
                         deferDebugMetadata: false,
+                        eagerDelazificationStrategy_: DelazificationOption::OnDemandOnly,
                     };
                     let script = InstantiateGlobalStencil(
                         *cx,
@@ -2875,10 +2888,11 @@ impl GlobalScope {
             if !result {
                 debug!("error evaluating Dom string");
                 report_pending_exception(cx, true, InRealm::Entered(&ar), can_gc);
+                return Err(JavaScriptEvaluationError::EvaluationFailure);
             }
 
             maybe_resume_unwind();
-            result
+            Ok(())
         }
     }
 
@@ -2903,7 +2917,8 @@ impl GlobalScope {
         arguments: Vec<HandleValue>,
         timeout: Duration,
         is_interval: IsInterval,
-    ) -> i32 {
+        can_gc: CanGc,
+    ) -> Fallible<i32> {
         self.timers().set_timeout_or_interval(
             self,
             callback,
@@ -2911,6 +2926,7 @@ impl GlobalScope {
             timeout,
             is_interval,
             self.timer_source(),
+            can_gc,
         )
     }
 
@@ -2923,105 +2939,6 @@ impl GlobalScope {
             callback,
             pipeline: self.pipeline_id(),
         }))
-    }
-
-    pub(crate) fn is_js_evaluation_allowed(&self, source: &str) -> bool {
-        let Some(csp_list) = self.get_csp_list() else {
-            return true;
-        };
-
-        let (is_js_evaluation_allowed, violations) = csp_list.is_js_evaluation_allowed(source);
-
-        self.report_csp_violations(violations, None);
-
-        is_js_evaluation_allowed == CheckResult::Allowed
-    }
-
-    pub(crate) fn should_navigation_request_be_blocked(&self, load_data: &LoadData) -> bool {
-        let Some(csp_list) = self.get_csp_list() else {
-            return false;
-        };
-        let request = Request {
-            url: load_data.url.clone().into_url(),
-            origin: match &load_data.load_origin {
-                LoadOrigin::Script(immutable_origin) => immutable_origin.clone().into_url_origin(),
-                _ => Origin::new_opaque(),
-            },
-            // TODO: populate this field correctly
-            redirect_count: 0,
-            destination: Destination::None,
-            initiator: Initiator::None,
-            nonce: "".to_owned(),
-            integrity_metadata: "".to_owned(),
-            parser_metadata: ParserMetadata::None,
-        };
-        // TODO: set correct navigation check type for form submission if applicable
-        let (result, violations) =
-            csp_list.should_navigation_request_be_blocked(&request, NavigationCheckType::Other);
-
-        self.report_csp_violations(violations, None);
-
-        result == CheckResult::Blocked
-    }
-
-    pub(crate) fn create_image_bitmap(
-        &self,
-        image: ImageBitmapSource,
-        options: &ImageBitmapOptions,
-        can_gc: CanGc,
-    ) -> Rc<Promise> {
-        let in_realm_proof = AlreadyInRealm::assert::<crate::DomTypeHolder>();
-        let p = Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), can_gc);
-        if options.resizeWidth.is_some_and(|w| w == 0) {
-            p.reject_error(Error::InvalidState, can_gc);
-            return p;
-        }
-
-        if options.resizeHeight.is_some_and(|w| w == 0) {
-            p.reject_error(Error::InvalidState, can_gc);
-            return p;
-        }
-
-        match image {
-            ImageBitmapSource::HTMLCanvasElement(ref canvas) => {
-                // https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument
-                if !canvas.is_valid() {
-                    p.reject_error(Error::InvalidState, can_gc);
-                    return p;
-                }
-
-                if let Some(snapshot) = canvas.get_image_data() {
-                    let size = snapshot.size().cast();
-                    let image_bitmap =
-                        ImageBitmap::new(self, size.width, size.height, can_gc).unwrap();
-                    image_bitmap.set_bitmap_data(snapshot.to_vec());
-                    image_bitmap.set_origin_clean(canvas.origin_is_clean());
-                    p.resolve_native(&(image_bitmap), can_gc);
-                }
-                p
-            },
-            ImageBitmapSource::OffscreenCanvas(ref canvas) => {
-                // https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument
-                if !canvas.is_valid() {
-                    p.reject_error(Error::InvalidState, can_gc);
-                    return p;
-                }
-
-                if let Some(snapshot) = canvas.get_image_data() {
-                    let size = snapshot.size().cast();
-                    let image_bitmap =
-                        ImageBitmap::new(self, size.width, size.height, can_gc).unwrap();
-                    image_bitmap.set_bitmap_data(snapshot.to_vec());
-                    image_bitmap.set_origin_clean(canvas.origin_is_clean());
-                    p.resolve_native(&(image_bitmap), can_gc);
-                }
-                p
-            },
-            _ => {
-                p.reject_error(Error::NotSupported, can_gc);
-                p
-            },
-        }
     }
 
     pub(crate) fn fire_timer(&self, handle: TimerEventId, can_gc: CanGc) {
@@ -3204,13 +3121,30 @@ impl GlobalScope {
         if Some(false) == self.inherited_secure_context {
             return false;
         }
-        if let Some(creation_url) = self.creation_url() {
-            if creation_url.scheme() == "blob" && Some(true) == self.inherited_secure_context {
-                return true;
-            }
-            return creation_url.is_potentially_trustworthy();
+        // Step 1. If environment is an environment settings object, then:
+        // Step 1.1. Let global be environment's global object.
+        match self.top_level_creation_url() {
+            None => {
+                // Workers and worklets don't have a top-level creation URL
+                assert!(
+                    self.downcast::<WorkerGlobalScope>().is_some() ||
+                        self.downcast::<WorkletGlobalScope>().is_some()
+                );
+                true
+            },
+            Some(top_level_creation_url) => {
+                assert!(self.downcast::<Window>().is_some());
+                // Step 2. If the result of Is url potentially trustworthy?
+                // given environment's top-level creation URL is "Potentially Trustworthy", then return true.
+                // Step 3. Return false.
+                if top_level_creation_url.scheme() == "blob" &&
+                    Some(true) == self.inherited_secure_context
+                {
+                    return true;
+                }
+                top_level_creation_url.is_potentially_trustworthy()
+            },
         }
-        false
     }
 
     /// <https://www.w3.org/TR/CSP/#get-csp-of-object>
@@ -3328,7 +3262,7 @@ impl GlobalScope {
         }
     }
 
-    pub(crate) fn dynamic_module_list(&self) -> RefMut<DynamicModuleList> {
+    pub(crate) fn dynamic_module_list(&self) -> RefMut<'_, DynamicModuleList> {
         self.dynamic_modules.borrow_mut()
     }
 
@@ -3446,73 +3380,89 @@ impl GlobalScope {
         unreachable!();
     }
 
-    /// <https://www.w3.org/TR/CSP/#report-violation>
-    #[allow(unsafe_code)]
-    pub(crate) fn report_csp_violations(
+    pub(crate) fn append_reporting_observer(&self, reporting_observer: &ReportingObserver) {
+        if let Some(window) = self.downcast::<Window>() {
+            return window.append_reporting_observer(DomRoot::from_ref(reporting_observer));
+        }
+        if let Some(worker) = self.downcast::<WorkerGlobalScope>() {
+            return worker.append_reporting_observer(DomRoot::from_ref(reporting_observer));
+        }
+        unreachable!();
+    }
+
+    pub(crate) fn remove_reporting_observer(&self, reporting_observer: &ReportingObserver) {
+        if let Some(window) = self.downcast::<Window>() {
+            return window.remove_reporting_observer(reporting_observer);
+        }
+        if let Some(worker) = self.downcast::<WorkerGlobalScope>() {
+            return worker.remove_reporting_observer(reporting_observer);
+        }
+        unreachable!();
+    }
+
+    pub(crate) fn registered_reporting_observers(&self) -> Vec<DomRoot<ReportingObserver>> {
+        if let Some(window) = self.downcast::<Window>() {
+            return window.registered_reporting_observers();
+        }
+        if let Some(worker) = self.downcast::<WorkerGlobalScope>() {
+            return worker.registered_reporting_observers();
+        }
+        unreachable!();
+    }
+
+    pub(crate) fn append_report(&self, report: Report) {
+        if let Some(window) = self.downcast::<Window>() {
+            return window.append_report(report);
+        }
+        if let Some(worker) = self.downcast::<WorkerGlobalScope>() {
+            return worker.append_report(report);
+        }
+        unreachable!();
+    }
+
+    pub(crate) fn buffered_reports(&self) -> Vec<Report> {
+        if let Some(window) = self.downcast::<Window>() {
+            return window.buffered_reports();
+        }
+        if let Some(worker) = self.downcast::<WorkerGlobalScope>() {
+            return worker.buffered_reports();
+        }
+        unreachable!();
+    }
+
+    pub(crate) fn import_map(&self) -> Ref<'_, ImportMap> {
+        self.import_map.borrow()
+    }
+
+    pub(crate) fn import_map_mut(&self) -> RefMut<'_, ImportMap> {
+        self.import_map.borrow_mut()
+    }
+
+    pub(crate) fn resolved_module_set(&self) -> Ref<'_, HashSet<ResolvedModule>> {
+        self.resolved_module_set.borrow()
+    }
+
+    pub(crate) fn resolved_module_set_mut(&self) -> RefMut<'_, HashSet<ResolvedModule>> {
+        self.resolved_module_set.borrow_mut()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#add-module-to-resolved-module-set>
+    pub(crate) fn add_module_to_resolved_module_set(
         &self,
-        violations: Vec<Violation>,
-        element: Option<&Element>,
+        base_url: &str,
+        specifier: &str,
+        specifier_url: Option<ServoUrl>,
     ) {
-        let scripted_caller =
-            unsafe { describe_scripted_caller(*GlobalScope::get_cx()) }.unwrap_or_default();
-        for violation in violations {
-            let (sample, resource) = match violation.resource {
-                ViolationResource::Inline { sample } => (sample, "inline".to_owned()),
-                ViolationResource::Url(url) => (None, url.into()),
-                ViolationResource::TrustedTypePolicy { sample } => {
-                    (Some(sample), "trusted-types-policy".to_owned())
-                },
-                ViolationResource::TrustedTypeSink { sample } => {
-                    (Some(sample), "trusted-types-sink".to_owned())
-                },
-                ViolationResource::Eval { sample } => (sample, "eval".to_owned()),
-                ViolationResource::WasmEval => (None, "wasm-eval".to_owned()),
-            };
-            let report = CSPViolationReportBuilder::default()
-                .resource(resource)
-                .sample(sample)
-                .effective_directive(violation.directive.name)
-                .original_policy(violation.policy.to_string())
-                .report_only(violation.policy.disposition == PolicyDisposition::Report)
-                .source_file(scripted_caller.filename.clone())
-                .line_number(scripted_caller.line)
-                .column_number(scripted_caller.col + 1)
-                .build(self);
-            // Step 1: Let global be violation’s global object.
-            // We use `self` as `global`;
-            // Step 2: Let target be violation’s element.
-            let target = element.and_then(|event_target| {
-                // Step 3.1: If target is not null, and global is a Window,
-                // and target’s shadow-including root is not global’s associated Document, set target to null.
-                if let Some(window) = self.downcast::<Window>() {
-                    if !window
-                        .Document()
-                        .upcast::<Node>()
-                        .is_shadow_including_inclusive_ancestor_of(event_target.upcast())
-                    {
-                        return None;
-                    }
-                }
-                Some(event_target)
-            });
-            let target = match target {
-                // Step 3.2: If target is null:
-                None => {
-                    // Step 3.2.2: If target is a Window, set target to target’s associated Document.
-                    if let Some(window) = self.downcast::<Window>() {
-                        Trusted::new(window.Document().upcast())
-                    } else {
-                        // Step 3.2.1: Set target to violation’s global object.
-                        Trusted::new(self.upcast())
-                    }
-                },
-                Some(event_target) => Trusted::new(event_target.upcast()),
-            };
-            // Step 3: Queue a task to run the following steps:
-            let task = CSPViolationReportTask::new(Trusted::new(self), target, report);
-            self.task_manager()
-                .dom_manipulation_task_source()
-                .queue(task);
+        // Step 1. Let global be settingsObject's global object.
+        // Step 2. If global does not implement Window, then return.
+        if self.is::<Window>() {
+            // Step 3. Let record be a new specifier resolution record, with serialized base URL
+            // set to serializedBaseURL, specifier set to normalizedSpecifier, and specifier as
+            // a URL set to asURL.
+            let record =
+                ResolvedModule::new(base_url.to_owned(), specifier.to_owned(), specifier_url);
+            // Step 4. Append record to global's resolved module set.
+            self.resolved_module_set.borrow_mut().insert(record);
         }
     }
 }
@@ -3523,31 +3473,37 @@ unsafe fn global_scope_from_global(
     global: *mut JSObject,
     cx: *mut JSContext,
 ) -> DomRoot<GlobalScope> {
-    assert!(!global.is_null());
-    let clasp = get_object_class(global);
-    assert_ne!(
-        ((*clasp).flags & (JSCLASS_IS_DOMJSCLASS | JSCLASS_IS_GLOBAL)),
-        0
-    );
-    root_from_object(global, cx).unwrap()
+    unsafe {
+        assert!(!global.is_null());
+        let clasp = get_object_class(global);
+        assert_ne!(
+            ((*clasp).flags & (JSCLASS_IS_DOMJSCLASS | JSCLASS_IS_GLOBAL)),
+            0
+        );
+        root_from_object(global, cx).unwrap()
+    }
 }
 
 /// Returns the Rust global scope from a JS global object.
 #[allow(unsafe_code)]
 unsafe fn global_scope_from_global_static(global: *mut JSObject) -> DomRoot<GlobalScope> {
     assert!(!global.is_null());
-    let clasp = get_object_class(global);
-    assert_ne!(
-        ((*clasp).flags & (JSCLASS_IS_DOMJSCLASS | JSCLASS_IS_GLOBAL)),
-        0
-    );
+    let clasp = unsafe { get_object_class(global) };
+
+    unsafe {
+        assert_ne!(
+            ((*clasp).flags & (JSCLASS_IS_DOMJSCLASS | JSCLASS_IS_GLOBAL)),
+            0
+        );
+    }
+
     root_from_object_static(global).unwrap()
 }
 
 #[allow(unsafe_code)]
 impl GlobalScopeHelpers<crate::DomTypeHolder> for GlobalScope {
     unsafe fn from_context(cx: *mut JSContext, realm: InRealm) -> DomRoot<Self> {
-        GlobalScope::from_context(cx, realm)
+        unsafe { GlobalScope::from_context(cx, realm) }
     }
 
     fn get_cx() -> SafeJSContext {

@@ -9,6 +9,7 @@ use content_security_policy::{self as csp};
 use http::header::{AUTHORIZATION, HeaderName};
 use http::{HeaderMap, Method};
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender, IpcSharedMemory};
+use ipc_channel::router::ROUTER;
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
 use serde::{Deserialize, Serialize};
@@ -21,7 +22,7 @@ use crate::{ReferrerPolicy, ResourceTimingType};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 /// An id to differeniate one network request from another.
-pub struct RequestId(Uuid);
+pub struct RequestId(pub Uuid);
 
 impl Default for RequestId {
     fn default() -> Self {
@@ -800,7 +801,7 @@ fn is_cors_safelisted_language(value: &[u8]) -> bool {
 
 // https://fetch.spec.whatwg.org/#cors-safelisted-request-header
 // subclause `content-type`
-fn is_cors_safelisted_request_content_type(value: &[u8]) -> bool {
+pub fn is_cors_safelisted_request_content_type(value: &[u8]) -> bool {
     // step 1
     if value.iter().any(is_cors_unsafe_request_header_byte) {
         return false;
@@ -924,4 +925,23 @@ pub fn convert_header_names_to_sorted_lowercase_set(
     ordered_set.sort_by(|a, b| a.as_str().partial_cmp(b.as_str()).unwrap());
     ordered_set.dedup();
     ordered_set.into_iter().cloned().collect()
+}
+
+pub fn create_request_body_with_content(content: &str) -> RequestBody {
+    let content_bytes = IpcSharedMemory::from_bytes(content.as_bytes());
+    let content_len = content_bytes.len();
+
+    let (chunk_request_sender, chunk_request_receiver) = ipc::channel().unwrap();
+    ROUTER.add_typed_route(
+        chunk_request_receiver,
+        Box::new(move |message| {
+            let request = message.unwrap();
+            if let BodyChunkRequest::Connect(sender) = request {
+                let _ = sender.send(BodyChunkResponse::Chunk(content_bytes.clone()));
+                let _ = sender.send(BodyChunkResponse::Done);
+            }
+        }),
+    );
+
+    RequestBody::new(chunk_request_sender, BodySource::Object, Some(content_len))
 }

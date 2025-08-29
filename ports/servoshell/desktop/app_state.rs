@@ -4,22 +4,27 @@
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::mem;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use euclid::{Point2D, Vector2D};
-use image::{DynamicImage, ImageFormat};
-use keyboard_types::{Key, KeyboardEvent, Modifiers, ShortcutMatcher};
+use crossbeam_channel::Receiver;
+use embedder_traits::webdriver::WebDriverSenders;
+use euclid::Vector2D;
+use keyboard_types::{Key, Modifiers, NamedKey, ShortcutMatcher};
 use log::{error, info};
+use servo::base::generic_channel::GenericSender;
 use servo::base::id::WebViewId;
 use servo::config::pref;
 use servo::ipc_channel::ipc::IpcSender;
 use servo::webrender_api::ScrollLocation;
-use servo::webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
+use servo::webrender_api::units::{DeviceIntPoint, DeviceIntSize};
 use servo::{
-    AllowOrDenyRequest, AuthenticationRequest, FilterPattern, FormControl, GamepadHapticEffectType,
-    LoadStatus, PermissionRequest, Servo, ServoDelegate, ServoError, SimpleDialog, TouchEventType,
-    WebView, WebViewBuilder, WebViewDelegate,
+    AllowOrDenyRequest, AuthenticationRequest, FilterPattern, FocusId, FormControl,
+    GamepadHapticEffectType, JSValue, KeyboardEvent, LoadStatus, PermissionRequest, Servo,
+    ServoDelegate, ServoError, SimpleDialog, TraversalId, WebDriverCommandMsg, WebDriverJSResult,
+    WebDriverLoadStatus, WebDriverUserPrompt, WebView, WebViewBuilder, WebViewDelegate,
 };
 use url::Url;
 
@@ -27,7 +32,8 @@ use super::app::PumpResult;
 use super::dialog::Dialog;
 use super::gamepad::GamepadSupport;
 use super::keyutils::CMD_OR_CONTROL;
-use super::window_trait::{LINE_HEIGHT, WindowPortsMethods};
+use super::window_trait::{LINE_HEIGHT, LINE_WIDTH, WindowPortsMethods};
+use crate::output_image::save_output_image_if_necessary;
 use crate::prefs::ServoShellPreferences;
 
 pub(crate) enum AppState {
@@ -44,6 +50,10 @@ pub(crate) struct RunningAppState {
     /// The preferences for this run of servoshell. This is not mutable, so doesn't need to
     /// be stored inside the [`RunningAppStateInner`].
     servoshell_preferences: ServoShellPreferences,
+    /// A [`Receiver`] for receiving commands from a running WebDriver server, if WebDriver
+    /// was enabled.
+    webdriver_receiver: Option<Receiver<WebDriverCommandMsg>>,
+    webdriver_senders: RefCell<WebDriverSenders>,
     inner: RefCell<RunningAppStateInner>,
 }
 
@@ -75,6 +85,10 @@ pub struct RunningAppStateInner {
     /// Whether or not Servo needs to repaint its display. Currently this is global
     /// because every `WebView` shares a `RenderingContext`.
     need_repaint: bool,
+
+    /// List of webviews that have favicon textures which are not yet uploaded
+    /// to the GPU by egui.
+    pending_favicon_loads: Vec<WebViewId>,
 }
 
 impl Drop for RunningAppState {
@@ -88,11 +102,14 @@ impl RunningAppState {
         servo: Servo,
         window: Rc<dyn WindowPortsMethods>,
         servoshell_preferences: ServoShellPreferences,
+        webdriver_receiver: Option<Receiver<WebDriverCommandMsg>>,
     ) -> RunningAppState {
         servo.set_delegate(Rc::new(ServoShellServoDelegate));
         RunningAppState {
             servo,
             servoshell_preferences,
+            webdriver_receiver,
+            webdriver_senders: RefCell::default(),
             inner: RefCell::new(RunningAppStateInner {
                 webviews: HashMap::default(),
                 creation_order: Default::default(),
@@ -102,28 +119,33 @@ impl RunningAppState {
                 gamepad_support: GamepadSupport::maybe_new(),
                 need_update: false,
                 need_repaint: false,
+                pending_favicon_loads: Default::default(),
             }),
         }
     }
 
-    pub(crate) fn new_toplevel_webview(self: &Rc<Self>, url: Url) {
+    pub(crate) fn create_and_focus_toplevel_webview(self: &Rc<Self>, url: Url) {
+        let webview = self.create_toplevel_webview(url);
+        webview.focus_and_raise_to_top(true);
+    }
+
+    pub(crate) fn create_toplevel_webview(self: &Rc<Self>, url: Url) -> WebView {
         let webview = WebViewBuilder::new(self.servo())
             .url(url)
             .hidpi_scale_factor(self.inner().window.hidpi_scale_factor())
             .delegate(self.clone())
             .build();
 
-        webview.focus();
-        webview.raise_to_top(true);
-
-        self.add(webview);
+        webview.notify_theme_change(self.inner().window.theme());
+        self.add(webview.clone());
+        webview
     }
 
-    pub(crate) fn inner(&self) -> Ref<RunningAppStateInner> {
+    pub(crate) fn inner(&self) -> Ref<'_, RunningAppStateInner> {
         self.inner.borrow()
     }
 
-    pub(crate) fn inner_mut(&self) -> RefMut<RunningAppStateInner> {
+    pub(crate) fn inner_mut(&self) -> RefMut<'_, RunningAppStateInner> {
         self.inner.borrow_mut()
     }
 
@@ -131,36 +153,15 @@ impl RunningAppState {
         &self.servo
     }
 
+    pub(crate) fn webdriver_receiver(&self) -> Option<&Receiver<WebDriverCommandMsg>> {
+        self.webdriver_receiver.as_ref()
+    }
+
     pub(crate) fn hidpi_scale_factor_changed(&self) {
         let inner = self.inner();
         let new_scale_factor = inner.window.hidpi_scale_factor();
         for webview in inner.webviews.values() {
             webview.set_hidpi_scale_factor(new_scale_factor);
-        }
-    }
-
-    pub(crate) fn save_output_image_if_necessary(&self) {
-        let Some(output_path) = self.servoshell_preferences.output_image_path.as_ref() else {
-            return;
-        };
-
-        let inner = self.inner();
-        let size = inner.window.rendering_context().size2d().to_i32();
-        let viewport_rect = DeviceIntRect::from_origin_and_size(Point2D::origin(), size);
-        let Some(image) = inner
-            .window
-            .rendering_context()
-            .read_to_image(viewport_rect)
-        else {
-            error!("Failed to read output image.");
-            return;
-        };
-
-        let image_format = ImageFormat::from_path(output_path).unwrap_or(ImageFormat::Png);
-        if let Err(error) =
-            DynamicImage::ImageRgba8(image).save_with_format(output_path, image_format)
-        {
-            error!("Failed to save {output_path}: {error}.");
         }
     }
 
@@ -180,7 +181,10 @@ impl RunningAppState {
 
         // This needs to be done before presenting(), because `ReneringContext::read_to_image` reads
         // from the back buffer.
-        self.save_output_image_if_necessary();
+        save_output_image_if_necessary(
+            &self.servoshell_preferences,
+            &self.inner().window.rendering_context(),
+        );
 
         let mut inner_mut = self.inner_mut();
         inner_mut.window.rendering_context().present();
@@ -261,8 +265,16 @@ impl RunningAppState {
             .and_then(|id| inner.webviews.get(id));
 
         match last_created {
-            Some(last_created_webview) => last_created_webview.focus(),
-            None => self.servo.start_shutting_down(),
+            Some(last_created_webview) => {
+                last_created_webview.focus();
+            },
+            None if self.servoshell_preferences.webdriver_port.is_none() => {
+                self.servo.start_shutting_down()
+            },
+            None => {
+                // For WebDriver, don't shut down when last webview closed
+                // https://github.com/servo/servo/issues/37408
+            },
         }
     }
 
@@ -280,6 +292,10 @@ impl RunningAppState {
             .iter()
             .map(|id| (*id, inner.webviews.get(id).unwrap().clone()))
             .collect()
+    }
+
+    pub fn webview_by_id(&self, id: WebViewId) -> Option<WebView> {
+        self.inner().webviews.get(&id).cloned()
     }
 
     pub fn handle_gamepad_events(&self) {
@@ -325,6 +341,56 @@ impl RunningAppState {
             .is_some_and(|dialogs| !dialogs.is_empty())
     }
 
+    pub(crate) fn webview_has_active_dialog(&self, webview_id: WebViewId) -> bool {
+        self.inner()
+            .dialogs
+            .get(&webview_id)
+            .is_some_and(|dialogs| !dialogs.is_empty())
+    }
+
+    pub(crate) fn get_current_active_dialog_webdriver_type(
+        &self,
+        webview_id: WebViewId,
+    ) -> Option<WebDriverUserPrompt> {
+        self.inner()
+            .dialogs
+            .get(&webview_id)
+            .and_then(|dialogs| dialogs.last())
+            .map(|dialog| dialog.webdriver_diaglog_type())
+    }
+
+    pub(crate) fn accept_active_dialogs(&self, webview_id: WebViewId) {
+        if let Some(dialogs) = self.inner_mut().dialogs.get_mut(&webview_id) {
+            dialogs.drain(..).for_each(|dialog| {
+                dialog.accept();
+            });
+        }
+    }
+
+    pub(crate) fn dismiss_active_dialogs(&self, webview_id: WebViewId) {
+        if let Some(dialogs) = self.inner_mut().dialogs.get_mut(&webview_id) {
+            dialogs.drain(..).for_each(|dialog| {
+                dialog.dismiss();
+            });
+        }
+    }
+
+    pub(crate) fn alert_text_of_newest_dialog(&self, webview_id: WebViewId) -> Option<String> {
+        self.inner()
+            .dialogs
+            .get(&webview_id)
+            .and_then(|dialogs| dialogs.last())
+            .and_then(|dialog| dialog.message())
+    }
+
+    pub(crate) fn set_alert_text_of_newest_dialog(&self, webview_id: WebViewId, text: String) {
+        if let Some(dialogs) = self.inner_mut().dialogs.get_mut(&webview_id) {
+            if let Some(dialog) = dialogs.last_mut() {
+                dialog.set_message(text);
+            }
+        }
+    }
+
     pub(crate) fn get_focused_webview_index(&self) -> Option<usize> {
         let focused_id = self.inner().focused_webview_id?;
         self.webviews()
@@ -335,7 +401,7 @@ impl RunningAppState {
     /// Handle servoshell key bindings that may have been prevented by the page in the focused webview.
     fn handle_overridable_key_bindings(&self, webview: ::servo::WebView, event: KeyboardEvent) {
         let origin = webview.rect().min.ceil().to_i32();
-        ShortcutMatcher::from_event(event)
+        ShortcutMatcher::from_event(event.event)
             .shortcut(CMD_OR_CONTROL, '=', || {
                 webview.set_zoom(1.1);
             })
@@ -348,42 +414,115 @@ impl RunningAppState {
             .shortcut(CMD_OR_CONTROL, '0', || {
                 webview.reset_zoom();
             })
-            .shortcut(Modifiers::empty(), Key::PageDown, || {
-                let scroll_location = ScrollLocation::Delta(Vector2D::new(
-                    0.0,
-                    -self.inner().window.page_height() + 2.0 * LINE_HEIGHT,
-                ));
-                webview.notify_scroll_event(scroll_location, origin, TouchEventType::Move);
-            })
-            .shortcut(Modifiers::empty(), Key::PageUp, || {
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::PageDown), || {
                 let scroll_location = ScrollLocation::Delta(Vector2D::new(
                     0.0,
                     self.inner().window.page_height() - 2.0 * LINE_HEIGHT,
                 ));
-                webview.notify_scroll_event(scroll_location, origin, TouchEventType::Move);
+                webview.notify_scroll_event(scroll_location, origin);
             })
-            .shortcut(Modifiers::empty(), Key::Home, || {
-                webview.notify_scroll_event(ScrollLocation::Start, origin, TouchEventType::Move);
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::PageUp), || {
+                let scroll_location = ScrollLocation::Delta(Vector2D::new(
+                    0.0,
+                    -self.inner().window.page_height() + 2.0 * LINE_HEIGHT,
+                ));
+                webview.notify_scroll_event(scroll_location, origin);
             })
-            .shortcut(Modifiers::empty(), Key::End, || {
-                webview.notify_scroll_event(ScrollLocation::End, origin, TouchEventType::Move);
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::Home), || {
+                webview.notify_scroll_event(ScrollLocation::Start, origin);
             })
-            .shortcut(Modifiers::empty(), Key::ArrowUp, || {
-                let location = ScrollLocation::Delta(Vector2D::new(0.0, 3.0 * LINE_HEIGHT));
-                webview.notify_scroll_event(location, origin, TouchEventType::Move);
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::End), || {
+                webview.notify_scroll_event(ScrollLocation::End, origin);
             })
-            .shortcut(Modifiers::empty(), Key::ArrowDown, || {
-                let location = ScrollLocation::Delta(Vector2D::new(0.0, -3.0 * LINE_HEIGHT));
-                webview.notify_scroll_event(location, origin, TouchEventType::Move);
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowUp), || {
+                let location = ScrollLocation::Delta(Vector2D::new(0.0, -LINE_HEIGHT));
+                webview.notify_scroll_event(location, origin);
             })
-            .shortcut(Modifiers::empty(), Key::ArrowLeft, || {
-                let location = ScrollLocation::Delta(Vector2D::new(LINE_HEIGHT, 0.0));
-                webview.notify_scroll_event(location, origin, TouchEventType::Move);
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowDown), || {
+                let location = ScrollLocation::Delta(Vector2D::new(0.0, LINE_HEIGHT));
+                webview.notify_scroll_event(location, origin);
             })
-            .shortcut(Modifiers::empty(), Key::ArrowRight, || {
-                let location = ScrollLocation::Delta(Vector2D::new(-LINE_HEIGHT, 0.0));
-                webview.notify_scroll_event(location, origin, TouchEventType::Move);
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowLeft), || {
+                let location = ScrollLocation::Delta(Vector2D::new(-LINE_WIDTH, 0.0));
+                webview.notify_scroll_event(location, origin);
+            })
+            .shortcut(Modifiers::empty(), Key::Named(NamedKey::ArrowRight), || {
+                let location = ScrollLocation::Delta(Vector2D::new(LINE_WIDTH, 0.0));
+                webview.notify_scroll_event(location, origin);
             });
+    }
+
+    pub(crate) fn set_pending_focus(&self, focus_id: FocusId, sender: IpcSender<bool>) {
+        self.webdriver_senders
+            .borrow_mut()
+            .pending_focus
+            .insert(focus_id, sender);
+    }
+
+    pub(crate) fn set_pending_traversal(
+        &self,
+        traversal_id: TraversalId,
+        sender: GenericSender<WebDriverLoadStatus>,
+    ) {
+        self.webdriver_senders
+            .borrow_mut()
+            .pending_traversals
+            .insert(traversal_id, sender);
+    }
+
+    pub(crate) fn set_load_status_sender(
+        &self,
+        webview_id: WebViewId,
+        sender: GenericSender<WebDriverLoadStatus>,
+    ) {
+        self.webdriver_senders
+            .borrow_mut()
+            .load_status_senders
+            .insert(webview_id, sender);
+    }
+
+    pub(crate) fn set_script_command_interrupt_sender(
+        &self,
+        sender: Option<IpcSender<WebDriverJSResult>>,
+    ) {
+        self.webdriver_senders
+            .borrow_mut()
+            .script_evaluation_interrupt_sender = sender;
+    }
+
+    /// Interrupt any ongoing WebDriver-based script evaluation.
+    ///
+    /// From <https://w3c.github.io/webdriver/#dfn-execute-a-function-body>:
+    /// > The rules to execute a function body are as follows. The algorithm returns
+    /// > an ECMAScript completion record.
+    /// >
+    /// > If at any point during the algorithm a user prompt appears, immediately return
+    /// > Completion { Type: normal, Value: null, Target: empty }, but continue to run the
+    /// >  other steps of this algorithm in parallel.
+    fn interrupt_webdriver_script_evaluation(&self) {
+        if let Some(sender) = &self
+            .webdriver_senders
+            .borrow()
+            .script_evaluation_interrupt_sender
+        {
+            sender.send(Ok(JSValue::Null)).unwrap_or_else(|err| {
+                info!(
+                    "Notify dialog appear failed. Maybe the channel to webdriver is closed: {err}"
+                );
+            });
+        }
+    }
+
+    pub(crate) fn remove_load_status_sender(&self, webview_id: WebViewId) {
+        self.webdriver_senders
+            .borrow_mut()
+            .load_status_senders
+            .remove(&webview_id);
+    }
+
+    /// Return a list of all webviews that have favicons that have not yet been loaded by egui.
+    pub(crate) fn take_pending_favicon_loads(&self) -> Vec<WebViewId> {
+        mem::take(&mut self.inner_mut().pending_favicon_loads)
     }
 }
 
@@ -419,19 +558,42 @@ impl WebViewDelegate for RunningAppState {
         }
     }
 
+    fn notify_traversal_complete(&self, _webview: servo::WebView, traversal_id: TraversalId) {
+        let mut webdriver_state = self.webdriver_senders.borrow_mut();
+        if let Entry::Occupied(entry) = webdriver_state.pending_traversals.entry(traversal_id) {
+            let sender = entry.remove();
+            let _ = sender.send(WebDriverLoadStatus::Complete);
+        }
+    }
+
     fn request_move_to(&self, _: servo::WebView, new_position: DeviceIntPoint) {
         self.inner().window.set_position(new_position);
     }
 
-    fn request_resize_to(&self, webview: servo::WebView, new_size: DeviceIntSize) {
-        let mut rect = webview.rect();
-        rect.set_size(new_size.to_f32());
-        webview.move_resize(rect);
-        self.inner().window.request_resize(&webview, new_size);
+    fn request_resize_to(&self, webview: servo::WebView, requested_outer_size: DeviceIntSize) {
+        // We need to update compositor's view later as we not sure about resizing result.
+        self.inner()
+            .window
+            .request_resize(&webview, requested_outer_size);
     }
 
     fn show_simple_dialog(&self, webview: servo::WebView, dialog: SimpleDialog) {
-        if self.servoshell_preferences.headless {
+        self.interrupt_webdriver_script_evaluation();
+
+        // Dialogs block the page load, so need need to notify WebDriver
+        let webview_id = webview.id();
+        if let Some(sender) = self
+            .webdriver_senders
+            .borrow_mut()
+            .load_status_senders
+            .get(&webview_id)
+        {
+            let _ = sender.send(WebDriverLoadStatus::Blocked);
+        };
+
+        if self.servoshell_preferences.headless &&
+            self.servoshell_preferences.webdriver_port.is_none()
+        {
             // TODO: Avoid copying this from the default trait impl?
             // Return the DOM-specified default value for when we **cannot show simple dialogs**.
             let _ = match dialog {
@@ -456,7 +618,9 @@ impl WebViewDelegate for RunningAppState {
         webview: WebView,
         authentication_request: AuthenticationRequest,
     ) {
-        if self.servoshell_preferences.headless {
+        if self.servoshell_preferences.headless &&
+            self.servoshell_preferences.webdriver_port.is_none()
+        {
             return;
         }
 
@@ -475,15 +639,27 @@ impl WebViewDelegate for RunningAppState {
             .delegate(parent_webview.delegate())
             .build();
 
-        webview.focus();
-        webview.raise_to_top(true);
-
+        webview.notify_theme_change(self.inner().window.theme());
+        // When WebDriver is enabled, do not focus and raise the WebView to the top,
+        // as that is what the specification expects. Otherwise, we would like `window.open()`
+        // to create a new foreground tab
+        if self.servoshell_preferences.webdriver_port.is_none() {
+            webview.focus_and_raise_to_top(true);
+        }
         self.add(webview.clone());
         Some(webview)
     }
 
     fn notify_closed(&self, webview: servo::WebView) {
         self.close_webview(webview.id());
+    }
+
+    fn notify_focus_complete(&self, webview: servo::WebView, focus_id: FocusId) {
+        let mut webdriver_state = self.webdriver_senders.borrow_mut();
+        if let Entry::Occupied(entry) = webdriver_state.pending_focus.entry(focus_id) {
+            let sender = entry.remove();
+            let _ = sender.send(webview.focused());
+        }
     }
 
     fn notify_focus_changed(&self, webview: servo::WebView, focused: bool) {
@@ -505,8 +681,19 @@ impl WebViewDelegate for RunningAppState {
         self.inner().window.set_cursor(cursor);
     }
 
-    fn notify_load_status_changed(&self, _webview: servo::WebView, _status: LoadStatus) {
+    fn notify_load_status_changed(&self, webview: servo::WebView, status: LoadStatus) {
         self.inner_mut().need_update = true;
+
+        if status == LoadStatus::Complete {
+            if let Some(sender) = self
+                .webdriver_senders
+                .borrow_mut()
+                .load_status_senders
+                .remove(&webview.id())
+            {
+                let _ = sender.send(WebDriverLoadStatus::Complete);
+            }
+        }
     }
 
     fn notify_fullscreen_state_changed(&self, _webview: servo::WebView, fullscreen_state: bool) {
@@ -538,7 +725,9 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn request_permission(&self, webview: servo::WebView, permission_request: PermissionRequest) {
-        if self.servoshell_preferences.headless {
+        if self.servoshell_preferences.headless &&
+            self.servoshell_preferences.webdriver_port.is_none()
+        {
             permission_request.deny();
             return;
         }
@@ -598,7 +787,9 @@ impl WebViewDelegate for RunningAppState {
     }
 
     fn show_form_control(&self, webview: WebView, form_control: FormControl) {
-        if self.servoshell_preferences.headless {
+        if self.servoshell_preferences.headless &&
+            self.servoshell_preferences.webdriver_port.is_none()
+        {
             return;
         }
 
@@ -619,5 +810,11 @@ impl WebViewDelegate for RunningAppState {
                 );
             },
         }
+    }
+
+    fn notify_favicon_changed(&self, webview: WebView) {
+        let mut inner = self.inner_mut();
+        inner.pending_favicon_loads.push(webview.id());
+        inner.need_repaint = true;
     }
 }

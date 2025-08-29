@@ -413,9 +413,9 @@ const logicalXorTests = [
 ];
 
 if (navigator.ml) {
-  logicalXorTests.forEach((test) => {
-    webnn_conformance_test(buildAndExecuteGraph, getPrecisionTolerance, test);
+  logicalXorTests.filter(isTargetTest).forEach((test) => {
+    webnn_conformance_test(buildAndExecuteGraph, getZeroULPTolerance, test);
   });
 } else {
-test(() => assert_implements(navigator.ml, 'missing navigator.ml'));
+  test(() => assert_implements(navigator.ml, 'missing navigator.ml'));
 }

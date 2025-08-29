@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::sync::LazyLock;
 
@@ -53,7 +54,7 @@ pub(crate) enum CSSStyleOwner {
         Dom<CSSRule>,
         #[ignore_malloc_size_of = "Arc"]
         #[no_trace]
-        Arc<Locked<PropertyDeclarationBlock>>,
+        RefCell<Arc<Locked<PropertyDeclarationBlock>>>,
     ),
 }
 
@@ -76,8 +77,7 @@ impl CSSStyleOwner {
                 let document = el.owner_document();
                 let shared_lock = document.style_shared_lock();
                 let mut attr = el.style_attribute().borrow_mut().take();
-                let result = if attr.is_some() {
-                    let lock = attr.as_ref().unwrap();
+                let result = if let Some(lock) = attr.as_ref() {
                     let mut guard = shared_lock.write();
                     let pdb = lock.write_with(&mut guard);
                     f(pdb, &mut changed)
@@ -120,16 +120,13 @@ impl CSSStyleOwner {
                 result
             },
             CSSStyleOwner::CSSRule(ref rule, ref pdb) => {
+                rule.parent_stylesheet().will_modify();
                 let result = {
                     let mut guard = rule.shared_lock().write();
-                    f(&mut *pdb.write_with(&mut guard), &mut changed)
+                    f(&mut *pdb.borrow().write_with(&mut guard), &mut changed)
                 };
                 if changed {
-                    // If this is changed, see also
-                    // CSSStyleRule::SetSelectorText, which does the same thing.
-                    if let Some(owner) = rule.parent_stylesheet().get_owner() {
-                        owner.stylesheet_list_owner().invalidate_stylesheets();
-                    }
+                    rule.parent_stylesheet().notify_invalidations();
                 }
                 result
             },
@@ -157,7 +154,7 @@ impl CSSStyleOwner {
             },
             CSSStyleOwner::CSSRule(ref rule, ref pdb) => {
                 let guard = rule.shared_lock().read();
-                f(pdb.read_with(&guard))
+                f(pdb.borrow().read_with(&guard))
             },
         }
     }
@@ -206,7 +203,7 @@ macro_rules! css_properties(
                     $id.enabled_for_all_content(),
                     "Someone forgot a #[Pref] annotation"
                 );
-                self.get_property_value($id, CanGc::note())
+                self.get_property_value($id)
             }
             fn $setter(&self, value: DOMString) -> ErrorResult {
                 debug_assert!(
@@ -270,7 +267,18 @@ impl CSSStyleDeclaration {
         )
     }
 
-    fn get_computed_style(&self, property: PropertyId, can_gc: CanGc) -> DOMString {
+    pub(crate) fn update_property_declaration_block(
+        &self,
+        pdb: &Arc<Locked<PropertyDeclarationBlock>>,
+    ) {
+        if let CSSStyleOwner::CSSRule(_, pdb_cell) = &self.owner {
+            *pdb_cell.borrow_mut() = pdb.clone();
+        } else {
+            panic!("update_rule called on CSSStyleDeclaration with a Element owner");
+        }
+    }
+
+    fn get_computed_style(&self, property: PropertyId) -> DOMString {
         match self.owner {
             CSSStyleOwner::CSSRule(..) => {
                 panic!("get_computed_style called on CSSStyleDeclaration with a CSSRule owner")
@@ -282,20 +290,20 @@ impl CSSStyleDeclaration {
                 }
                 let addr = node.to_trusted_node_address();
                 node.owner_window()
-                    .resolved_style_query(addr, self.pseudo, property, can_gc)
+                    .resolved_style_query(addr, self.pseudo, property)
             },
             CSSStyleOwner::Null => DOMString::new(),
         }
     }
 
-    fn get_property_value(&self, id: PropertyId, can_gc: CanGc) -> DOMString {
+    fn get_property_value(&self, id: PropertyId) -> DOMString {
         if matches!(self.owner, CSSStyleOwner::Null) {
             return DOMString::new();
         }
 
         if self.readonly {
             // Readonly style declarations are used for getComputedStyle.
-            return self.get_computed_style(id, can_gc);
+            return self.get_computed_style(id);
         }
 
         let mut string = String::new();
@@ -307,6 +315,7 @@ impl CSSStyleDeclaration {
         DOMString::from(string)
     }
 
+    /// <https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-setproperty>
     fn set_property(
         &self,
         id: PropertyId,
@@ -314,24 +323,57 @@ impl CSSStyleDeclaration {
         priority: DOMString,
         can_gc: CanGc,
     ) -> ErrorResult {
-        // Step 1
+        self.set_property_inner(
+            PotentiallyParsedPropertyId::Parsed(id),
+            value,
+            priority,
+            can_gc,
+        )
+    }
+
+    /// <https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-setproperty>
+    ///
+    /// This function receives a `PotentiallyParsedPropertyId` instead of a `DOMString` in case
+    /// the caller already has a parsed property ID.
+    fn set_property_inner(
+        &self,
+        id: PotentiallyParsedPropertyId,
+        value: DOMString,
+        priority: DOMString,
+        can_gc: CanGc,
+    ) -> ErrorResult {
+        // Step 1. If the readonly flag is set, then throw a NoModificationAllowedError exception.
         if self.readonly {
             return Err(Error::NoModificationAllowed);
         }
 
-        if !id.enabled_for_all_content() {
-            return Ok(());
-        }
+        let id = match id {
+            PotentiallyParsedPropertyId::Parsed(id) => {
+                if !id.enabled_for_all_content() {
+                    return Ok(());
+                }
+
+                id
+            },
+            PotentiallyParsedPropertyId::NotParsed(unparsed) => {
+                match PropertyId::parse_enabled_for_all_content(&unparsed) {
+                    Ok(id) => id,
+                    Err(..) => return Ok(()),
+                }
+            },
+        };
 
         self.owner.mutate_associated_block(
             |pdb, changed| {
+                // Step 3. If value is the empty string, invoke removeProperty()
+                // with property as argument and return.
                 if value.is_empty() {
-                    // Step 3
                     *changed = remove_property(pdb, &id);
                     return Ok(());
                 }
 
-                // Step 4
+                // Step 4. If priority is not the empty string and is not an ASCII case-insensitive
+                // match for the string "important", then return.
                 let importance = match &*priority {
                     "" => Importance::Normal,
                     p if p.eq_ignore_ascii_case("important") => Importance::Important,
@@ -412,6 +454,11 @@ pub(crate) static ENABLED_LONGHAND_PROPERTIES: LazyLock<Vec<LonghandId>> = LazyL
     enabled_longhands
 });
 
+enum PotentiallyParsedPropertyId {
+    Parsed(PropertyId),
+    NotParsed(DOMString),
+}
+
 impl CSSStyleDeclarationMethods<crate::DomTypeHolder> for CSSStyleDeclaration {
     // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-length
     fn Length(&self) -> u32 {
@@ -433,12 +480,12 @@ impl CSSStyleDeclarationMethods<crate::DomTypeHolder> for CSSStyleDeclaration {
     }
 
     // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-getpropertyvalue
-    fn GetPropertyValue(&self, property: DOMString, can_gc: CanGc) -> DOMString {
+    fn GetPropertyValue(&self, property: DOMString) -> DOMString {
         let id = match PropertyId::parse_enabled_for_all_content(&property) {
             Ok(id) => id,
             Err(..) => return DOMString::new(),
         };
-        self.get_property_value(id, can_gc)
+        self.get_property_value(id)
     }
 
     // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-getpropertypriority
@@ -462,7 +509,7 @@ impl CSSStyleDeclarationMethods<crate::DomTypeHolder> for CSSStyleDeclaration {
         })
     }
 
-    // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-setproperty
+    /// <https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-setproperty>
     fn SetProperty(
         &self,
         property: DOMString,
@@ -470,12 +517,12 @@ impl CSSStyleDeclarationMethods<crate::DomTypeHolder> for CSSStyleDeclaration {
         priority: DOMString,
         can_gc: CanGc,
     ) -> ErrorResult {
-        // Step 3
-        let id = match PropertyId::parse_enabled_for_all_content(&property) {
-            Ok(id) => id,
-            Err(..) => return Ok(()),
-        };
-        self.set_property(id, value, priority, can_gc)
+        self.set_property_inner(
+            PotentiallyParsedPropertyId::NotParsed(property),
+            value,
+            priority,
+            can_gc,
+        )
     }
 
     // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-removeproperty
@@ -503,12 +550,12 @@ impl CSSStyleDeclarationMethods<crate::DomTypeHolder> for CSSStyleDeclaration {
         Ok(DOMString::from(string))
     }
 
-    // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-cssfloat
-    fn CssFloat(&self, can_gc: CanGc) -> DOMString {
-        self.get_property_value(PropertyId::NonCustom(LonghandId::Float.into()), can_gc)
+    /// <https://drafts.csswg.org/cssom/#dom-cssstyleproperties-cssfloat>
+    fn CssFloat(&self) -> DOMString {
+        self.get_property_value(PropertyId::NonCustom(LonghandId::Float.into()))
     }
 
-    // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-cssfloat
+    /// <https://drafts.csswg.org/cssom/#dom-cssstyleproperties-cssfloat>
     fn SetCssFloat(&self, value: DOMString, can_gc: CanGc) -> ErrorResult {
         self.set_property(
             PropertyId::NonCustom(LonghandId::Float.into()),

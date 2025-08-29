@@ -2,10 +2,13 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::time::{Duration, SystemTime};
+
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
 use net_traits::CookieSource;
 use servo_url::ServoUrl;
+use time::macros::datetime;
 
 #[test]
 fn test_domain_match() {
@@ -100,6 +103,14 @@ fn fn_cookie_constructor() {
     let u = &ServoUrl::parse("http://example.com/foobar").unwrap();
     let cookie = cookie::Cookie::parse("foobar=value;path=/").unwrap();
     assert!(ServoCookie::new_wrapped(cookie, u, CookieSource::HTTP).is_some());
+
+    let cookie = cookie::Cookie::parse("foo=bar; max-age=99999999999999999999999999999").unwrap();
+    let cookie = ServoCookie::new_wrapped(cookie, u, CookieSource::HTTP).unwrap();
+    assert!(
+        cookie
+            .expiry_time
+            .is_some_and(|exp| exp < SystemTime::now() + Duration::from_secs(401 * 24 * 60 * 60))
+    );
 }
 
 #[test]
@@ -471,5 +482,29 @@ fn test_cookie_eviction_all_nonsecure_new_nonsecure() {
     assert_eq!(
         &r,
         "extra2=bar; extra3=bar; extra4=bar; extra5=bar; foo=bar"
+    );
+}
+
+#[test]
+fn test_parse_date() {
+    assert_eq!(
+        ServoCookie::parse_date("26 Jun 2024 15:35:10 GMT"), // without day of week
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26-Jun-2024 15:35:10 GMT"), // dashed
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26 Jun 2024 15:35:10"), // no GMT
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26 Jun 24 15:35:10 GMT"), // 2-digit year
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
+    );
+    assert_eq!(
+        ServoCookie::parse_date("26 jun 2024 15:35:10 gmt"), // Lowercase
+        Some(datetime!(2024-06-26 15:35:10).assume_utc())
     );
 }

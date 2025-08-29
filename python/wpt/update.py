@@ -3,6 +3,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 # pylint: disable=missing-docstring
 
+from typing import Any
 import os
 import subprocess
 import shutil
@@ -12,24 +13,23 @@ from wptrunner.update import setup_logging, WPTUpdate  # noqa: F401
 from wptrunner.update.base import exit_unclean  # noqa: F401
 from wptrunner import wptcommandline  # noqa: F401
 
+from argparse import ArgumentParser
+
 from . import WPT_PATH
 from . import manifestupdate
 
-TEST_ROOT = os.path.join(WPT_PATH, 'tests')
-META_ROOTS = [
-    os.path.join(WPT_PATH, 'meta'),
-    os.path.join(WPT_PATH, 'meta-legacy')
-]
+TEST_ROOT = os.path.join(WPT_PATH, "tests")
+META_ROOTS = [os.path.join(WPT_PATH, "meta"), os.path.join(WPT_PATH, "meta-legacy")]
 
 
-def do_sync(**kwargs) -> int:
+def do_sync(**kwargs: str) -> int:
     last_commit = subprocess.check_output(["git", "log", "-1"])
 
     # Commits should always be authored by the GitHub Actions bot.
     os.environ["GIT_AUTHOR_NAME"] = "Servo WPT Sync"
     os.environ["GIT_AUTHOR_EMAIL"] = "ghbot+wpt-sync@servo.org"
-    os.environ["GIT_COMMITTER_NAME"] = os.environ['GIT_AUTHOR_NAME']
-    os.environ["GIT_COMMITTER_EMAIL"] = os.environ['GIT_AUTHOR_EMAIL']
+    os.environ["GIT_COMMITTER_NAME"] = os.environ["GIT_AUTHOR_NAME"]
+    os.environ["GIT_COMMITTER_EMAIL"] = os.environ["GIT_AUTHOR_EMAIL"]
 
     print("Updating WPT from upstream...")
     run_update(**kwargs)
@@ -52,7 +52,7 @@ def do_sync(**kwargs) -> int:
     return 0
 
 
-def remove_unused_metadata():
+def remove_unused_metadata() -> None:
     print("Removing unused results...")
     unused_files = []
     unused_dirs = []
@@ -67,7 +67,7 @@ def remove_unused_metadata():
                 dir_path = os.path.join(base_dir, dir_name)
 
                 # Skip any known directories that are meta-metadata.
-                if dir_name == '.cache':
+                if dir_name == ".cache":
                     unused_dirs.append(dir_path)
                     continue
 
@@ -78,12 +78,11 @@ def remove_unused_metadata():
 
             for fname in files:
                 # Skip any known files that are meta-metadata.
-                if not fname.endswith(".ini") or fname == '__dir__.ini':
+                if not fname.endswith(".ini") or fname == "__dir__.ini":
                     continue
 
                 # Turn tests/wpt/meta/foo/bar.html.ini into tests/wpt/tests/foo/bar.html.
-                test_file = os.path.join(
-                    TEST_ROOT, os.path.relpath(base_dir, meta_root), fname[:-4])
+                test_file = os.path.join(TEST_ROOT, os.path.relpath(base_dir, meta_root), fname[:-4])
 
                 if not os.path.exists(test_file):
                     unused_files.append(os.path.join(base_dir, fname))
@@ -96,8 +95,8 @@ def remove_unused_metadata():
         shutil.rmtree(directory)
 
 
-def update_tests(**kwargs) -> int:
-    def set_if_none(args: dict, key: str, value):
+def update_tests(**kwargs: Any) -> int:
+    def set_if_none(args: dict, key: str, value: str) -> None:
         if key not in args or args[key] is None:
             args[key] = value
 
@@ -106,20 +105,20 @@ def update_tests(**kwargs) -> int:
     kwargs["store_state"] = False
 
     wptcommandline.set_from_config(kwargs)
-    if hasattr(wptcommandline, 'check_paths'):
+    if hasattr(wptcommandline, "check_paths"):
         wptcommandline.check_paths(kwargs["test_paths"])
 
-    if kwargs.get('sync', False):
+    if kwargs.get("sync", False):
         return do_sync(**kwargs)
 
     return 0 if run_update(**kwargs) else 1
 
 
-def run_update(**kwargs) -> bool:
+def run_update(**kwargs: Any) -> bool:
     """Run the update process returning True if the process is successful."""
     logger = setup_logging(kwargs, {"mach": sys.stdout})
     return WPTUpdate(logger, **kwargs).run() != exit_unclean
 
 
-def create_parser(**_kwargs):
+def create_parser(**_kwargs: Any) -> ArgumentParser:
     return wptcommandline.create_parser_update()

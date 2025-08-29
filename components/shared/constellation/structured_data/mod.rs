@@ -10,7 +10,10 @@ mod transferable;
 
 use std::collections::HashMap;
 
-use base::id::{BlobId, DomExceptionId, DomPointId, MessagePortId};
+use base::id::{
+    BlobId, DomExceptionId, DomMatrixId, DomPointId, DomQuadId, DomRectId, ImageBitmapId,
+    MessagePortId, OffscreenCanvasId, QuotaExceededErrorId,
+};
 use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
@@ -28,21 +31,38 @@ pub struct StructuredSerializedData {
     pub blobs: Option<HashMap<BlobId, BlobImpl>>,
     /// Serialized point objects.
     pub points: Option<HashMap<DomPointId, DomPoint>>,
+    /// Serialized rect objects.
+    pub rects: Option<HashMap<DomRectId, DomRect>>,
+    /// Serialized quad objects.
+    pub quads: Option<HashMap<DomQuadId, DomQuad>>,
+    /// Serialized matrix objects.
+    pub matrices: Option<HashMap<DomMatrixId, DomMatrix>>,
     /// Serialized exception objects.
     pub exceptions: Option<HashMap<DomExceptionId, DomException>>,
+    /// Serialized quota exceeded errors.
+    pub quota_exceeded_errors:
+        Option<HashMap<QuotaExceededErrorId, SerializableQuotaExceededError>>,
     /// Transferred objects.
     pub ports: Option<HashMap<MessagePortId, MessagePortImpl>>,
     /// Transform streams transferred objects.
     pub transform_streams: Option<HashMap<MessagePortId, TransformStreamData>>,
+    /// Serialized image bitmap objects.
+    pub image_bitmaps: Option<HashMap<ImageBitmapId, SerializableImageBitmap>>,
+    /// Transferred image bitmap objects.
+    pub transferred_image_bitmaps: Option<HashMap<ImageBitmapId, SerializableImageBitmap>>,
+    /// Transferred offscreen canvas objects.
+    pub offscreen_canvases: Option<HashMap<OffscreenCanvasId, TransferableOffscreenCanvas>>,
 }
 
 impl StructuredSerializedData {
     fn is_empty(&self, val: Transferrable) -> bool {
         fn is_field_empty<K, V>(field: &Option<HashMap<K, V>>) -> bool {
-            field.as_ref().is_some_and(|h| h.is_empty())
+            field.as_ref().is_none_or(|h| h.is_empty())
         }
         match val {
+            Transferrable::ImageBitmap => is_field_empty(&self.transferred_image_bitmaps),
             Transferrable::MessagePort => is_field_empty(&self.ports),
+            Transferrable::OffscreenCanvas => is_field_empty(&self.offscreen_canvases),
             Transferrable::ReadableStream => is_field_empty(&self.ports),
             Transferrable::WritableStream => is_field_empty(&self.ports),
             Transferrable::TransformStream => is_field_empty(&self.ports),

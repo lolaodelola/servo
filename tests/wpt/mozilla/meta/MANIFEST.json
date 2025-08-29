@@ -32,6 +32,13 @@
       {}
      ]
     ],
+    "form-navigate-loop-crash.html": [
+     "1068ccc38eed223cf83a4cbd8fed336b83c0b745",
+     [
+      null,
+      {}
+     ]
+    ],
     "form_reset-crash.html": [
      "b23cbf6aefdef8231e2cc4cb0e6416195d5bdf71",
      [
@@ -91,6 +98,99 @@
    }
   },
   "reftest": {
+   "appearance": {
+    "input-textual-definite-width.html": [
+     "59f1797fab3d1889bbcb7863178c6c5ef9e54f19",
+     [
+      "appearance/input-textual-definite-width.html",
+      [
+       [
+        "/_mozilla/appearance/input-textual-definite-width-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ],
+    "input-textual-empty.html": [
+     "c85214b6c681b657a30a06b44670c796cdaeda11",
+     [
+      "appearance/input-textual-empty.html",
+      [
+       [
+        "/_mozilla/appearance/input-textual-empty-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ],
+    "input-textual-nonempty-placeholder.html": [
+     "83670d37e310954e6d3a69114577ff92b4126a98",
+     [
+      "appearance/input-textual-nonempty-placeholder.html",
+      [
+       [
+        "/_mozilla/appearance/input-textual-nonempty-placeholder-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ],
+    "input-textual-overflow.html": [
+     "ad1f0aa70285e227153f7d05983b2ef9caa798f9",
+     [
+      "appearance/input-textual-overflow.html",
+      [
+       [
+        "/_mozilla/appearance/input-textual-overflow-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ],
+    "input-textual-placeholder-overflow.html": [
+     "9bc84f26b8c1ae0718085ddb069889cca2e0322a",
+     [
+      "appearance/input-textual-placeholder-overflow.html",
+      [
+       [
+        "/_mozilla/appearance/input-textual-placeholder-overflow-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ],
+    "input-textual-placeholder.html": [
+     "68287721ce67ecece6e746b44fd3fd1d92763085",
+     [
+      "appearance/input-textual-placeholder.html",
+      [
+       [
+        "/_mozilla/appearance/input-textual-placeholder-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ],
+    "input-textual-text-align.html": [
+     "600a41cba133e9933132165e7cc4a2ea0ca28884",
+     [
+      "appearance/input-textual-text-align.html",
+      [
+       [
+        "/_mozilla/appearance/input-textual-text-align-ref.html",
+        "=="
+       ]
+      ],
+      {}
+     ]
+    ]
+   },
    "css": {
     "abs-overflow-stackingcontext.html": [
      "264df01aa64e0abe9ea3a75e57452c27d53a904f",
@@ -2887,7 +2987,7 @@
      ]
     ],
     "incremental_trailing_whitespace_a.html": [
-     "f59bd91d9ea23effec2a888649e345937cf0addd",
+     "eca05c4f79fb786492e81aa7881aaa0d75899811",
      [
       null,
       [
@@ -3186,7 +3286,7 @@
      ]
     ],
     "inline_block_opacity_change.html": [
-     "aa51ab444cddb381b6ca76615a30573f49f6f6c3",
+     "6df5d7466d6569a7d1969d5c49a83a7a3564ef7b",
      [
       null,
       [
@@ -3575,19 +3675,6 @@
       {}
      ]
     ],
-    "input_placeholder.html": [
-     "f74cec8d54c04755bf5277db2e127fb0a37f855e",
-     [
-      null,
-      [
-       [
-        "/_mozilla/css/input_placeholder_ref.html",
-        "=="
-       ]
-      ],
-      {}
-     ]
-    ],
     "input_selection_a.html": [
      "fbee15aed7bcbae55a2771e9af422ce105b96a60",
      [
@@ -3946,19 +4033,6 @@
       [
        [
         "/_mozilla/css/linear_gradients_lengths_ref.html",
-        "=="
-       ]
-      ],
-      {}
-     ]
-    ],
-    "linear_gradients_non_square_a.html": [
-     "2edd6cbaa4638d6fdc474c6e7bec7f4c194dc721",
-     [
-      null,
-      [
-       [
-        "/_mozilla/css/linear_gradients_non_square_ref.html",
         "=="
        ]
       ],
@@ -8075,6 +8149,42 @@
     "b485d435a63ada28eabe976b49a8a580725e7508",
     []
    ],
+   "appearance": {
+    "input-textual-definite-width-ref.html": [
+     "7a256be23b3c084bb8477d7380a8b1801ec07f05",
+     []
+    ],
+    "input-textual-empty-ref.html": [
+     "6cbaa3e40e5a7fa6ea96710f126d6e6d4d4d633e",
+     []
+    ],
+    "input-textual-nonempty-placeholder-ref.html": [
+     "7a256be23b3c084bb8477d7380a8b1801ec07f05",
+     []
+    ],
+    "input-textual-overflow-ref.html": [
+     "f8e22c9d11dc68dd244a3fc5b8f5946a707a2660",
+     []
+    ],
+    "input-textual-placeholder-overflow-ref.html": [
+     "ee297a94cacb3838375b94c3a546f288adb464f1",
+     []
+    ],
+    "input-textual-placeholder-ref.html": [
+     "d30f13a2a1bab16989ec585a57ba7b7bd0b1c329",
+     []
+    ],
+    "input-textual-text-align-ref.html": [
+     "c2c99bc0751afd0aea3479a54df5f1d107fff38d",
+     []
+    ],
+    "supports": {
+     "input-textual-ref.css": [
+      "7cdabb05d5dd7eb39df521fcb5ce24e39fea840f",
+      []
+     ]
+    }
+   },
    "bluetooth": {
     "bluetooth-helpers.js": [
      "16a280cca298bcaa5796b36b48d331bfd15baae8",
@@ -8608,7 +8718,7 @@
     ],
     "css": {
      "ahem.css": [
-      "51eede74aaa0b43f2c9235019bc73a508b1f14e4",
+      "a7db592e0df53e0b70f66ca7b31a7734db18887e",
       []
      ]
     },
@@ -9208,10 +9318,6 @@
      "f29e061cc35625fa039473e702f78dbc5a7d9c14",
      []
     ],
-    "input_placeholder_ref.html": [
-     "1caffed07f2cdd341ad26ab7489e02233a6ae26c",
-     []
-    ],
     "input_selection_incremental_ref.html": [
      "95b24db3c3d7d8e02a6e1a89a07c1182bcb832de",
      []
@@ -9322,10 +9428,6 @@
     ],
     "linear_gradients_lengths_ref.html": [
      "a067067fff64d232aad7233b69b7b78e74e1f365",
-     []
-    ],
-    "linear_gradients_non_square_ref.html": [
-     "1ad3c75747e05768a3e79d879e535e8b3980f1a4",
      []
     ],
     "linear_gradients_parsing_ref.html": [
@@ -10573,7 +10675,7 @@
      []
     ],
     "interfaces.js": [
-     "fbfc396b62c55415c0493b7528bd5e2b959452e6",
+     "52fc87e916db0cd9143304eac883d975b6faf75e",
      []
     ],
     "max-session-history-frame.html": [
@@ -10654,7 +10756,7 @@
       []
      ],
      "no_mime_type.py": [
-      "860005a42c237735287031133786352d7c732402",
+      "980eeee18f993f20a9df033f337a52ec93155ec4",
       []
      ],
      "origin_helpers.js": [
@@ -10754,6 +10856,50 @@
     ],
     "test.txt": [
      "9235007d960cc6c804a93c89f24881bedc3613c3",
+     []
+    ],
+    "test1.jpg": [
+     "124d70729ea649ee253254ec0f1e2ea0f926ed31",
+     []
+    ],
+    "test10.jpg": [
+     "1ff396cd08dbf8a6039f39e79af860c44859da48",
+     []
+    ],
+    "test11.jpg": [
+     "8074fffaa33a371825c7a54c9536fc22f4d8bca4",
+     []
+    ],
+    "test2.jpg": [
+     "e35589b82207d655379acbcac3932ccbef846dee",
+     []
+    ],
+    "test3.jpg": [
+     "1f135409c45ea58b4cb7b89bdf4f71b8b43d0b88",
+     []
+    ],
+    "test4.jpg": [
+     "793ded09d3e65db01ea2c55c6f9f2bbe10366b94",
+     []
+    ],
+    "test5.jpg": [
+     "3df583072e57fd6195104e8fb16be7a91b751a70",
+     []
+    ],
+    "test6.jpg": [
+     "81c68f412a27fcdcb1d961db568168b0e9ea2caf",
+     []
+    ],
+    "test7.jpg": [
+     "b6169d4a7b804b184e4677eb9eda54c67f0d2e75",
+     []
+    ],
+    "test8.jpg": [
+     "295e9c523527c584eac494298060d2631d69603d",
+     []
+    ],
+    "test9.jpg": [
+     "c82f94f0134105792bb45a3a827c2a51cc92e674",
      []
     ],
     "text-overflow-ellipsis-stacking-context-ref.html": [
@@ -12473,7 +12619,7 @@
       ]
      ],
      "basic-transition.html": [
-      "b80e8a666a6e6202b4ecafe628ef00ebcecfe168",
+      "c3461d3a5f9f1259296168742028db3bd4fc3668",
       [
        null,
        {}
@@ -12501,7 +12647,7 @@
       ]
      ],
      "transition-raf.html": [
-      "c38404503408e04b3c75b42df18ec3a7ec0819f5",
+      "aa3ed54e3e08a190f227c87165523306aed5a6bc",
       [
        null,
        {}
@@ -12621,7 +12767,7 @@
      ]
     ],
     "stylesheet_media_queries.html": [
-     "49956367a16c3de98d173d4cf5692c05451340a0",
+     "d04eb4b23f107b1e4d127cf633d4155ab3bdf629",
      [
       null,
       {}
@@ -12848,8 +12994,22 @@
        null,
        {}
       ]
+     ],
+     "invalid.html": [
+      "d50ff1030c48794dfc92083b6fecde3f97524b7e",
+      [
+       null,
+       {}
+      ]
      ]
     },
+    "canvas-oversize-serialization.html": [
+     "3330ee2b8c4e33a18a3e17151fd7c398c9a5d024",
+     [
+      null,
+      {}
+     ]
+    ],
     "canvas.initial.reset.2dstate.html": [
      "e276ed09ffcf16eff16b784c622b93665c4109ee",
      [
@@ -13518,6 +13678,13 @@
       {}
      ]
     ],
+    "img_load_more_than_cache.html": [
+     "41f1212f8df42c9082d462d861a1ae5545ea5523",
+     [
+      null,
+      {}
+     ]
+    ],
     "img_multiple_request.html": [
      "df625a2bc338c0220808cf7a153128fe9b9d48a8",
      [
@@ -13582,14 +13749,14 @@
      ]
     ],
     "interfaces.https.html": [
-     "eee8c799727b91e00b512795756b693a5f121f86",
+     "1397b723a1cb001521ac1b2032c380f1e02cf1f0",
      [
       null,
       {}
      ]
     ],
     "interfaces.worker.js": [
-     "e86f34f261442aeaa7074c525fb4b1206219769d",
+     "66f95241d5518a6b82725529775dc5613cbab1c0",
      [
       "mozilla/interfaces.worker.html",
       {}
@@ -14372,7 +14539,14 @@
      ]
     ],
     "window_resizeTo.html": [
-     "3f6c5a610d52b64bf4457d478b929e95d79e9ab8",
+     "d104be2bc840eecc7c32e27a6fdf1850d945f1e5",
+     [
+      null,
+      {}
+     ]
+    ],
+    "window_resize_event.html": [
+     "68222f978909022ae1abfbdce6c4ea1c5787c554",
      [
       null,
       {}

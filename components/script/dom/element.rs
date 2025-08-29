@@ -12,8 +12,7 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::{fmt, mem};
 
-use content_security_policy as csp;
-use cssparser::match_ignore_ascii_case;
+use cssparser::{Parser as CssParser, ParserInput as CssParserInput, match_ignore_ascii_case};
 use devtools_traits::AttrInfo;
 use dom_struct::dom_struct;
 use embedder_traits::InputMethodType;
@@ -24,6 +23,7 @@ use html5ever::{LocalName, Namespace, Prefix, QualName, local_name, namespace_pr
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::HandleObject;
+use layout_api::LayoutDamage;
 use net_traits::ReferrerPolicy;
 use net_traits::request::CorsSettings;
 use selectors::Element as SelectorsElement;
@@ -34,8 +34,11 @@ use selectors::sink::Push;
 use servo_arc::Arc;
 use style::applicable_declarations::ApplicableDeclarationBlock;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
+use style::computed_values::position::T as Position;
 use style::context::QuirksMode;
 use style::invalidation::element::restyle_hints::RestyleHint;
+use style::media_queries::MediaList;
+use style::parser::ParserContext as CssParserContext;
 use style::properties::longhands::{
     self, background_image, border_spacing, font_family, font_size,
 };
@@ -48,15 +51,16 @@ use style::selector_parser::{
     NonTSPseudoClass, PseudoElement, RestyleDamage, SelectorImpl, SelectorParser,
     extended_filtering,
 };
-use style::shared_lock::{Locked, SharedRwLock};
+use style::shared_lock::Locked;
 use style::stylesheets::layer_rule::LayerOrder;
-use style::stylesheets::{CssRuleType, UrlExtraData};
+use style::stylesheets::{CssRuleType, Origin as CssOrigin, UrlExtraData};
 use style::values::computed::Overflow;
 use style::values::generics::NonNegative;
 use style::values::generics::position::PreferredRatio;
 use style::values::generics::ratio::Ratio;
 use style::values::{AtomIdent, AtomString, CSSFloat, computed, specified};
 use style::{ArcSlice, CaseSensitivityExt, dom_apis, thread_state};
+use style_traits::ParsingMode as CssParsingMode;
 use stylo_atoms::Atom;
 use stylo_dom::ElementState;
 use xml5ever::serialize::TraversalScope::{
@@ -70,7 +74,7 @@ use crate::dom::bindings::cell::{DomRefCell, Ref, RefMut};
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
 use crate::dom::bindings::codegen::Bindings::ElementBinding::{
-    ElementMethods, GetHTMLOptions, ShadowRootInit,
+    ElementMethods, GetHTMLOptions, ScrollIntoViewContainer, ScrollLogicalPosition, ShadowRootInit,
 };
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
 use crate::dom::bindings::codegen::Bindings::HTMLTemplateElementBinding::HTMLTemplateElementMethods;
@@ -82,27 +86,30 @@ use crate::dom::bindings::codegen::Bindings::WindowBinding::{
     ScrollBehavior, ScrollToOptions, WindowMethods,
 };
 use crate::dom::bindings::codegen::UnionTypes::{
-    NodeOrString, TrustedHTMLOrNullIsEmptyString, TrustedHTMLOrString, TrustedScriptURLOrUSVString,
+    BooleanOrScrollIntoViewOptions, NodeOrString, TrustedHTMLOrNullIsEmptyString,
+    TrustedHTMLOrString,
+    TrustedHTMLOrTrustedScriptOrTrustedScriptURLOrString as TrustedTypeOrString,
+    TrustedScriptURLOrUSVString,
 };
 use crate::dom::bindings::conversions::DerivedFrom;
+use crate::dom::bindings::domname::{
+    self, is_valid_attribute_local_name, namespace_from_domstring,
+};
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom, ToLayout};
 use crate::dom::bindings::str::{DOMString, USVString};
-use crate::dom::bindings::xmlname::{
-    matches_name_production, namespace_from_domstring, validate_and_extract,
-};
+use crate::dom::bindings::xmlname::matches_name_production;
 use crate::dom::characterdata::CharacterData;
 use crate::dom::create::create_element;
+use crate::dom::csp::{CspReporting, InlineCheckType, SourcePosition};
 use crate::dom::customelementregistry::{
     CallbackReaction, CustomElementDefinition, CustomElementReaction, CustomElementState,
     is_valid_custom_element_name,
 };
-use crate::dom::document::{
-    Document, LayoutDocumentHelpers, ReflowTriggerCondition, determine_policy_for_token,
-};
+use crate::dom::document::{Document, LayoutDocumentHelpers, determine_policy_for_token};
 use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::domrect::DOMRect;
 use crate::dom::domrectlist::DOMRectList;
@@ -118,7 +125,7 @@ use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlfieldsetelement::HTMLFieldSetElement;
 use crate::dom::htmlfontelement::{HTMLFontElement, HTMLFontElementLayoutHelpers};
 use crate::dom::htmlformelement::FormControlElementHelpers;
-use crate::dom::htmlhrelement::{HTMLHRElement, HTMLHRLayoutHelpers};
+use crate::dom::htmlhrelement::{HTMLHRElement, HTMLHRLayoutHelpers, SizePresentationalHint};
 use crate::dom::htmliframeelement::{HTMLIFrameElement, HTMLIFrameElementLayoutMethods};
 use crate::dom::htmlimageelement::{HTMLImageElement, LayoutHTMLImageElementHelpers};
 use crate::dom::htmlinputelement::{HTMLInputElement, LayoutHTMLInputElementHelpers};
@@ -156,6 +163,7 @@ use crate::dom::servoparser::ServoParser;
 use crate::dom::shadowroot::{IsUserAgentWidget, ShadowRoot};
 use crate::dom::text::Text;
 use crate::dom::trustedhtml::TrustedHTML;
+use crate::dom::trustedtypepolicyfactory::TrustedTypePolicyFactory;
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidationFlags;
 use crate::dom::virtualmethods::{VirtualMethods, vtable_for};
@@ -259,6 +267,20 @@ impl FromStr for AdjacentPosition {
     }
 }
 
+/// Represents a scrolling box that can be either an element or the viewport
+/// <https://drafts.csswg.org/cssom-view/#scrolling-box>
+enum ScrollingBox {
+    Element(DomRoot<Element>),
+    Viewport(DomRoot<Document>),
+}
+
+/// Represents a scroll position with x and y coordinates
+#[derive(Clone, Copy, Debug)]
+struct ScrollPosition {
+    x: f64,
+    y: f64,
+}
+
 //
 // Element methods
 //
@@ -333,15 +355,15 @@ impl Element {
         )
     }
 
-    fn rare_data(&self) -> Ref<Option<Box<ElementRareData>>> {
+    fn rare_data(&self) -> Ref<'_, Option<Box<ElementRareData>>> {
         self.rare_data.borrow()
     }
 
-    fn rare_data_mut(&self) -> RefMut<Option<Box<ElementRareData>>> {
+    fn rare_data_mut(&self) -> RefMut<'_, Option<Box<ElementRareData>>> {
         self.rare_data.borrow_mut()
     }
 
-    fn ensure_rare_data(&self) -> RefMut<Box<ElementRareData>> {
+    fn ensure_rare_data(&self) -> RefMut<'_, Box<ElementRareData>> {
         let mut rare_data = self.rare_data.borrow_mut();
         if rare_data.is_none() {
             *rare_data = Some(Default::default());
@@ -357,9 +379,18 @@ impl Element {
         // NodeStyleDamaged, but I'm preserving existing behavior.
         restyle.hint.insert(RestyleHint::RESTYLE_SELF);
 
-        if damage == NodeDamage::OtherNodeDamage {
-            doc.note_node_with_dirty_descendants(self.upcast());
-            restyle.damage = RestyleDamage::reconstruct();
+        match damage {
+            NodeDamage::Style => {},
+            NodeDamage::ContentOrHeritage => {
+                doc.note_node_with_dirty_descendants(self.upcast());
+                restyle
+                    .damage
+                    .insert(LayoutDamage::recollect_box_tree_children());
+            },
+            NodeDamage::Other => {
+                doc.note_node_with_dirty_descendants(self.upcast());
+                restyle.damage.insert(RestyleDamage::reconstruct());
+            },
         }
     }
 
@@ -410,6 +441,7 @@ impl Element {
         self.ensure_rare_data().custom_element_definition = None;
     }
 
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn push_callback_reaction(&self, function: Rc<Function>, args: Box<[Heap<JSVal>]>) {
         self.ensure_rare_data()
             .custom_element_reaction_queue
@@ -452,34 +484,30 @@ impl Element {
 
     /// style will be `None` for elements in a `display: none` subtree. otherwise, the element has a
     /// layout box iff it doesn't have `display: none`.
-    pub(crate) fn style(&self, can_gc: CanGc) -> Option<Arc<ComputedValues>> {
-        self.upcast::<Node>().style(can_gc)
+    pub(crate) fn style(&self) -> Option<Arc<ComputedValues>> {
+        self.upcast::<Node>().style()
     }
 
     // https://drafts.csswg.org/cssom-view/#css-layout-box
-    pub(crate) fn has_css_layout_box(&self, can_gc: CanGc) -> bool {
-        self.style(can_gc)
+    pub(crate) fn has_css_layout_box(&self) -> bool {
+        self.style()
             .is_some_and(|s| !s.get_box().clone_display().is_none())
     }
 
     /// <https://drafts.csswg.org/cssom-view/#potentially-scrollable>
-    pub(crate) fn is_potentially_scrollable_body(&self, can_gc: CanGc) -> bool {
-        self.is_potentially_scrollable_body_shared_logic(false, can_gc)
+    pub(crate) fn is_potentially_scrollable_body(&self) -> bool {
+        self.is_potentially_scrollable_body_shared_logic(false)
     }
 
     /// <https://drafts.csswg.org/cssom-view/#potentially-scrollable>
-    pub(crate) fn is_potentially_scrollable_body_for_scrolling_element(
-        &self,
-        can_gc: CanGc,
-    ) -> bool {
-        self.is_potentially_scrollable_body_shared_logic(true, can_gc)
+    pub(crate) fn is_potentially_scrollable_body_for_scrolling_element(&self) -> bool {
+        self.is_potentially_scrollable_body_shared_logic(true)
     }
 
     /// <https://drafts.csswg.org/cssom-view/#potentially-scrollable>
     fn is_potentially_scrollable_body_shared_logic(
         &self,
         treat_overflow_clip_on_parent_as_hidden: bool,
-        can_gc: CanGc,
     ) -> bool {
         let node = self.upcast::<Node>();
         debug_assert!(
@@ -490,14 +518,14 @@ impl Element {
         // "An element body (which will be the body element) is potentially
         // scrollable if all of the following conditions are true:
         //  - body has an associated box."
-        if !self.has_css_layout_box(can_gc) {
+        if !self.has_css_layout_box() {
             return false;
         }
 
         // " - body’s parent element’s computed value of the overflow-x or
         //     overflow-y properties is neither visible nor clip."
         if let Some(parent) = node.GetParentElement() {
-            if let Some(style) = parent.style(can_gc) {
+            if let Some(style) = parent.style() {
                 let mut overflow_x = style.get_box().clone_overflow_x();
                 let mut overflow_y = style.get_box().clone_overflow_y();
 
@@ -520,7 +548,7 @@ impl Element {
 
         // " - body’s computed value of the overflow-x or overflow-y properties
         //     is neither visible nor clip."
-        if let Some(style) = self.style(can_gc) {
+        if let Some(style) = self.style() {
             if !style.get_box().clone_overflow_x().is_scrollable() &&
                 !style.get_box().clone_overflow_y().is_scrollable()
             {
@@ -532,18 +560,17 @@ impl Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#scrolling-box
-    fn has_scrolling_box(&self, can_gc: CanGc) -> bool {
+    fn has_scrolling_box(&self) -> bool {
         // TODO: scrolling mechanism, such as scrollbar (We don't have scrollbar yet)
         //       self.has_scrolling_mechanism()
-        self.style(can_gc).is_some_and(|style| {
+        self.style().is_some_and(|style| {
             style.get_box().clone_overflow_x().is_scrollable() ||
                 style.get_box().clone_overflow_y().is_scrollable()
         })
     }
 
-    fn has_overflow(&self, can_gc: CanGc) -> bool {
-        self.ScrollHeight(can_gc) > self.ClientHeight(can_gc) ||
-            self.ScrollWidth(can_gc) > self.ClientWidth(can_gc)
+    fn has_overflow(&self) -> bool {
+        self.ScrollHeight() > self.ClientHeight() || self.ScrollWidth() > self.ClientWidth()
     }
 
     pub(crate) fn shadow_root(&self) -> Option<DomRoot<ShadowRoot>> {
@@ -671,10 +698,46 @@ impl Element {
         shadow_root.bind_to_tree(&bind_context, can_gc);
 
         let node = self.upcast::<Node>();
-        node.dirty(NodeDamage::OtherNodeDamage);
-        node.rev_version();
+        node.dirty(NodeDamage::Other);
 
         Ok(shadow_root)
+    }
+
+    /// Attach a UA widget shadow root with its default parameters.
+    /// Additionally mark ShadowRoot to use styling configuration for a UA widget.
+    ///
+    /// The general trait of these elements is that it would hide the implementation.
+    /// Thus, we would make it inaccessible (i.e., closed mode, not cloneable, and
+    /// not serializable).
+    ///
+    /// With UA shadow root element being assumed as one element, any focus should
+    /// be delegated to its host.
+    ///
+    // TODO: Ideally, all of the UA shadow root should use UA widget styling, but
+    //       some of the UA widget implemented prior to the implementation of Gecko's
+    //       UA widget matching might need some tweaking.
+    // FIXME: We are yet to implement more complex focusing with that is necessary
+    //        for delegate focus, and we are using workarounds for that right now.
+    pub(crate) fn attach_ua_shadow_root(
+        &self,
+        use_ua_widget_styling: bool,
+        can_gc: CanGc,
+    ) -> DomRoot<ShadowRoot> {
+        let root = self
+            .attach_shadow(
+                IsUserAgentWidget::Yes,
+                ShadowRootMode::Closed,
+                false,
+                false,
+                false,
+                SlotAssignmentMode::Manual,
+                can_gc,
+            )
+            .expect("Attaching UA shadow root failed");
+
+        root.upcast::<Node>()
+            .set_in_ua_widget(use_ua_widget_styling);
+        root
     }
 
     pub(crate) fn detach_shadow(&self, can_gc: CanGc) {
@@ -692,7 +755,7 @@ impl Element {
 
     // https://html.spec.whatwg.org/multipage/#translation-mode
     pub(crate) fn is_translate_enabled(&self) -> bool {
-        let name = &html5ever::local_name!("translate");
+        let name = &local_name!("translate");
         if self.has_attribute(name) {
             match_ignore_ascii_case! { &*self.get_string_attribute(name),
                 "yes" | "" => return true,
@@ -729,7 +792,7 @@ impl Element {
     /// Lazily initialize the raredata if it does not exist.
     pub(crate) fn registered_intersection_observers_mut(
         &self,
-    ) -> RefMut<Vec<IntersectionObserverRegistration>> {
+    ) -> RefMut<'_, Vec<IntersectionObserverRegistration>> {
         RefMut::map(self.ensure_rare_data(), |rare_data| {
             &mut rare_data.registered_intersection_observers
         })
@@ -737,8 +800,8 @@ impl Element {
 
     pub(crate) fn registered_intersection_observers(
         &self,
-    ) -> Option<Ref<Vec<IntersectionObserverRegistration>>> {
-        let rare_data: Ref<_> = self.rare_data.borrow();
+    ) -> Option<Ref<'_, Vec<IntersectionObserverRegistration>>> {
+        let rare_data: Ref<'_, _> = self.rare_data.borrow();
 
         if rare_data.is_none() {
             return None;
@@ -754,7 +817,7 @@ impl Element {
     pub(crate) fn get_intersection_observer_registration(
         &self,
         observer: &IntersectionObserver,
-    ) -> Option<Ref<IntersectionObserverRegistration>> {
+    ) -> Option<Ref<'_, IntersectionObserverRegistration>> {
         if let Some(registrations) = self.registered_intersection_observers() {
             registrations
                 .iter()
@@ -780,6 +843,403 @@ impl Element {
         self.ensure_rare_data()
             .registered_intersection_observers
             .retain(|reg_obs| *reg_obs.observer != *observer)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#matches-the-environment>
+    pub(crate) fn matches_environment(&self, media_query: &str) -> bool {
+        let document = self.owner_document();
+        let quirks_mode = document.quirks_mode();
+        let document_url_data = UrlExtraData(document.url().get_arc());
+        // FIXME(emilio): This should do the same that we do for other media
+        // lists regarding the rule type and such, though it doesn't really
+        // matter right now...
+        //
+        // Also, ParsingMode::all() is wrong, and should be DEFAULT.
+        let context = CssParserContext::new(
+            CssOrigin::Author,
+            &document_url_data,
+            Some(CssRuleType::Style),
+            CssParsingMode::all(),
+            quirks_mode,
+            /* namespaces = */ Default::default(),
+            None,
+            None,
+        );
+        let mut parser_input = CssParserInput::new(media_query);
+        let mut parser = CssParser::new(&mut parser_input);
+        let media_list = MediaList::parse(&context, &mut parser);
+        media_list.evaluate(document.window().layout().device(), quirks_mode)
+    }
+
+    /// <https://drafts.csswg.org/cssom-view/#scroll-a-target-into-view>
+    fn scroll_into_view_with_options(
+        &self,
+        behavior: ScrollBehavior,
+        block: ScrollLogicalPosition,
+        inline: ScrollLogicalPosition,
+        container: Option<&Element>,
+    ) {
+        let target_document = self.upcast::<Node>().owner_doc();
+
+        // Step 1: For each ancestor element or viewport that establishes a scrolling box,
+        // in order of innermost to outermost scrolling box
+        let mut out_of_bound = false;
+        self.upcast::<Node>()
+            .inclusive_ancestors(ShadowIncluding::Yes)
+            .skip(1) // Skip self
+            .filter(|node| self.establishes_scroll_box(node))
+            .map_while(|node| {
+                if out_of_bound {
+                    return None;
+                }
+                let scrolling_box = if node.is::<Document>() {
+                    let document = node.downcast::<Document>().unwrap();
+                    ScrollingBox::Viewport(DomRoot::from_ref(document))
+                } else {
+                    let element = node.downcast::<Element>().unwrap();
+                    ScrollingBox::Element(DomRoot::from_ref(element))
+                };
+
+                // Step 1.4: Check container stopping condition
+                if let Some(container) = container {
+                    // If container is not null and either scrolling box is a
+                    // shadow-including inclusive ancestor of container or is a viewport
+                    // whose document is a shadow-including inclusive ancestor of
+                    // container, abort the rest of these steps.
+                    let stop_condition = match scrolling_box {
+                        ScrollingBox::Element(ref element) => {
+                            // Check if the scrolling box element is a shadow-including inclusive ancestor of container
+                            element
+                                .upcast::<Node>()
+                                .is_shadow_including_inclusive_ancestor_of(
+                                    container.upcast::<Node>(),
+                                )
+                        },
+                        ScrollingBox::Viewport(ref document) => {
+                            // Check if the viewport's document is a shadow-including inclusive ancestor of container
+                            document
+                                .upcast::<Node>()
+                                .is_shadow_including_inclusive_ancestor_of(
+                                    container.upcast::<Node>(),
+                                )
+                        },
+                    };
+                    if stop_condition {
+                        out_of_bound = true;
+                    }
+                }
+                Some(scrolling_box)
+            })
+            .for_each(|scrolling_box| {
+                match scrolling_box {
+                    ScrollingBox::Element(ref element) => {
+                        // Step 1.1: Check same origin
+                        let scrolling_box_document = element.upcast::<Node>().owner_doc();
+                        if !target_document
+                            .origin()
+                            .same_origin(scrolling_box_document.origin())
+                        {
+                            return;
+                        }
+
+                        // Step 1.2: Determine scroll position
+                        let position = self.determine_scroll_into_view_position(
+                            element.upcast::<Node>(),
+                            block,
+                            inline,
+                        );
+                        // Step 1.3: Check if scroll is needed
+                        // TODO: check if scrolling box has an ongoing smooth scroll
+                        let current_scroll_x = element.ScrollLeft();
+                        let current_scroll_y = element.ScrollTop();
+                        if position.x != current_scroll_x || position.y != current_scroll_y {
+                            // Step 1.3.1: If scrolling box is associated with an element:
+                            // Perform a scroll of the element’s scrolling box to position,
+                            // with the element as the associated element and behavior as the scroll behavior.
+                            let window = target_document.window();
+                            window.scroll_an_element(element, position.x, position.y, behavior);
+                        }
+                    },
+                    ScrollingBox::Viewport(ref viewport) => {
+                        // Step 1.1: Check same origin (viewport is always same origin with target)
+                        // Step 1.2: Determine scroll position
+                        let position = self.determine_scroll_into_view_position(
+                            viewport.upcast::<Node>(),
+                            block,
+                            inline,
+                        );
+                        // Step 1.3: Check if scroll is needed
+                        let window = viewport.window();
+                        let current_scroll_x = window.ScrollX() as f64;
+                        let current_scroll_y = window.ScrollY() as f64;
+                        if position.x != current_scroll_x || position.y != current_scroll_y {
+                            // Step 1.3.2: Perform a scroll of the viewport to position, with root
+                            // element as the associated element
+                            window.scroll(position.x, position.y, behavior);
+                        }
+                    },
+                }
+            });
+    }
+
+    /// Check if an element establishes a scrolling box
+    fn establishes_scroll_box(&self, node: &Node) -> bool {
+        if node.is::<Document>() {
+            true // Document's viewport is always a scrolling box
+        } else if node.is::<Element>() {
+            let element: &Element = node.downcast::<Element>().unwrap();
+            if let Some(style) = element.style() {
+                let overflow_x = style.get_box().clone_overflow_x();
+                let overflow_y = style.get_box().clone_overflow_y();
+                overflow_x.is_scrollable() || overflow_y.is_scrollable()
+            } else {
+                false // Element without style is not a scrolling box
+            }
+        } else {
+            false // Shadow roots and other nodes are not scrolling boxes
+        }
+    }
+
+    /// <https://drafts.csswg.org/cssom-view/#element-scrolling-members>
+    fn determine_scroll_into_view_position(
+        &self,
+        scrolling_node: &Node,
+        block: ScrollLogicalPosition,
+        inline: ScrollLogicalPosition,
+    ) -> ScrollPosition {
+        let target_bounding_box = self.upcast::<Node>().border_box().unwrap_or_default();
+
+        let device_pixel_ratio = self
+            .upcast::<Node>()
+            .owner_doc()
+            .window()
+            .device_pixel_ratio()
+            .get();
+
+        // Target element bounds
+        let element_left = target_bounding_box
+            .origin
+            .x
+            .to_nearest_pixel(device_pixel_ratio) as f64;
+        let element_top = target_bounding_box
+            .origin
+            .y
+            .to_nearest_pixel(device_pixel_ratio) as f64;
+        let element_width = target_bounding_box
+            .size
+            .width
+            .to_nearest_pixel(device_pixel_ratio) as f64;
+        let element_height = target_bounding_box
+            .size
+            .height
+            .to_nearest_pixel(device_pixel_ratio) as f64;
+        let element_right = element_left + element_width;
+        let element_bottom = element_top + element_height;
+
+        let (target_x, target_y) = if scrolling_node.is::<Document>() {
+            // Handle document-specific scrolling
+            // Viewport bounds and current scroll position
+            let owner_doc = self.upcast::<Node>().owner_doc();
+            let window = owner_doc.window();
+            let viewport_width = window.InnerWidth() as f64;
+            let viewport_height = window.InnerHeight() as f64;
+            let current_scroll_x = window.ScrollX() as f64;
+            let current_scroll_y = window.ScrollY() as f64;
+
+            // For viewport scrolling, we need to add current scroll to get document-relative positions
+            let document_element_left = element_left + current_scroll_x;
+            let document_element_top = element_top + current_scroll_y;
+            let document_element_right = element_right + current_scroll_x;
+            let document_element_bottom = element_bottom + current_scroll_y;
+
+            (
+                self.calculate_scroll_position_one_axis(
+                    inline,
+                    document_element_left,
+                    document_element_right,
+                    element_width,
+                    viewport_width,
+                    current_scroll_x,
+                ),
+                self.calculate_scroll_position_one_axis(
+                    block,
+                    document_element_top,
+                    document_element_bottom,
+                    element_height,
+                    viewport_height,
+                    current_scroll_y,
+                ),
+            )
+        } else {
+            // Handle element-specific scrolling
+            // Scrolling box bounds and current scroll position
+            let scrolling_box = scrolling_node.border_box().unwrap_or_default();
+            let scrolling_left = scrolling_box.origin.x.to_nearest_pixel(device_pixel_ratio) as f64;
+            let scrolling_top = scrolling_box.origin.y.to_nearest_pixel(device_pixel_ratio) as f64;
+            let scrolling_width = scrolling_box
+                .size
+                .width
+                .to_nearest_pixel(device_pixel_ratio) as f64;
+            let scrolling_height = scrolling_box
+                .size
+                .height
+                .to_nearest_pixel(device_pixel_ratio) as f64;
+
+            let current_scroll_x = scrolling_node.downcast::<Element>().unwrap().ScrollLeft();
+            let current_scroll_y = scrolling_node.downcast::<Element>().unwrap().ScrollTop();
+
+            // Calculate element position in scroller's content coordinate system
+            // Element's viewport position relative to scroller, then add scroll offset to get content position
+            let viewport_relative_left = element_left - scrolling_left;
+            let viewport_relative_top = element_top - scrolling_top;
+            let viewport_relative_right = element_right - scrolling_left;
+            let viewport_relative_bottom = element_bottom - scrolling_top;
+
+            // For absolutely positioned elements, we need to account for the positioning context
+            // If the element is positioned relative to an ancestor that's within the scrolling container,
+            // we need to adjust coordinates accordingly
+            let (
+                adjusted_relative_left,
+                adjusted_relative_top,
+                adjusted_relative_right,
+                adjusted_relative_bottom,
+            ) = {
+                // Check if this element has a positioned ancestor between it and the scrolling container
+                let mut current_node = self.upcast::<Node>().GetParentNode();
+                let mut final_coords = (
+                    viewport_relative_left,
+                    viewport_relative_top,
+                    viewport_relative_right,
+                    viewport_relative_bottom,
+                );
+
+                while let Some(node) = current_node {
+                    // Stop if we reach the scrolling container
+                    if &*node == scrolling_node {
+                        break;
+                    }
+
+                    // Check if this node establishes a positioning context and has position relative/absolute
+                    if let Some(element) = node.downcast::<Element>() {
+                        if let Some(computed_style) = element.style() {
+                            let position = computed_style.get_box().position;
+
+                            if matches!(position, Position::Relative | Position::Absolute) {
+                                // If this element establishes a positioning context,
+                                // Get its bounding box to calculate the offset
+                                let positioning_box = node.border_box().unwrap_or_default();
+                                let positioning_left = positioning_box
+                                    .origin
+                                    .x
+                                    .to_nearest_pixel(device_pixel_ratio)
+                                    as f64;
+                                let positioning_top = positioning_box
+                                    .origin
+                                    .y
+                                    .to_nearest_pixel(device_pixel_ratio)
+                                    as f64;
+
+                                // Calculate the offset of the positioning context relative to the scrolling container
+                                let offset_left = positioning_left - scrolling_left;
+                                let offset_top = positioning_top - scrolling_top;
+
+                                // Adjust the coordinates by subtracting the positioning context offset
+                                final_coords = (
+                                    viewport_relative_left - offset_left,
+                                    viewport_relative_top - offset_top,
+                                    viewport_relative_right - offset_left,
+                                    viewport_relative_bottom - offset_top,
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    current_node = node.GetParentNode();
+                }
+
+                final_coords
+            };
+
+            let content_element_left = adjusted_relative_left + current_scroll_x;
+            let content_element_top = adjusted_relative_top + current_scroll_y;
+            let content_element_right = adjusted_relative_right + current_scroll_x;
+            let content_element_bottom = adjusted_relative_bottom + current_scroll_y;
+
+            (
+                self.calculate_scroll_position_one_axis(
+                    inline,
+                    content_element_left,
+                    content_element_right,
+                    element_width,
+                    scrolling_width,
+                    current_scroll_x,
+                ),
+                self.calculate_scroll_position_one_axis(
+                    block,
+                    content_element_top,
+                    content_element_bottom,
+                    element_height,
+                    scrolling_height,
+                    current_scroll_y,
+                ),
+            )
+        };
+
+        ScrollPosition {
+            x: target_x,
+            y: target_y,
+        }
+    }
+
+    fn calculate_scroll_position_one_axis(
+        &self,
+        alignment: ScrollLogicalPosition,
+        element_start: f64,
+        element_end: f64,
+        element_size: f64,
+        container_size: f64,
+        current_scroll_offset: f64,
+    ) -> f64 {
+        match alignment {
+            // Step 1 & 5: If inline is "start", then align element start edge with scrolling box start edge.
+            ScrollLogicalPosition::Start => element_start,
+            // Step 2 & 6: If inline is "end", then align element end edge with
+            // scrolling box end edge.
+            ScrollLogicalPosition::End => element_end - container_size,
+            // Step 3 & 7: If inline is "center", then align the center of target bounding
+            // border box with the center of scrolling box in scrolling box’s inline base direction.
+            ScrollLogicalPosition::Center => element_start + (element_size - container_size) / 2.0,
+            // Step 4 & 8: If inline is "nearest",
+            ScrollLogicalPosition::Nearest => {
+                let viewport_start = current_scroll_offset;
+                let viewport_end = current_scroll_offset + container_size;
+
+                // Step 4.2 & 8.2: If element start edge is outside scrolling box start edge and element
+                // size is less than scrolling box size or If element end edge is outside
+                // scrolling box end edge and element size is greater than scrolling box size:
+                // Align element start edge with scrolling box start edge.
+                if (element_start < viewport_start && element_size <= container_size) ||
+                    (element_end > viewport_end && element_size >= container_size)
+                {
+                    element_start
+                }
+                // Step 4.3 & 8.3: If element end edge is outside scrolling box start edge and element
+                // size is greater than scrolling box size or If element start edge is outside
+                // scrolling box end edge and element size is less than scrolling box size:
+                // Align element end edge with scrolling box end edge.
+                else if (element_end > viewport_end && element_size < container_size) ||
+                    (element_start < viewport_start && element_size > container_size)
+                {
+                    element_end - container_size
+                }
+                // Step 4.1 & 8.1: If element start edge and element end edge are both outside scrolling
+                // box start edge and scrolling box end edge or an invalid situation: Do nothing.
+                else {
+                    current_scroll_offset
+                }
+            },
+        }
     }
 }
 
@@ -831,8 +1291,14 @@ pub(crate) fn get_attr_for_layout<'dom>(
 
 pub(crate) trait LayoutElementHelpers<'dom> {
     fn attrs(self) -> &'dom [LayoutDom<'dom, Attr>];
-    fn has_class_for_layout(self, name: &AtomIdent, case_sensitivity: CaseSensitivity) -> bool;
+    fn has_class_or_part_for_layout(
+        self,
+        name: &AtomIdent,
+        attr_name: &LocalName,
+        case_sensitivity: CaseSensitivity,
+    ) -> bool;
     fn get_classes_for_layout(self) -> Option<&'dom [Atom]>;
+    fn get_parts_for_layout(self) -> Option<&'dom [Atom]>;
 
     fn synthesize_presentational_hints_for_legacy_attributes<V>(self, hints: &mut V)
     where
@@ -859,6 +1325,9 @@ pub(crate) trait LayoutElementHelpers<'dom> {
     ) -> Option<&'dom AttrValue>;
     fn get_attr_val_for_layout(self, namespace: &Namespace, name: &LocalName) -> Option<&'dom str>;
     fn get_attr_vals_for_layout(self, name: &LocalName) -> Vec<&'dom AttrValue>;
+    fn each_custom_state<F>(self, callback: F)
+    where
+        F: FnMut(&AtomIdent);
 }
 
 impl LayoutDom<'_, Element> {
@@ -875,8 +1344,13 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
     }
 
     #[inline]
-    fn has_class_for_layout(self, name: &AtomIdent, case_sensitivity: CaseSensitivity) -> bool {
-        get_attr_for_layout(self, &ns!(), &local_name!("class")).is_some_and(|attr| {
+    fn has_class_or_part_for_layout(
+        self,
+        name: &AtomIdent,
+        attr_name: &LocalName,
+        case_sensitivity: CaseSensitivity,
+    ) -> bool {
+        get_attr_for_layout(self, &ns!(), attr_name).is_some_and(|attr| {
             attr.to_tokens()
                 .unwrap()
                 .iter()
@@ -890,36 +1364,28 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
             .map(|attr| attr.to_tokens().unwrap())
     }
 
+    fn get_parts_for_layout(self) -> Option<&'dom [Atom]> {
+        get_attr_for_layout(self, &ns!(), &local_name!("part"))
+            .map(|attr| attr.to_tokens().unwrap())
+    }
+
     fn synthesize_presentational_hints_for_legacy_attributes<V>(self, hints: &mut V)
     where
         V: Push<ApplicableDeclarationBlock>,
     {
-        // FIXME(emilio): Just a single PDB should be enough.
-        #[inline]
-        fn from_declaration(
-            shared_lock: &SharedRwLock,
-            declaration: PropertyDeclaration,
-        ) -> ApplicableDeclarationBlock {
-            ApplicableDeclarationBlock::from_declarations(
-                Arc::new(shared_lock.wrap(PropertyDeclarationBlock::with_one(
-                    declaration,
-                    Importance::Normal,
-                ))),
-                CascadeLevel::PresHints,
-                LayerOrder::root(),
-            )
-        }
-
-        let document = self.upcast::<Node>().owner_doc_for_layout();
-        let shared_lock = document.style_shared_lock();
+        let mut property_declaration_block = None;
+        let mut push = |declaration| {
+            property_declaration_block
+                .get_or_insert_with(PropertyDeclarationBlock::default)
+                .push(declaration, Importance::Normal);
+        };
 
         // TODO(xiaochengh): This is probably not enough. When the root element doesn't have a `lang`,
         // we should check the browser settings and system locale.
         if let Some(lang) = self.get_lang_attr_val_for_layout() {
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::XLang(specified::XLang(Atom::from(lang.to_owned()))),
-            ));
+            push(PropertyDeclaration::XLang(specified::XLang(Atom::from(
+                lang.to_owned(),
+            ))));
         }
 
         let bgcolor = if let Some(this) = self.downcast::<HTMLBodyElement>() {
@@ -937,24 +1403,19 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
         };
 
         if let Some(color) = bgcolor {
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::BackgroundColor(specified::Color::from_absolute_color(color)),
+            push(PropertyDeclaration::BackgroundColor(
+                specified::Color::from_absolute_color(color),
             ));
         }
 
-        let background = if let Some(this) = self.downcast::<HTMLBodyElement>() {
-            this.get_background()
-        } else {
-            None
-        };
-
+        let background = self
+            .downcast::<HTMLBodyElement>()
+            .and_then(HTMLBodyElementLayoutHelpers::get_background);
         if let Some(url) = background {
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::BackgroundImage(background_image::SpecifiedValue(
+            push(PropertyDeclaration::BackgroundImage(
+                background_image::SpecifiedValue(
                     vec![specified::Image::for_cascade(url.get_arc())].into(),
-                )),
+                ),
             ));
         }
 
@@ -971,101 +1432,71 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
         };
 
         if let Some(color) = color {
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::Color(longhands::color::SpecifiedValue(
-                    specified::Color::from_absolute_color(color),
-                )),
+            push(PropertyDeclaration::Color(
+                longhands::color::SpecifiedValue(specified::Color::from_absolute_color(color)),
             ));
         }
 
-        let font_face = if let Some(this) = self.downcast::<HTMLFontElement>() {
-            this.get_face()
-        } else {
-            None
-        };
-
+        let font_face = self
+            .downcast::<HTMLFontElement>()
+            .and_then(HTMLFontElementLayoutHelpers::get_face);
         if let Some(font_face) = font_face {
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::FontFamily(font_family::SpecifiedValue::Values(
-                    computed::font::FontFamilyList {
-                        list: ArcSlice::from_iter(
-                            HTMLFontElement::parse_face_attribute(font_face).into_iter(),
-                        ),
-                    },
-                )),
+            push(PropertyDeclaration::FontFamily(
+                font_family::SpecifiedValue::Values(computed::font::FontFamilyList {
+                    list: ArcSlice::from_iter(
+                        HTMLFontElement::parse_face_attribute(font_face).into_iter(),
+                    ),
+                }),
             ));
         }
 
         let font_size = self
             .downcast::<HTMLFontElement>()
-            .and_then(|this| this.get_size());
-
+            .and_then(HTMLFontElementLayoutHelpers::get_size);
         if let Some(font_size) = font_size {
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::FontSize(font_size::SpecifiedValue::from_html_size(
-                    font_size as u8,
-                )),
-            ))
-        }
-
-        let cellspacing = if let Some(this) = self.downcast::<HTMLTableElement>() {
-            this.get_cellspacing()
-        } else {
-            None
-        };
-
-        if let Some(cellspacing) = cellspacing {
-            let width_value = specified::Length::from_px(cellspacing as f32);
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::BorderSpacing(Box::new(border_spacing::SpecifiedValue::new(
-                    width_value.clone().into(),
-                    width_value.into(),
-                ))),
+            push(PropertyDeclaration::FontSize(
+                font_size::SpecifiedValue::from_html_size(font_size as u8),
             ));
         }
 
-        let size = if let Some(this) = self.downcast::<HTMLInputElement>() {
-            // FIXME(pcwalton): More use of atoms, please!
-            match self.get_attr_val_for_layout(&ns!(), &local_name!("type")) {
-                // Not text entry widget
-                Some("hidden") |
-                Some("date") |
-                Some("month") |
-                Some("week") |
-                Some("time") |
-                Some("datetime-local") |
-                Some("number") |
-                Some("range") |
-                Some("color") |
-                Some("checkbox") |
-                Some("radio") |
-                Some("file") |
-                Some("submit") |
-                Some("image") |
-                Some("reset") |
-                Some("button") => None,
-                // Others
-                _ => match this.size_for_layout() {
-                    0 => None,
-                    s => Some(s as i32),
-                },
-            }
-        } else {
-            None
-        };
+        let cellspacing = self
+            .downcast::<HTMLTableElement>()
+            .and_then(HTMLTableElementLayoutHelpers::get_cellspacing);
+        if let Some(cellspacing) = cellspacing {
+            let width_value = specified::Length::from_px(cellspacing as f32);
+            push(PropertyDeclaration::BorderSpacing(Box::new(
+                border_spacing::SpecifiedValue::new(width_value.clone().into(), width_value.into()),
+            )));
+        }
+
+        // Textual input, specifically text entry and domain specific input has
+        // a default preferred size.
+        //
+        // <https://html.spec.whatwg.org/multipage/#the-input-element-as-a-text-entry-widget>
+        // <https://html.spec.whatwg.org/multipage/#the-input-element-as-domain-specific-widgets>
+        let size = self
+            .downcast::<HTMLInputElement>()
+            .and_then(|input_element| {
+                // FIXME(pcwalton): More use of atoms, please!
+                match self.get_attr_val_for_layout(&ns!(), &local_name!("type")) {
+                    Some("hidden") | Some("range") | Some("color") | Some("checkbox") |
+                    Some("radio") | Some("file") | Some("submit") | Some("image") |
+                    Some("reset") | Some("button") => None,
+                    // Others
+                    _ => match input_element.size_for_layout() {
+                        0 => None,
+                        s => Some(s as i32),
+                    },
+                }
+            });
 
         if let Some(size) = size {
             let value =
                 specified::NoCalcLength::ServoCharacterWidth(specified::CharacterWidth(size));
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::Width(specified::Size::LengthPercentage(NonNegative(
+            push(PropertyDeclaration::Width(
+                specified::Size::LengthPercentage(NonNegative(
                     specified::LengthPercentage::Length(value),
-                ))),
+                )),
             ));
         }
 
@@ -1095,10 +1526,7 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
                 let width_value = specified::Size::LengthPercentage(NonNegative(
                     specified::LengthPercentage::Percentage(computed::Percentage(percentage)),
                 ));
-                hints.push(from_declaration(
-                    shared_lock,
-                    PropertyDeclaration::Width(width_value),
-                ));
+                push(PropertyDeclaration::Width(width_value));
             },
             LengthOrPercentageOrAuto::Length(length) => {
                 let width_value = specified::Size::LengthPercentage(NonNegative(
@@ -1106,10 +1534,7 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
                         specified::AbsoluteLength::Px(length.to_f32_px()),
                     )),
                 ));
-                hints.push(from_declaration(
-                    shared_lock,
-                    PropertyDeclaration::Width(width_value),
-                ));
+                push(PropertyDeclaration::Width(width_value));
             },
         }
 
@@ -1137,10 +1562,7 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
                 let height_value = specified::Size::LengthPercentage(NonNegative(
                     specified::LengthPercentage::Percentage(computed::Percentage(percentage)),
                 ));
-                hints.push(from_declaration(
-                    shared_lock,
-                    PropertyDeclaration::Height(height_value),
-                ));
+                push(PropertyDeclaration::Height(height_value));
             },
             LengthOrPercentageOrAuto::Length(length) => {
                 let height_value = specified::Size::LengthPercentage(NonNegative(
@@ -1148,10 +1570,7 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
                         specified::AbsoluteLength::Px(length.to_f32_px()),
                     )),
                 ));
-                hints.push(from_declaration(
-                    shared_lock,
-                    PropertyDeclaration::Height(height_value),
-                ));
+                push(PropertyDeclaration::Height(height_value));
             },
         }
 
@@ -1168,87 +1587,61 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
                         auto: true,
                         ratio: PreferredRatio::Ratio(Ratio(width_value, height_value)),
                     };
-                    hints.push(from_declaration(
-                        shared_lock,
-                        PropertyDeclaration::AspectRatio(aspect_ratio),
-                    ));
+                    push(PropertyDeclaration::AspectRatio(aspect_ratio));
                 }
             }
         }
 
-        let cols = if let Some(this) = self.downcast::<HTMLTextAreaElement>() {
-            match this.get_cols() {
-                0 => None,
-                c => Some(c as i32),
-            }
-        } else {
-            None
-        };
-
+        let cols = self
+            .downcast::<HTMLTextAreaElement>()
+            .map(LayoutHTMLTextAreaElementHelpers::get_cols);
         if let Some(cols) = cols {
-            // TODO(mttr) ServoCharacterWidth uses the size math for <input type="text">, but
-            // the math for <textarea> is a little different since we need to take
-            // scrollbar size into consideration (but we don't have a scrollbar yet!)
-            //
-            // https://html.spec.whatwg.org/multipage/#textarea-effective-width
-            let value =
-                specified::NoCalcLength::ServoCharacterWidth(specified::CharacterWidth(cols));
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::Width(specified::Size::LengthPercentage(NonNegative(
-                    specified::LengthPercentage::Length(value),
-                ))),
-            ));
-        }
-
-        let rows = if let Some(this) = self.downcast::<HTMLTextAreaElement>() {
-            match this.get_rows() {
-                0 => None,
-                r => Some(r as i32),
+            let cols = cols as i32;
+            if cols > 0 {
+                // TODO(mttr) ServoCharacterWidth uses the size math for <input type="text">, but
+                // the math for <textarea> is a little different since we need to take
+                // scrollbar size into consideration (but we don't have a scrollbar yet!)
+                //
+                // https://html.spec.whatwg.org/multipage/#textarea-effective-width
+                let value =
+                    specified::NoCalcLength::ServoCharacterWidth(specified::CharacterWidth(cols));
+                push(PropertyDeclaration::Width(
+                    specified::Size::LengthPercentage(NonNegative(
+                        specified::LengthPercentage::Length(value),
+                    )),
+                ));
             }
-        } else {
-            None
-        };
-
-        if let Some(rows) = rows {
-            // TODO(mttr) This should take scrollbar size into consideration.
-            //
-            // https://html.spec.whatwg.org/multipage/#textarea-effective-height
-            let value = specified::NoCalcLength::FontRelative(specified::FontRelativeLength::Em(
-                rows as CSSFloat,
-            ));
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::Height(specified::Size::LengthPercentage(NonNegative(
-                    specified::LengthPercentage::Length(value),
-                ))),
-            ));
         }
 
-        let border = if let Some(this) = self.downcast::<HTMLTableElement>() {
-            this.get_border()
-        } else {
-            None
-        };
+        let rows = self
+            .downcast::<HTMLTextAreaElement>()
+            .map(LayoutHTMLTextAreaElementHelpers::get_rows);
+        if let Some(rows) = rows {
+            let rows = rows as i32;
+            if rows > 0 {
+                // TODO(mttr) This should take scrollbar size into consideration.
+                //
+                // https://html.spec.whatwg.org/multipage/#textarea-effective-height
+                let value = specified::NoCalcLength::FontRelative(
+                    specified::FontRelativeLength::Em(rows as CSSFloat),
+                );
+                push(PropertyDeclaration::Height(
+                    specified::Size::LengthPercentage(NonNegative(
+                        specified::LengthPercentage::Length(value),
+                    )),
+                ));
+            }
+        }
 
+        let border = self
+            .downcast::<HTMLTableElement>()
+            .and_then(|table| table.get_border());
         if let Some(border) = border {
             let width_value = specified::BorderSideWidth::from_px(border as f32);
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::BorderTopWidth(width_value.clone()),
-            ));
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::BorderLeftWidth(width_value.clone()),
-            ));
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::BorderBottomWidth(width_value.clone()),
-            ));
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::BorderRightWidth(width_value),
-            ));
+            push(PropertyDeclaration::BorderTopWidth(width_value.clone()));
+            push(PropertyDeclaration::BorderLeftWidth(width_value.clone()));
+            push(PropertyDeclaration::BorderBottomWidth(width_value.clone()));
+            push(PropertyDeclaration::BorderRightWidth(width_value));
         }
 
         if let Some(cellpadding) = self
@@ -1259,23 +1652,46 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
             let cellpadding = NonNegative(specified::LengthPercentage::Length(
                 specified::NoCalcLength::from_px(cellpadding as f32),
             ));
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::PaddingTop(cellpadding.clone()),
-            ));
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::PaddingLeft(cellpadding.clone()),
-            ));
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::PaddingBottom(cellpadding.clone()),
-            ));
-            hints.push(from_declaration(
-                shared_lock,
-                PropertyDeclaration::PaddingRight(cellpadding),
-            ));
+            push(PropertyDeclaration::PaddingTop(cellpadding.clone()));
+            push(PropertyDeclaration::PaddingLeft(cellpadding.clone()));
+            push(PropertyDeclaration::PaddingBottom(cellpadding.clone()));
+            push(PropertyDeclaration::PaddingRight(cellpadding));
         }
+
+        // https://html.spec.whatwg.org/multipage/#the-hr-element-2
+        if let Some(size_info) = self
+            .downcast::<HTMLHRElement>()
+            .and_then(|hr_element| hr_element.get_size_info())
+        {
+            match size_info {
+                SizePresentationalHint::SetHeightTo(height) => {
+                    push(PropertyDeclaration::Height(height));
+                },
+                SizePresentationalHint::SetAllBorderWidthValuesTo(border_width) => {
+                    push(PropertyDeclaration::BorderLeftWidth(border_width.clone()));
+                    push(PropertyDeclaration::BorderRightWidth(border_width.clone()));
+                    push(PropertyDeclaration::BorderTopWidth(border_width.clone()));
+                    push(PropertyDeclaration::BorderBottomWidth(border_width));
+                },
+                SizePresentationalHint::SetBottomBorderWidthToZero => {
+                    push(PropertyDeclaration::BorderBottomWidth(
+                        specified::border::BorderSideWidth::from_px(0.),
+                    ));
+                },
+            }
+        }
+
+        let Some(property_declaration_block) = property_declaration_block else {
+            return;
+        };
+
+        let document = self.upcast::<Node>().owner_doc_for_layout();
+        let shared_lock = document.style_shared_lock();
+        hints.push(ApplicableDeclarationBlock::from_declarations(
+            Arc::new(shared_lock.wrap(property_declaration_block)),
+            CascadeLevel::PresHints,
+            LayerOrder::root(),
+        ));
     }
 
     fn get_span(self) -> Option<u32> {
@@ -1406,6 +1822,13 @@ impl<'dom> LayoutElementHelpers<'dom> for LayoutDom<'dom, Element> {
             })
             .collect()
     }
+
+    fn each_custom_state<F>(self, callback: F)
+    where
+        F: FnMut(&AtomIdent),
+    {
+        self.unsafe_get().each_custom_state(callback)
+    }
 }
 
 impl Element {
@@ -1432,7 +1855,7 @@ impl Element {
         &self.namespace
     }
 
-    pub(crate) fn prefix(&self) -> Ref<Option<Prefix>> {
+    pub(crate) fn prefix(&self) -> Ref<'_, Option<Prefix>> {
         self.prefix.borrow()
     }
 
@@ -1440,7 +1863,7 @@ impl Element {
         *self.prefix.borrow_mut() = prefix;
     }
 
-    pub(crate) fn attrs(&self) -> Ref<[Dom<Attr>]> {
+    pub(crate) fn attrs(&self) -> Ref<'_, [Dom<Attr>]> {
         Ref::map(self.attrs.borrow(), |attrs| &**attrs)
     }
 
@@ -1608,6 +2031,24 @@ impl Element {
         }
     }
 
+    /// <https://dom.spec.whatwg.org/#document-element>
+    pub(crate) fn is_document_element(&self) -> bool {
+        if let Some(document_element) = self.owner_document().GetDocumentElement() {
+            *document_element == *self
+        } else {
+            false
+        }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-document-activeelement>
+    pub(crate) fn is_active_element(&self) -> bool {
+        if let Some(active_element) = self.owner_document().GetActiveElement() {
+            *active_element == *self
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn is_focusable_area(&self) -> bool {
         if self.is_actually_disabled() {
             return false;
@@ -1630,6 +2071,29 @@ impl Element {
                 HTMLElementTypeId::HTMLTextAreaElement,
             ))
         )
+    }
+
+    /// Returns the focusable shadow host if this is a text control inner editor.
+    /// This is a workaround for the focus delegation of shadow DOM and should be
+    /// used only to delegate focusable inner editor of [HTMLInputElement] and
+    /// [HTMLTextAreaElement].
+    pub(crate) fn find_focusable_shadow_host_if_necessary(&self) -> Option<DomRoot<Element>> {
+        if self.is_focusable_area() {
+            Some(DomRoot::from_ref(self))
+        } else if self.upcast::<Node>().implemented_pseudo_element() ==
+            Some(PseudoElement::ServoTextControlInnerEditor)
+        {
+            let containing_shadow_host = self.containing_shadow_root().map(|root| root.Host());
+            debug_assert!(
+                containing_shadow_host
+                    .as_ref()
+                    .is_some_and(|e| e.is_focusable_area()),
+                "Containing shadow host is not focusable"
+            );
+            containing_shadow_host
+        } else {
+            None
+        }
     }
 
     pub(crate) fn is_actually_disabled(&self) -> bool {
@@ -1686,29 +2150,86 @@ impl Element {
         self.push_attribute(&attr, can_gc);
     }
 
-    pub(crate) fn push_attribute(&self, attr: &Attr, can_gc: CanGc) {
+    /// <https://dom.spec.whatwg.org/#handle-attribute-changes>
+    fn handle_attribute_changes(
+        &self,
+        attr: &Attr,
+        old_value: Option<&AttrValue>,
+        new_value: Option<DOMString>,
+        can_gc: CanGc,
+    ) {
+        let old_value_string = old_value.map(|old_value| DOMString::from(&**old_value));
+        // Step 1. Queue a mutation record of "attributes" for element with attribute’s local name,
+        // attribute’s namespace, oldValue, « », « », null, and null.
         let name = attr.local_name().clone();
         let namespace = attr.namespace().clone();
         let mutation = LazyCell::new(|| Mutation::Attribute {
             name: name.clone(),
             namespace: namespace.clone(),
-            old_value: None,
+            old_value: old_value_string.clone(),
         });
-
         MutationObserver::queue_a_mutation_record(&self.node, mutation);
 
+        // Avoid double borrow
+        let has_new_value = new_value.is_none();
+
+        // Step 2. If element is custom, then enqueue a custom element callback reaction with element,
+        // callback name "attributeChangedCallback", and « attribute’s local name, oldValue, newValue, attribute’s namespace ».
         if self.is_custom() {
-            let value = DOMString::from(&**attr.value());
-            let reaction = CallbackReaction::AttributeChanged(name, None, Some(value), namespace);
+            let reaction = CallbackReaction::AttributeChanged(
+                attr.local_name().clone(),
+                old_value_string,
+                new_value,
+                attr.namespace().clone(),
+            );
             ScriptThread::enqueue_callback_reaction(self, reaction, None);
         }
 
+        // Step 3. Run the attribute change steps with element, attribute’s local name, oldValue, newValue, and attribute’s namespace.
+        if is_relevant_attribute(attr.namespace(), attr.local_name()) {
+            let attribute_mutation = if has_new_value {
+                AttributeMutation::Removed
+            } else {
+                AttributeMutation::Set(old_value)
+            };
+            vtable_for(self.upcast()).attribute_mutated(attr, attribute_mutation, can_gc);
+        }
+    }
+
+    /// <https://dom.spec.whatwg.org/#concept-element-attributes-change>
+    pub(crate) fn change_attribute(&self, attr: &Attr, mut value: AttrValue, can_gc: CanGc) {
+        // Step 1. Let oldValue be attribute’s value.
+        //
+        // Clone to avoid double borrow
+        let old_value = &attr.value().clone();
+        // Step 2. Set attribute’s value to value.
+        self.will_mutate_attr(attr);
+        attr.swap_value(&mut value);
+        // Step 3. Handle attribute changes for attribute with attribute’s element, oldValue, and value.
+        //
+        // Put on a separate line to avoid double borrow
+        let new_value = DOMString::from(&**attr.value());
+        self.handle_attribute_changes(attr, Some(old_value), Some(new_value), can_gc);
+    }
+
+    /// <https://dom.spec.whatwg.org/#concept-element-attributes-append>
+    pub(crate) fn push_attribute(&self, attr: &Attr, can_gc: CanGc) {
+        // Step 2. Set attribute’s element to element.
+        //
+        // Handled by callers of this function and asserted here.
         assert!(attr.GetOwnerElement().as_deref() == Some(self));
+        // Step 3. Set attribute’s node document to element’s node document.
+        //
+        // Handled by callers of this function and asserted here.
+        assert!(attr.upcast::<Node>().owner_doc() == self.node.owner_doc());
+        // Step 1. Append attribute to element’s attribute list.
         self.will_mutate_attr(attr);
         self.attrs.borrow_mut().push(Dom::from_ref(attr));
-        if is_relevant_attribute(attr.namespace(), attr.local_name()) {
-            vtable_for(self.upcast()).attribute_mutated(attr, AttributeMutation::Set(None), can_gc);
-        }
+        // Step 4. Handle attribute changes for attribute with element, null, and attribute’s value.
+        //
+        // Put on a separate line to avoid double borrow
+        let new_value = DOMString::from(&**attr.value());
+        self.handle_attribute_changes(attr, None, Some(new_value), can_gc);
     }
 
     pub(crate) fn get_attribute(
@@ -1816,6 +2337,7 @@ impl Element {
         Ok(())
     }
 
+    /// <https://dom.spec.whatwg.org/#concept-element-attributes-set-value>
     #[allow(clippy::too_many_arguments)]
     fn set_first_matching_attribute<F>(
         &self,
@@ -1829,6 +2351,7 @@ impl Element {
     ) where
         F: Fn(&Attr) -> bool,
     {
+        // Step 1. Let attribute be the result of getting an attribute given namespace, localName, and element.
         let attr = self
             .attrs
             .borrow()
@@ -1836,8 +2359,14 @@ impl Element {
             .find(|attr| find(attr))
             .map(|js| DomRoot::from_ref(&**js));
         if let Some(attr) = attr {
-            attr.set_value(value, self, can_gc);
+            // Step 3. Change attribute to value.
+            self.will_mutate_attr(&attr);
+            self.change_attribute(&attr, value, can_gc);
         } else {
+            // Step 2. If attribute is null, create an attribute whose namespace is namespace,
+            // namespace prefix is prefix, local name is localName, value is value,
+            // and node document is element’s node document,
+            // then append this attribute to element, and then return.
             self.push_new_attribute(local_name, value, name, namespace, prefix, can_gc);
         };
     }
@@ -1875,6 +2404,7 @@ impl Element {
         self.remove_first_matching_attribute(|attr| attr.name() == name, can_gc)
     }
 
+    /// <https://dom.spec.whatwg.org/#concept-element-attributes-remove>
     fn remove_first_matching_attribute<F>(&self, find: F, can_gc: CanGc) -> Option<DomRoot<Attr>>
     where
         F: Fn(&Attr) -> bool,
@@ -1882,40 +2412,31 @@ impl Element {
         let idx = self.attrs.borrow().iter().position(|attr| find(attr));
         idx.map(|idx| {
             let attr = DomRoot::from_ref(&*(*self.attrs.borrow())[idx]);
+
+            // Step 2. Remove attribute from element’s attribute list.
             self.will_mutate_attr(&attr);
-
-            let name = attr.local_name().clone();
-            let namespace = attr.namespace().clone();
-            let old_value = DOMString::from(&**attr.value());
-            let mutation = LazyCell::new(|| Mutation::Attribute {
-                name: name.clone(),
-                namespace: namespace.clone(),
-                old_value: Some(old_value.clone()),
-            });
-
-            MutationObserver::queue_a_mutation_record(&self.node, mutation);
-
-            if self.is_custom() {
-                let reaction =
-                    CallbackReaction::AttributeChanged(name, Some(old_value), None, namespace);
-                ScriptThread::enqueue_callback_reaction(self, reaction, None);
-            }
-
             self.attrs.borrow_mut().remove(idx);
+            // Step 3. Set attribute’s element to null.
             attr.set_owner(None);
-            if is_relevant_attribute(attr.namespace(), attr.local_name()) {
-                vtable_for(self.upcast()).attribute_mutated(
-                    &attr,
-                    AttributeMutation::Removed,
-                    can_gc,
-                );
-            }
+            // Step 4. Handle attribute changes for attribute with element, attribute’s value, and null.
+            self.handle_attribute_changes(&attr, Some(&attr.value()), None, can_gc);
+
             attr
         })
     }
 
     pub(crate) fn has_class(&self, name: &Atom, case_sensitivity: CaseSensitivity) -> bool {
         self.get_attribute(&ns!(), &local_name!("class"))
+            .is_some_and(|attr| {
+                attr.value()
+                    .as_tokens()
+                    .iter()
+                    .any(|atom| case_sensitivity.eq_atom(name, atom))
+            })
+    }
+
+    pub(crate) fn is_part(&self, name: &Atom, case_sensitivity: CaseSensitivity) -> bool {
+        self.get_attribute(&ns!(), &LocalName::from("part"))
             .is_some_and(|attr| {
                 attr.value()
                     .as_tokens()
@@ -2162,15 +2683,19 @@ impl Element {
                 } else {
                     let win = self.owner_window();
                     let source = &**attr.value();
+                    let global = &self.owner_global();
                     // However, if the Should element's inline behavior be blocked by
                     // Content Security Policy? algorithm returns "Blocked" when executed
                     // upon the attribute's element, "style attribute", and the attribute's value,
                     // then the style rules defined in the attribute's value must not be applied to the element. [CSP]
-                    if doc.should_elements_inline_type_behavior_be_blocked(
-                        self,
-                        csp::InlineCheckType::StyleAttribute,
-                        source,
-                    ) == csp::CheckResult::Blocked
+                    if global
+                        .get_csp_list()
+                        .should_elements_inline_type_behavior_be_blocked(
+                            global,
+                            self,
+                            InlineCheckType::StyleAttribute,
+                            source,
+                        )
                     {
                         return;
                     }
@@ -2187,6 +2712,94 @@ impl Element {
             },
             AttributeMutation::Removed => None,
         };
+    }
+
+    /// <https://dom.spec.whatwg.org/#concept-element-attributes-set>
+    /// including steps of
+    /// <https://dom.spec.whatwg.org/#concept-element-attributes-replace>
+    fn set_attribute_node(&self, attr: &Attr, can_gc: CanGc) -> Fallible<Option<DomRoot<Attr>>> {
+        // Step 1. Let verifiedValue be the result of calling
+        // get Trusted Types-compliant attribute value with attr’s local name,
+        // attr’s namespace, element, and attr’s value. [TRUSTED-TYPES]
+        let verified_value = TrustedTypePolicyFactory::get_trusted_types_compliant_attribute_value(
+            self.namespace(),
+            self.local_name(),
+            attr.local_name(),
+            Some(attr.namespace()),
+            TrustedTypeOrString::String(attr.Value()),
+            &self.owner_global(),
+            can_gc,
+        )?;
+
+        // Step 2. If attr’s element is neither null nor element,
+        // throw an "InUseAttributeError" DOMException.
+        if let Some(owner) = attr.GetOwnerElement() {
+            if &*owner != self {
+                return Err(Error::InUseAttribute);
+            }
+        }
+
+        let vtable = vtable_for(self.upcast());
+
+        // Step 5. Set attr’s value to verifiedValue.
+        //
+        // This ensures that the attribute is of the expected kind for this
+        // specific element. This is inefficient and should probably be done
+        // differently.
+        attr.swap_value(
+            &mut vtable.parse_plain_attribute(attr.local_name(), verified_value.clone()),
+        );
+
+        // Step 3. Let oldAttr be the result of getting an attribute given attr’s namespace, attr’s local name, and element.
+        let position = self.attrs.borrow().iter().position(|old_attr| {
+            attr.namespace() == old_attr.namespace() && attr.local_name() == old_attr.local_name()
+        });
+
+        let old_attr = if let Some(position) = position {
+            let old_attr = DomRoot::from_ref(&*self.attrs.borrow()[position]);
+
+            // Step 4. If oldAttr is attr, return attr.
+            if &*old_attr == attr {
+                return Ok(Some(DomRoot::from_ref(attr)));
+            }
+
+            // Step 6. If oldAttr is non-null, then replace oldAttr with attr.
+            //
+            // Start of steps for https://dom.spec.whatwg.org/#concept-element-attributes-replace
+
+            // Step 1. Let element be oldAttribute’s element.
+            //
+            // Skipped, as that points to self.
+
+            // Step 2. Replace oldAttribute by newAttribute in element’s attribute list.
+            self.will_mutate_attr(attr);
+            self.attrs.borrow_mut()[position] = Dom::from_ref(attr);
+            // Step 3. Set newAttribute’s element to element.
+            attr.set_owner(Some(self));
+            // Step 4. Set newAttribute’s node document to element’s node document.
+            attr.upcast::<Node>().set_owner_doc(&self.node.owner_doc());
+            // Step 5. Set oldAttribute’s element to null.
+            old_attr.set_owner(None);
+            // Step 6. Handle attribute changes for oldAttribute with element, oldAttribute’s value, and newAttribute’s value.
+            self.handle_attribute_changes(
+                attr,
+                Some(&old_attr.value()),
+                Some(verified_value),
+                can_gc,
+            );
+
+            Some(old_attr)
+        } else {
+            // Step 7. Otherwise, append attr to element.
+            attr.set_owner(Some(self));
+            attr.upcast::<Node>().set_owner_doc(&self.node.owner_doc());
+            self.push_attribute(attr, can_gc);
+
+            None
+        };
+
+        // Step 8. Return oldAttr.
+        Ok(old_attr)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#nonce-attributes>
@@ -2298,7 +2911,8 @@ impl Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scroll
-    pub(crate) fn scroll(&self, x_: f64, y_: f64, behavior: ScrollBehavior, can_gc: CanGc) {
+    // TODO(stevennovaryo): Need to update the scroll API to follow the spec since it is quite outdated.
+    pub(crate) fn scroll(&self, x_: f64, y_: f64, behavior: ScrollBehavior) {
         // Step 1.2 or 2.3
         let x = if x_.is_finite() { x_ } else { 0.0f64 };
         let y = if y_.is_finite() { y_ } else { 0.0f64 };
@@ -2322,7 +2936,7 @@ impl Element {
         // Step 7
         if *self.root_element() == *self {
             if doc.quirks_mode() != QuirksMode::Quirks {
-                win.scroll(x, y, behavior, can_gc);
+                win.scroll(x, y, behavior);
             }
 
             return;
@@ -2331,22 +2945,19 @@ impl Element {
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body(can_gc)
+            !self.is_potentially_scrollable_body()
         {
-            win.scroll(x, y, behavior, can_gc);
+            win.scroll(x, y, behavior);
             return;
         }
 
         // Step 10
-        if !self.has_css_layout_box(can_gc) ||
-            !self.has_scrolling_box(can_gc) ||
-            !self.has_overflow(can_gc)
-        {
+        if !self.has_css_layout_box() || !self.has_scrolling_box() || !self.has_overflow() {
             return;
         }
 
         // Step 11
-        win.scroll_node(node, x, y, behavior, can_gc);
+        win.scroll_an_element(self, x, y, behavior);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#fragment-parsing-algorithm-steps>
@@ -2380,6 +2991,7 @@ impl Element {
     }
 
     /// Step 4 of <https://html.spec.whatwg.org/multipage/#dom-element-insertadjacenthtml>
+    /// and step 6. of <https://html.spec.whatwg.org/multipage/#dom-range-createcontextualfragment>
     pub(crate) fn fragment_parsing_context(
         owner_doc: &Document,
         element: Option<&Self>,
@@ -2473,8 +3085,8 @@ impl Element {
                 HTMLElementTypeId::HTMLAnchorElement,
             )) => element.has_attribute(&local_name!("href")),
 
-            //TODO focusable if editing host
-            //TODO focusable if "sorting interface th elements"
+            // TODO focusable if editing host
+            // TODO focusable if "sorting interface th elements"
             _ => {
                 // Draggable elements are focusable.
                 element.get_string_attribute(&local_name!("draggable")) == "true"
@@ -2517,8 +3129,17 @@ impl Element {
             TrustedHTMLOrNullIsEmptyString::TrustedHTML(_) => unreachable!(),
         }
     }
+
+    pub(crate) fn compute_source_position(&self, line_number: u32) -> SourcePosition {
+        SourcePosition {
+            source_file: self.owner_global().get_url().to_string(),
+            line_number: line_number + 2,
+            column_number: 0,
+        }
+    }
 }
 
+#[allow(non_snake_case)]
 impl ElementMethods<crate::DomTypeHolder> for Element {
     // https://dom.spec.whatwg.org/#dom-element-namespaceuri
     fn GetNamespaceURI(&self) -> Option<DOMString> {
@@ -2639,8 +3260,9 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         force: Option<bool>,
         can_gc: CanGc,
     ) -> Fallible<bool> {
-        // Step 1.
-        if !matches_name_production(&name) {
+        // Step 1. If qualifiedName is not a valid attribute local name,
+        //      then throw an "InvalidCharacterError" DOMException.
+        if !is_valid_attribute_local_name(&name) {
             return Err(Error::InvalidCharacter);
         }
 
@@ -2681,17 +3303,39 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
     }
 
     /// <https://dom.spec.whatwg.org/#dom-element-setattribute>
-    fn SetAttribute(&self, name: DOMString, value: DOMString, can_gc: CanGc) -> ErrorResult {
+    fn SetAttribute(
+        &self,
+        name: DOMString,
+        value: TrustedTypeOrString,
+        can_gc: CanGc,
+    ) -> ErrorResult {
         // Step 1. If qualifiedName does not match the Name production in XML,
         // then throw an "InvalidCharacterError" DOMException.
-        if !matches_name_production(&name) {
+        if !is_valid_attribute_local_name(&name) {
             return Err(Error::InvalidCharacter);
         }
 
-        // Step 2.
+        // Step 2. If this is in the HTML namespace and its node document is an HTML document,
+        // then set qualifiedName to qualifiedName in ASCII lowercase.
         let name = self.parsed_name(name);
 
-        // Step 3-5.
+        // Step 3. Let verifiedValue be the result of calling get
+        // Trusted Types-compliant attribute value with qualifiedName, null,
+        // this, and value. [TRUSTED-TYPES]
+        let value = TrustedTypePolicyFactory::get_trusted_types_compliant_attribute_value(
+            self.namespace(),
+            self.local_name(),
+            &name,
+            None,
+            value,
+            &self.owner_global(),
+            can_gc,
+        )?;
+
+        // Step 4. Let attribute be the first attribute in this’s attribute list whose qualified name is qualifiedName, and null otherwise.
+        // Step 5. If attribute is null, create an attribute whose local name is qualifiedName, value is verifiedValue, and node document
+        // is this’s node document, then append this attribute to this, and then return.
+        // Step 6. Change attribute to verifiedValue.
         let value = self.parse_attribute(&ns!(), &name, value);
         self.set_first_matching_attribute(
             name.clone(),
@@ -2710,16 +3354,29 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         &self,
         namespace: Option<DOMString>,
         qualified_name: DOMString,
-        value: DOMString,
+        value: TrustedTypeOrString,
         can_gc: CanGc,
     ) -> ErrorResult {
-        let (namespace, prefix, local_name) = validate_and_extract(namespace, &qualified_name)?;
-        let qualified_name = LocalName::from(qualified_name);
+        // Step 1. Let namespace, prefix, and localName be the result of passing namespace and qualifiedName to validate and extract.
+        let (namespace, prefix, local_name) =
+            domname::validate_and_extract(namespace, &qualified_name, domname::Context::Element)?;
+        // Step 2. Let verifiedValue be the result of calling get
+        // Trusted Types-compliant attribute value with localName, namespace, element, and value. [TRUSTED-TYPES]
+        let value = TrustedTypePolicyFactory::get_trusted_types_compliant_attribute_value(
+            self.namespace(),
+            self.local_name(),
+            &local_name,
+            Some(&namespace),
+            value,
+            &self.owner_global(),
+            can_gc,
+        )?;
+        // Step 3. Set an attribute value for this using localName, verifiedValue, and also prefix and namespace.
         let value = self.parse_attribute(&namespace, &local_name, value);
         self.set_first_matching_attribute(
             local_name.clone(),
             value,
-            qualified_name,
+            LocalName::from(qualified_name),
             namespace.clone(),
             prefix,
             |attr| *attr.local_name() == local_name && *attr.namespace() == namespace,
@@ -2730,74 +3387,12 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
 
     // https://dom.spec.whatwg.org/#dom-element-setattributenode
     fn SetAttributeNode(&self, attr: &Attr, can_gc: CanGc) -> Fallible<Option<DomRoot<Attr>>> {
-        // Step 1.
-        if let Some(owner) = attr.GetOwnerElement() {
-            if &*owner != self {
-                return Err(Error::InUseAttribute);
-            }
-        }
-
-        let vtable = vtable_for(self.upcast());
-
-        // This ensures that the attribute is of the expected kind for this
-        // specific element. This is inefficient and should probably be done
-        // differently.
-        attr.swap_value(&mut vtable.parse_plain_attribute(attr.local_name(), attr.Value()));
-
-        // Step 2.
-        let position = self.attrs.borrow().iter().position(|old_attr| {
-            attr.namespace() == old_attr.namespace() && attr.local_name() == old_attr.local_name()
-        });
-
-        if let Some(position) = position {
-            let old_attr = DomRoot::from_ref(&*self.attrs.borrow()[position]);
-
-            // Step 3.
-            if &*old_attr == attr {
-                return Ok(Some(DomRoot::from_ref(attr)));
-            }
-
-            // Step 4.
-            if self.is_custom() {
-                let old_name = old_attr.local_name().clone();
-                let old_value = DOMString::from(&**old_attr.value());
-                let new_value = DOMString::from(&**attr.value());
-                let namespace = old_attr.namespace().clone();
-                let reaction = CallbackReaction::AttributeChanged(
-                    old_name,
-                    Some(old_value),
-                    Some(new_value),
-                    namespace,
-                );
-                ScriptThread::enqueue_callback_reaction(self, reaction, None);
-            }
-            self.will_mutate_attr(attr);
-            attr.set_owner(Some(self));
-            self.attrs.borrow_mut()[position] = Dom::from_ref(attr);
-            old_attr.set_owner(None);
-            if is_relevant_attribute(attr.namespace(), attr.local_name()) {
-                vtable.attribute_mutated(
-                    attr,
-                    AttributeMutation::Set(Some(&old_attr.value())),
-                    can_gc,
-                );
-            }
-
-            // Step 6.
-            Ok(Some(old_attr))
-        } else {
-            // Step 5.
-            attr.set_owner(Some(self));
-            self.push_attribute(attr, can_gc);
-
-            // Step 6.
-            Ok(None)
-        }
+        self.set_attribute_node(attr, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-setattributenodens
     fn SetAttributeNodeNS(&self, attr: &Attr, can_gc: CanGc) -> Fallible<Option<DomRoot<Attr>>> {
-        self.SetAttributeNode(attr, can_gc)
+        self.set_attribute_node(attr, can_gc)
     }
 
     // https://dom.spec.whatwg.org/#dom-element-removeattribute
@@ -2865,7 +3460,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
     // https://drafts.csswg.org/cssom-view/#dom-element-getclientrects
     fn GetClientRects(&self, can_gc: CanGc) -> DomRoot<DOMRectList> {
         let win = self.owner_window();
-        let raw_rects = self.upcast::<Node>().content_boxes(can_gc);
+        let raw_rects = self.upcast::<Node>().border_boxes();
         let rects: Vec<DomRoot<DOMRect>> = raw_rects
             .iter()
             .map(|rect| {
@@ -2885,7 +3480,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
     // https://drafts.csswg.org/cssom-view/#dom-element-getboundingclientrect
     fn GetBoundingClientRect(&self, can_gc: CanGc) -> DomRoot<DOMRect> {
         let win = self.owner_window();
-        let rect = self.upcast::<Node>().bounding_content_box_or_zero(can_gc);
+        let rect = self.upcast::<Node>().border_box().unwrap_or_default();
         DOMRect::new(
             win.upcast(),
             rect.origin.x.to_f64_px(),
@@ -2897,52 +3492,47 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scroll
-    fn Scroll(&self, options: &ScrollToOptions, can_gc: CanGc) {
+    fn Scroll(&self, options: &ScrollToOptions) {
         // Step 1
-        let left = options.left.unwrap_or(self.ScrollLeft(can_gc));
-        let top = options.top.unwrap_or(self.ScrollTop(can_gc));
-        self.scroll(left, top, options.parent.behavior, can_gc);
+        let left = options.left.unwrap_or(self.ScrollLeft());
+        let top = options.top.unwrap_or(self.ScrollTop());
+        self.scroll(left, top, options.parent.behavior);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scroll
-    fn Scroll_(&self, x: f64, y: f64, can_gc: CanGc) {
-        self.scroll(x, y, ScrollBehavior::Auto, can_gc);
+    fn Scroll_(&self, x: f64, y: f64) {
+        self.scroll(x, y, ScrollBehavior::Auto);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollto
-    fn ScrollTo(&self, options: &ScrollToOptions, can_gc: CanGc) {
-        self.Scroll(options, can_gc);
+    fn ScrollTo(&self, options: &ScrollToOptions) {
+        self.Scroll(options);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollto
-    fn ScrollTo_(&self, x: f64, y: f64, can_gc: CanGc) {
-        self.Scroll_(x, y, can_gc);
+    fn ScrollTo_(&self, x: f64, y: f64) {
+        self.Scroll_(x, y);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollby
-    fn ScrollBy(&self, options: &ScrollToOptions, can_gc: CanGc) {
+    fn ScrollBy(&self, options: &ScrollToOptions) {
         // Step 2
         let delta_left = options.left.unwrap_or(0.0f64);
         let delta_top = options.top.unwrap_or(0.0f64);
-        let left = self.ScrollLeft(can_gc);
-        let top = self.ScrollTop(can_gc);
-        self.scroll(
-            left + delta_left,
-            top + delta_top,
-            options.parent.behavior,
-            can_gc,
-        );
+        let left = self.ScrollLeft();
+        let top = self.ScrollTop();
+        self.scroll(left + delta_left, top + delta_top, options.parent.behavior);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollby
-    fn ScrollBy_(&self, x: f64, y: f64, can_gc: CanGc) {
-        let left = self.ScrollLeft(can_gc);
-        let top = self.ScrollTop(can_gc);
-        self.scroll(left + x, top + y, ScrollBehavior::Auto, can_gc);
+    fn ScrollBy_(&self, x: f64, y: f64) {
+        let left = self.ScrollLeft();
+        let top = self.ScrollTop();
+        self.scroll(left + x, top + y, ScrollBehavior::Auto);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
-    fn ScrollTop(&self, can_gc: CanGc) -> f64 {
+    fn ScrollTop(&self) -> f64 {
         let node = self.upcast::<Node>();
 
         // Step 1
@@ -2972,23 +3562,24 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         // Step 7
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body(can_gc)
+            !self.is_potentially_scrollable_body()
         {
             return win.ScrollY() as f64;
         }
 
         // Step 8
-        if !self.has_css_layout_box(can_gc) {
+        if !self.has_css_layout_box() {
             return 0.0;
         }
 
         // Step 9
-        let point = node.scroll_offset();
+        let point = win.scroll_offset_query(node);
         point.y.abs() as f64
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
-    fn SetScrollTop(&self, y_: f64, can_gc: CanGc) {
+    // TODO(stevennovaryo): Need to update the scroll API to follow the spec since it is quite outdated.
+    fn SetScrollTop(&self, y_: f64) {
         let behavior = ScrollBehavior::Auto;
 
         // Step 1, 2
@@ -3013,7 +3604,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         // Step 7
         if *self.root_element() == *self {
             if doc.quirks_mode() != QuirksMode::Quirks {
-                win.scroll(win.ScrollX() as f64, y, behavior, can_gc);
+                win.scroll(win.ScrollX() as f64, y, behavior);
             }
 
             return;
@@ -3022,26 +3613,23 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body(can_gc)
+            !self.is_potentially_scrollable_body()
         {
-            win.scroll(win.ScrollX() as f64, y, behavior, can_gc);
+            win.scroll(win.ScrollX() as f64, y, behavior);
             return;
         }
 
         // Step 10
-        if !self.has_css_layout_box(can_gc) ||
-            !self.has_scrolling_box(can_gc) ||
-            !self.has_overflow(can_gc)
-        {
+        if !self.has_css_layout_box() || !self.has_scrolling_box() || !self.has_overflow() {
             return;
         }
 
         // Step 11
-        win.scroll_node(node, self.ScrollLeft(can_gc), y, behavior, can_gc);
+        win.scroll_an_element(self, self.ScrollLeft(), y, behavior);
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-element-scrolltop
-    fn ScrollLeft(&self, can_gc: CanGc) -> f64 {
+    // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
+    fn ScrollLeft(&self) -> f64 {
         let node = self.upcast::<Node>();
 
         // Step 1
@@ -3071,23 +3659,23 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         // Step 7
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body(can_gc)
+            !self.is_potentially_scrollable_body()
         {
             return win.ScrollX() as f64;
         }
 
         // Step 8
-        if !self.has_css_layout_box(can_gc) {
+        if !self.has_css_layout_box() {
             return 0.0;
         }
 
         // Step 9
-        let point = node.scroll_offset();
+        let point = win.scroll_offset_query(node);
         point.x.abs() as f64
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollleft
-    fn SetScrollLeft(&self, x_: f64, can_gc: CanGc) {
+    fn SetScrollLeft(&self, x_: f64) {
         let behavior = ScrollBehavior::Auto;
 
         // Step 1, 2
@@ -3115,59 +3703,102 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
                 return;
             }
 
-            win.scroll(x, win.ScrollY() as f64, behavior, can_gc);
+            win.scroll(x, win.ScrollY() as f64, behavior);
             return;
         }
 
         // Step 9
         if doc.GetBody().as_deref() == self.downcast::<HTMLElement>() &&
             doc.quirks_mode() == QuirksMode::Quirks &&
-            !self.is_potentially_scrollable_body(can_gc)
+            !self.is_potentially_scrollable_body()
         {
-            win.scroll(x, win.ScrollY() as f64, behavior, can_gc);
+            win.scroll(x, win.ScrollY() as f64, behavior);
             return;
         }
 
         // Step 10
-        if !self.has_css_layout_box(can_gc) ||
-            !self.has_scrolling_box(can_gc) ||
-            !self.has_overflow(can_gc)
-        {
+        if !self.has_css_layout_box() || !self.has_scrolling_box() || !self.has_overflow() {
             return;
         }
 
         // Step 11
-        win.scroll_node(node, x, self.ScrollTop(can_gc), behavior, can_gc);
+        win.scroll_an_element(self, x, self.ScrollTop(), behavior);
+    }
+
+    /// <https://drafts.csswg.org/cssom-view/#dom-element-scrollintoview>
+    fn ScrollIntoView(&self, arg: BooleanOrScrollIntoViewOptions) {
+        let (behavior, block, inline, container) = match arg {
+            // If arg is true:
+            BooleanOrScrollIntoViewOptions::Boolean(true) => (
+                ScrollBehavior::Auto,           // Step 1: Let behavior be "auto".
+                ScrollLogicalPosition::Start,   // Step 2: Let block be "start".
+                ScrollLogicalPosition::Nearest, // Step 3: Let inline be "nearest".
+                None,                           // Step 4: Let container be null.
+            ),
+            // Step 5: If arg is a ScrollIntoViewOptions dictionary, set its properties
+            // to the corresponding values in the dictionary.
+            BooleanOrScrollIntoViewOptions::ScrollIntoViewOptions(options) => (
+                options.parent.behavior,
+                options.block,
+                options.inline,
+                // Step 5.4: If the container dictionary member of options is "nearest",
+                // set container to the element.
+                if options.container == ScrollIntoViewContainer::Nearest {
+                    Some(self)
+                } else {
+                    None
+                },
+            ),
+            // Step 6: Otherwise, if arg is false, then set block to "end".
+            BooleanOrScrollIntoViewOptions::Boolean(false) => (
+                ScrollBehavior::Auto,
+                ScrollLogicalPosition::End,
+                ScrollLogicalPosition::Nearest,
+                None,
+            ),
+        };
+
+        // Step 7: If the element does not have any associated box, or is not
+        // available to user-agent features, then return.
+        if !self.has_css_layout_box() {
+            return;
+        }
+
+        // Step 8: Scroll the element into view with behavior, block, inline, and container.
+        self.scroll_into_view_with_options(behavior, block, inline, container);
+
+        // Step 9: Optionally perform some other action that brings the
+        // element to the user’s attention.
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollwidth
-    fn ScrollWidth(&self, can_gc: CanGc) -> i32 {
-        self.upcast::<Node>().scroll_area(can_gc).size.width
+    fn ScrollWidth(&self) -> i32 {
+        self.upcast::<Node>().scroll_area().size.width
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-scrollheight
-    fn ScrollHeight(&self, can_gc: CanGc) -> i32 {
-        self.upcast::<Node>().scroll_area(can_gc).size.height
+    fn ScrollHeight(&self) -> i32 {
+        self.upcast::<Node>().scroll_area().size.height
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clienttop
-    fn ClientTop(&self, can_gc: CanGc) -> i32 {
-        self.client_rect(can_gc).origin.y
+    fn ClientTop(&self) -> i32 {
+        self.client_rect().origin.y
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientleft
-    fn ClientLeft(&self, can_gc: CanGc) -> i32 {
-        self.client_rect(can_gc).origin.x
+    fn ClientLeft(&self) -> i32 {
+        self.client_rect().origin.x
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientwidth
-    fn ClientWidth(&self, can_gc: CanGc) -> i32 {
-        self.client_rect(can_gc).size.width
+    fn ClientWidth(&self) -> i32 {
+        self.client_rect().size.width
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-element-clientheight
-    fn ClientHeight(&self, can_gc: CanGc) -> i32 {
-        self.client_rect(can_gc).size.height
+    fn ClientHeight(&self) -> i32 {
+        self.client_rect().size.height
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-element-sethtmlunsafe>
@@ -3175,13 +3806,12 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         // Step 1. Let compliantHTML be the result of invoking the
         // Get Trusted Type compliant string algorithm with TrustedHTML,
         // this's relevant global object, html, "Element setHTMLUnsafe", and "script".
-        let html = DOMString::from(TrustedHTML::get_trusted_script_compliant_string(
+        let html = TrustedHTML::get_trusted_script_compliant_string(
             &self.owner_global(),
             html,
-            "Element",
-            "setHTMLUnsafe",
+            "Element setHTMLUnsafe",
             can_gc,
-        )?);
+        )?;
         // Step 2. Let target be this's template contents if this is a template element; otherwise this.
         let target = if let Some(template) = self.downcast::<HTMLTemplateElement>() {
             DomRoot::upcast(template.Content(can_gc))
@@ -3221,7 +3851,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
                 .html_serialize(ChildrenOnly(Some(qname)), false, vec![], can_gc)
         } else {
             self.upcast::<Node>()
-                .xml_serialize(XmlChildrenOnly(Some(qname)))
+                .xml_serialize(XmlChildrenOnly(Some(qname)))?
         };
 
         Ok(TrustedHTMLOrNullIsEmptyString::NullIsEmptyString(result))
@@ -3232,13 +3862,12 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         // Step 1: Let compliantString be the result of invoking the
         // Get Trusted Type compliant string algorithm with TrustedHTML,
         // this's relevant global object, the given value, "Element innerHTML", and "script".
-        let value = DOMString::from(TrustedHTML::get_trusted_script_compliant_string(
+        let value = TrustedHTML::get_trusted_script_compliant_string(
             &self.owner_global(),
             value.convert(),
-            "Element",
-            "innerHTML",
+            "Element innerHTML",
             can_gc,
-        )?);
+        )?;
         // https://github.com/w3c/DOM-Parsing/issues/1
         let target = if let Some(template) = self.downcast::<HTMLTemplateElement>() {
             // Step 4: If context is a template element, then set context to
@@ -3258,8 +3887,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
                 .iter()
                 .any(|c| matches!(*c, b'&' | b'\0' | b'<' | b'\r'))
         {
-            Node::SetTextContent(&target, Some(value), can_gc);
-            return Ok(());
+            return Node::SetTextContent(&target, Some(value), can_gc);
         }
 
         // Step 3: Let fragment be the result of invoking the fragment parsing algorithm steps
@@ -3279,7 +3907,7 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
             self.upcast::<Node>()
                 .html_serialize(IncludeNode, false, vec![], can_gc)
         } else {
-            self.upcast::<Node>().xml_serialize(XmlIncludeNode)
+            self.upcast::<Node>().xml_serialize(XmlIncludeNode)?
         };
 
         Ok(TrustedHTMLOrNullIsEmptyString::NullIsEmptyString(result))
@@ -3290,13 +3918,12 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         // Step 1: Let compliantString be the result of invoking the
         // Get Trusted Type compliant string algorithm with TrustedHTML,
         // this's relevant global object, the given value, "Element outerHTML", and "script".
-        let value = DOMString::from(TrustedHTML::get_trusted_script_compliant_string(
+        let value = TrustedHTML::get_trusted_script_compliant_string(
             &self.owner_global(),
             value.convert(),
-            "Element",
-            "outerHTML",
+            "Element outerHTML",
             can_gc,
-        )?);
+        )?;
         let context_document = self.owner_document();
         let context_node = self.upcast::<Node>();
         // Step 2: Let parent be this's parent.
@@ -3506,13 +4133,12 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         // Step 1: Let compliantString be the result of invoking the
         // Get Trusted Type compliant string algorithm with TrustedHTML,
         // this's relevant global object, string, "Element insertAdjacentHTML", and "script".
-        let text = DOMString::from(TrustedHTML::get_trusted_script_compliant_string(
+        let text = TrustedHTML::get_trusted_script_compliant_string(
             &self.owner_global(),
             text,
-            "Element",
-            "insertAdjacentHTML",
+            "Element insertAdjacentHTML",
             can_gc,
-        )?);
+        )?;
         let position = position.parse::<AdjacentPosition>()?;
 
         // Step 2: Let context be null.
@@ -3980,6 +4606,13 @@ impl ElementMethods<crate::DomTypeHolder> for Element {
         rooted!(in(*cx) let slottable = Slottable(Dom::from_ref(self.upcast::<Node>())));
         slottable.find_a_slot(true)
     }
+
+    /// <https://drafts.csswg.org/css-shadow-parts/#dom-element-part>
+    fn Part(&self) -> DomRoot<DOMTokenList> {
+        self.ensure_rare_data()
+            .part
+            .or_init(|| DOMTokenList::new(self, &local_name!("part"), None, CanGc::note()))
+    }
 }
 
 impl VirtualMethods for Element {
@@ -4013,11 +4646,14 @@ impl VirtualMethods for Element {
             },
             &local_name!("style") => self.update_style_attribute(attr, mutation),
             &local_name!("id") => {
+                // https://dom.spec.whatwg.org/#ref-for-concept-element-attributes-change-ext%E2%91%A2
                 *self.id_attribute.borrow_mut() = mutation.new_value(attr).and_then(|value| {
                     let value = value.as_atom();
                     if value != &atom!("") {
+                        // Step 2. Otherwise, if localName is id, namespace is null, then set element’s ID to value.
                         Some(value.clone())
                     } else {
+                        // Step 1. If localName is id, namespace is null, and value is null or the empty string, then unset element’s ID.
                         None
                     }
                 });
@@ -4104,7 +4740,7 @@ impl VirtualMethods for Element {
                 // FIXME(emilio): This is pretty dubious, and should be done in
                 // the relevant super-classes.
                 if attr.namespace() == &ns!() && attr.local_name() == &local_name!("src") {
-                    node.dirty(NodeDamage::OtherNodeDamage);
+                    node.dirty(NodeDamage::Other);
                 }
             },
         };
@@ -4119,7 +4755,10 @@ impl VirtualMethods for Element {
         match *name {
             local_name!("id") => AttrValue::from_atomic(value.into()),
             local_name!("name") => AttrValue::from_atomic(value.into()),
-            local_name!("class") => AttrValue::from_serialized_tokenlist(value.into()),
+            local_name!("class") | local_name!("part") => {
+                AttrValue::from_serialized_tokenlist(value.into())
+            },
+            local_name!("exportparts") => AttrValue::from_shadow_parts(value.into()),
             _ => self
                 .super_type()
                 .unwrap()
@@ -4215,20 +4854,20 @@ impl VirtualMethods for Element {
         let flags = self.selector_flags.get();
         if flags.intersects(ElementSelectorFlags::HAS_SLOW_SELECTOR) {
             // All children of this node need to be restyled when any child changes.
-            self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+            self.upcast::<Node>().dirty(NodeDamage::Other);
         } else {
             if flags.intersects(ElementSelectorFlags::HAS_SLOW_SELECTOR_LATER_SIBLINGS) {
                 if let Some(next_child) = mutation.next_child() {
                     for child in next_child.inclusively_following_siblings() {
                         if child.is::<Element>() {
-                            child.dirty(NodeDamage::OtherNodeDamage);
+                            child.dirty(NodeDamage::Other);
                         }
                     }
                 }
             }
             if flags.intersects(ElementSelectorFlags::HAS_EDGE_CHILD_SELECTOR) {
                 if let Some(child) = mutation.modified_edge_element() {
-                    child.dirty(NodeDamage::OtherNodeDamage);
+                    child.dirty(NodeDamage::Other);
                 }
             }
         }
@@ -4430,7 +5069,9 @@ impl SelectorsElement for SelectorWrapper<'_> {
             // a string containing commas (separating each language tag in
             // a list) but the pseudo-class instead should be parsing and
             // storing separate <ident> or <string>s for each language tag.
-            NonTSPseudoClass::Lang(ref lang) => extended_filtering(&self.get_lang(), lang),
+            NonTSPseudoClass::Lang(ref lang) => {
+                extended_filtering(&self.upcast::<Node>().get_lang().unwrap_or_default(), lang)
+            },
 
             NonTSPseudoClass::ReadOnly => {
                 !Element::state(self).contains(NonTSPseudoClass::ReadWrite.state_flag())
@@ -4491,8 +5132,8 @@ impl SelectorsElement for SelectorWrapper<'_> {
             .is_some_and(|atom| case_sensitivity.eq_atom(id, atom))
     }
 
-    fn is_part(&self, _name: &AtomIdent) -> bool {
-        false
+    fn is_part(&self, name: &AtomIdent) -> bool {
+        Element::is_part(self, name, CaseSensitivity::CaseSensitive)
     }
 
     fn imported_part(&self, _: &AtomIdent) -> Option<AtomIdent> {
@@ -4565,13 +5206,25 @@ impl SelectorsElement for SelectorWrapper<'_> {
         true
     }
 
-    fn has_custom_state(&self, _name: &AtomIdent) -> bool {
-        false
+    fn has_custom_state(&self, name: &AtomIdent) -> bool {
+        let mut has_state = false;
+        self.each_custom_state(|state| has_state |= state == name);
+
+        has_state
     }
 }
 
 impl Element {
-    fn client_rect(&self, can_gc: CanGc) -> Rect<i32> {
+    fn each_custom_state<F>(&self, callback: F)
+    where
+        F: FnMut(&AtomIdent),
+    {
+        self.get_element_internals()
+            .and_then(|internals| internals.custom_states())
+            .inspect(|states| states.for_each_state(callback));
+    }
+
+    fn client_rect(&self) -> Rect<i32> {
         let doc = self.node.owner_doc();
 
         if let Some(rect) = self
@@ -4580,15 +5233,12 @@ impl Element {
             .and_then(|data| data.client_rect.as_ref())
             .and_then(|rect| rect.get().ok())
         {
-            if matches!(
-                doc.needs_reflow(),
-                None | Some(ReflowTriggerCondition::PaintPostponed)
-            ) {
+            if doc.restyle_reason().is_empty() {
                 return rect;
             }
         }
 
-        let mut rect = self.upcast::<Node>().client_rect(can_gc);
+        let mut rect = self.upcast::<Node>().client_rect();
         let in_quirks_mode = doc.quirks_mode() == QuirksMode::Quirks;
 
         if (in_quirks_mode && doc.GetBody().as_deref() == self.downcast::<HTMLElement>()) ||
@@ -4663,7 +5313,7 @@ impl Element {
 
     // https://html.spec.whatwg.org/multipage/#category-submit
     pub(crate) fn as_maybe_validatable(&self) -> Option<&dyn Validatable> {
-        let element = match self.upcast::<Node>().type_id() {
+        match self.upcast::<Node>().type_id() {
             NodeTypeId::Element(ElementTypeId::HTMLElement(
                 HTMLElementTypeId::HTMLInputElement,
             )) => {
@@ -4707,8 +5357,7 @@ impl Element {
                 Some(element as &dyn Validatable)
             },
             _ => None,
-        };
-        element
+        }
     }
 
     pub(crate) fn is_invalid(&self, needs_update: bool, can_gc: CanGc) -> bool {
@@ -4770,24 +5419,7 @@ impl Element {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#language
-    pub(crate) fn get_lang(&self) -> String {
-        self.upcast::<Node>()
-            .inclusive_ancestors(ShadowIncluding::Yes)
-            .filter_map(|node| {
-                node.downcast::<Element>().and_then(|el| {
-                    el.get_attribute(&ns!(xml), &local_name!("lang"))
-                        .or_else(|| el.get_attribute(&ns!(), &local_name!("lang")))
-                        .map(|attr| String::from(attr.Value()))
-                })
-                // TODO: Check meta tags for a pragma-set default language
-                // TODO: Check HTTP Content-Language header
-            })
-            .next()
-            .unwrap_or(String::new())
-    }
-
-    pub(crate) fn state(&self) -> ElementState {
+    pub fn state(&self) -> ElementState {
         self.state.get()
     }
 
@@ -4824,8 +5456,8 @@ impl Element {
     }
 
     pub(crate) fn set_focus_state(&self, value: bool) {
+        self.upcast::<Node>().dirty(NodeDamage::Other);
         self.set_state(ElementState::FOCUS, value);
-        self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
     }
 
     pub(crate) fn hover_state(&self) -> bool {
@@ -4867,7 +5499,7 @@ impl Element {
     pub(crate) fn set_placeholder_shown_state(&self, value: bool) {
         if self.placeholder_shown_state() != value {
             self.set_state(ElementState::PLACEHOLDER_SHOWN, value);
-            self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+            self.upcast::<Node>().dirty(NodeDamage::Other);
         }
     }
 

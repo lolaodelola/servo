@@ -4,12 +4,13 @@
 
 use std::convert::TryFrom;
 use std::ptr::{self, NonNull};
-use std::{io, slice};
+use std::slice;
 
 use devtools_traits::{
     ConsoleMessage, ConsoleMessageArgument, ConsoleMessageBuilder, LogLevel,
     ScriptToDevtoolsControlMsg, StackFrame,
 };
+use js::conversions::jsstr_to_string;
 use js::jsapi::{self, ESClass, PropertyDescriptor};
 use js::jsval::{Int32Value, UndefinedValue};
 use js::rust::wrappers::{
@@ -22,7 +23,6 @@ use js::rust::{
 use script_bindings::conversions::get_dom_class;
 
 use crate::dom::bindings::codegen::Bindings::ConsoleBinding::consoleMethods;
-use crate::dom::bindings::conversions::jsstring_to_str;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
@@ -47,8 +47,13 @@ impl Console {
         ConsoleMessageBuilder::new(level, caller.filename, caller.line, caller.col)
     }
 
-    /// Helper to send a message that only consists of a single string to the devtools
+    /// Helper to send a message that only consists of a single string to log,
+    /// console and stdout
     fn send_string_message(global: &GlobalScope, level: LogLevel, message: String) {
+        let s = DOMString::from(message.clone());
+        log!(level.clone().into(), "{}", &s);
+        console_message_to_stdout(global, &s);
+
         let mut builder = Self::build_message(level);
         builder.add_argument(message.into());
         let log_message = builder.finish();
@@ -64,7 +69,7 @@ impl Console {
     ) {
         let cx = GlobalScope::get_cx();
 
-        let mut log: ConsoleMessageBuilder = Console::build_message(level);
+        let mut log: ConsoleMessageBuilder = Console::build_message(level.clone());
         for message in &messages {
             log.add_argument(console_argument_from_handle_value(cx, *message));
         }
@@ -75,8 +80,12 @@ impl Console {
 
         Console::send_to_devtools(global, log.finish());
 
+        let msgs = stringify_handle_values(&messages);
         // Also log messages to stdout
-        console_messages(global, messages)
+        console_message_to_stdout(global, &msgs);
+
+        // Also output to the logger which will be at script::dom::console
+        log!(level.into(), "{}", &msgs);
     }
 
     fn send_to_devtools(global: &GlobalScope, message: ConsoleMessage) {
@@ -93,7 +102,6 @@ impl Console {
     // Directly logs a DOMString, without processing the message
     pub(crate) fn internal_warn(global: &GlobalScope, message: DOMString) {
         Console::send_string_message(global, LogLevel::Warn, String::from(message.clone()));
-        console_message(global, message);
     }
 }
 
@@ -102,10 +110,12 @@ impl Console {
 // we're finished with stdout. Since the stderr lock is reentrant, there is
 // no risk of deadlock if the callback ends up trying to write to stderr for
 // any reason.
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
 fn with_stderr_lock<F>(f: F)
 where
     F: FnOnce(),
 {
+    use std::io;
     let stderr = io::stderr();
     let _handle = stderr.lock();
     f()
@@ -117,7 +127,7 @@ unsafe fn handle_value_to_string(cx: *mut jsapi::JSContext, value: HandleValue) 
     match std::ptr::NonNull::new(JS_ValueToSource(cx, value)) {
         Some(js_str) => {
             js_string.set(js_str.as_ptr());
-            jsstring_to_str(cx, js_str)
+            DOMString::from_string(jsstr_to_string(cx, js_str))
         },
         None => "<error converting value to string>".into(),
     }
@@ -130,8 +140,8 @@ fn console_argument_from_handle_value(
 ) -> ConsoleMessageArgument {
     if handle_value.is_string() {
         let js_string = ptr::NonNull::new(handle_value.to_string()).unwrap();
-        let dom_string = unsafe { jsstring_to_str(*cx, js_string) };
-        return ConsoleMessageArgument::String(dom_string.into());
+        let dom_string = unsafe { jsstr_to_string(*cx, js_string) };
+        return ConsoleMessageArgument::String(dom_string);
     }
 
     if handle_value.is_int32() {
@@ -154,7 +164,8 @@ fn stringify_handle_value(message: HandleValue) -> DOMString {
     let cx = GlobalScope::get_cx();
     unsafe {
         if message.is_string() {
-            return jsstring_to_str(*cx, std::ptr::NonNull::new(message.to_string()).unwrap());
+            let jsstr = std::ptr::NonNull::new(message.to_string()).unwrap();
+            return DOMString::from_string(jsstr_to_string(*cx, jsstr));
         }
         unsafe fn stringify_object_from_handle_value(
             cx: *mut jsapi::JSContext,
@@ -287,7 +298,7 @@ fn maybe_stringify_dom_object(cx: JSContext, value: HandleValue) -> Option<DOMSt
         return Some("<error converting DOM object to string>".into());
     };
     let class_name = unsafe {
-        jsstring_to_str(*cx, class_name)
+        jsstr_to_string(*cx, class_name)
             .replace("[object ", "")
             .replace("]", "")
     };
@@ -330,17 +341,20 @@ fn stringify_handle_values(messages: &[HandleValue]) -> DOMString {
     ))
 }
 
-fn console_messages(global: &GlobalScope, messages: Vec<HandleValue>) {
-    let message = stringify_handle_values(&messages);
-    console_message(global, message)
-}
-
-fn console_message(global: &GlobalScope, message: DOMString) {
-    with_stderr_lock(move || {
+/// On OHOS/ Android, stdout and stderr will be redirected to go
+/// to the logger. As `Console::method` and `Console::send_string_message`
+/// already forwards all messages to the logger with appropriate level
+/// this does not need to do anything for these targets.
+#[allow(unused_variables)]
+fn console_message_to_stdout(global: &GlobalScope, message: &DOMString) {
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+    {
         let prefix = global.current_group_label().unwrap_or_default();
-        let message = format!("{}{}", prefix, message);
-        println!("{}", message);
-    })
+        let formatted_message = format!("{}{}", prefix, message);
+        with_stderr_lock(move || {
+            println!("{}", formatted_message);
+        });
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -392,7 +406,6 @@ impl consoleMethods<crate::DomTypeHolder> for Console {
             let message = format!("Assertion failed: {}", stringify_handle_values(&messages));
 
             Console::send_string_message(global, LogLevel::Log, message.clone());
-            console_message(global, DOMString::from(message));
         }
     }
 
@@ -401,7 +414,6 @@ impl consoleMethods<crate::DomTypeHolder> for Console {
         if let Ok(()) = global.time(label.clone()) {
             let message = format!("{label}: timer started");
             Console::send_string_message(global, LogLevel::Log, message.clone());
-            console_message(global, DOMString::from(message));
         }
     }
 
@@ -411,7 +423,6 @@ impl consoleMethods<crate::DomTypeHolder> for Console {
             let message = format!("{label}: {delta}ms {}", stringify_handle_values(&data));
 
             Console::send_string_message(global, LogLevel::Log, message.clone());
-            console_message(global, DOMString::from(message));
         }
     }
 
@@ -421,7 +432,6 @@ impl consoleMethods<crate::DomTypeHolder> for Console {
             let message = format!("{label}: {delta}ms");
 
             Console::send_string_message(global, LogLevel::Log, message.clone());
-            console_message(global, DOMString::from(message));
         }
     }
 
@@ -446,7 +456,6 @@ impl consoleMethods<crate::DomTypeHolder> for Console {
         let message = format!("{label}: {count}");
 
         Console::send_string_message(global, LogLevel::Log, message.clone());
-        console_message(global, DOMString::from(message));
     }
 
     /// <https://console.spec.whatwg.org/#countreset>
@@ -485,7 +494,7 @@ fn get_js_stack(cx: *mut jsapi::JSContext) -> Vec<StackFrame> {
             );
         }
         let function_name = if let Some(nonnull_result) = ptr::NonNull::new(*result) {
-            unsafe { jsstring_to_str(cx, nonnull_result) }.into()
+            unsafe { jsstr_to_string(cx, nonnull_result) }
         } else {
             "<anonymous>".into()
         };
@@ -502,7 +511,7 @@ fn get_js_stack(cx: *mut jsapi::JSContext) -> Vec<StackFrame> {
             );
         }
         let filename = if let Some(nonnull_result) = ptr::NonNull::new(*result) {
-            unsafe { jsstring_to_str(cx, nonnull_result) }.into()
+            unsafe { jsstr_to_string(cx, nonnull_result) }
         } else {
             "<anonymous>".into()
         };

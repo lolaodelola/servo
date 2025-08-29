@@ -4,7 +4,7 @@
 
 use geom::{FlexAxis, MainStartCrossStart};
 use malloc_size_of_derive::MallocSizeOf;
-use script::layout_dom::ServoLayoutNode;
+use script::layout_dom::ServoThreadSafeLayoutNode;
 use servo_arc::Arc as ServoArc;
 use style::context::SharedStyleContext;
 use style::logical_geometry::WritingMode;
@@ -22,7 +22,8 @@ use crate::context::LayoutContext;
 use crate::dom::LayoutBox;
 use crate::dom_traversal::{NodeAndStyleInfo, NonReplacedContents};
 use crate::formatting_contexts::IndependentFormattingContext;
-use crate::fragment_tree::{BaseFragmentInfo, Fragment};
+use crate::fragment_tree::BaseFragmentInfo;
+use crate::layout_box_base::LayoutBoxBase;
 use crate::positioned::AbsolutelyPositionedBox;
 
 mod geom;
@@ -113,13 +114,20 @@ impl FlexContainer {
             .into_iter()
             .map(|item| {
                 let box_ = match item.kind {
-                    ModernItemKind::InFlow => ArcRefCell::new(FlexLevelBox::FlexItem(
-                        FlexItemBox::new(item.formatting_context),
-                    )),
-                    ModernItemKind::OutOfFlow => {
-                        let abs_pos_box =
-                            ArcRefCell::new(AbsolutelyPositionedBox::new(item.formatting_context));
+                    ModernItemKind::InFlow(independent_formatting_context) => ArcRefCell::new(
+                        FlexLevelBox::FlexItem(FlexItemBox::new(independent_formatting_context)),
+                    ),
+                    ModernItemKind::OutOfFlow(independent_formatting_context) => {
+                        let abs_pos_box = ArcRefCell::new(AbsolutelyPositionedBox::new(
+                            independent_formatting_context,
+                        ));
                         ArcRefCell::new(FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(abs_pos_box))
+                    },
+                    ModernItemKind::ReusedBox(layout_box) => match layout_box {
+                        LayoutBox::FlexLevel(flex_level_box) => flex_level_box,
+                        _ => unreachable!(
+                            "Undamaged flex level element should be associated with flex level box"
+                        ),
                     },
                 };
 
@@ -144,6 +152,7 @@ impl FlexContainer {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, MallocSizeOf)]
 pub(crate) enum FlexLevelBox {
     FlexItem(FlexItemBox),
@@ -154,7 +163,7 @@ impl FlexLevelBox {
     pub(crate) fn repair_style(
         &mut self,
         context: &SharedStyleContext,
-        node: &ServoLayoutNode,
+        node: &ServoThreadSafeLayoutNode,
         new_style: &ServoArc<ComputedValues>,
     ) {
         match self {
@@ -168,28 +177,38 @@ impl FlexLevelBox {
         }
     }
 
-    pub(crate) fn invalidate_cached_fragment(&self) {
+    pub(crate) fn clear_fragment_layout_cache(&self) {
         match self {
             FlexLevelBox::FlexItem(flex_item_box) => flex_item_box
                 .independent_formatting_context
                 .base
-                .invalidate_cached_fragment(),
+                .clear_fragment_layout_cache(),
             FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => positioned_box
                 .borrow()
                 .context
                 .base
-                .invalidate_cached_fragment(),
+                .clear_fragment_layout_cache(),
         }
     }
 
-    pub(crate) fn fragments(&self) -> Vec<Fragment> {
+    pub(crate) fn with_base<T>(&self, callback: impl Fn(&LayoutBoxBase) -> T) -> T {
         match self {
-            FlexLevelBox::FlexItem(flex_item_box) => flex_item_box
-                .independent_formatting_context
-                .base
-                .fragments(),
+            FlexLevelBox::FlexItem(flex_item_box) => {
+                callback(&flex_item_box.independent_formatting_context.base)
+            },
             FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => {
-                positioned_box.borrow().context.base.fragments()
+                callback(&positioned_box.borrow().context.base)
+            },
+        }
+    }
+
+    pub(crate) fn with_base_mut<T>(&mut self, callback: impl Fn(&mut LayoutBoxBase) -> T) -> T {
+        match self {
+            FlexLevelBox::FlexItem(flex_item_box) => {
+                callback(&mut flex_item_box.independent_formatting_context.base)
+            },
+            FlexLevelBox::OutOfFlowAbsolutelyPositionedBox(positioned_box) => {
+                callback(&mut positioned_box.borrow_mut().context.base)
             },
         }
     }

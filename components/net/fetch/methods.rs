@@ -42,7 +42,10 @@ use super::fetch_params::FetchParams;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::headers::determine_nosniff;
 use crate::filemanager_thread::FileManager;
-use crate::http_loader::{HttpState, determine_requests_referrer, http_fetch, set_default_accept};
+use crate::http_loader::{
+    HttpState, determine_requests_referrer, http_fetch, send_early_httprequest_to_devtools,
+    send_response_to_devtools, set_default_accept,
+};
 use crate::protocols::{ProtocolRegistry, is_url_potentially_trustworthy};
 use crate::request_interceptor::RequestInterceptor;
 use crate::subresource_integrity::is_response_integrity_valid;
@@ -170,8 +173,12 @@ pub async fn fetch_with_cors_cache(
     // TODO: We don't implement fetchParams as defined in the spec
 }
 
-fn convert_request_to_csp_request(request: &Request, origin: &ImmutableOrigin) -> csp::Request {
-    csp::Request {
+pub(crate) fn convert_request_to_csp_request(request: &Request) -> Option<csp::Request> {
+    let origin = match &request.origin {
+        Origin::Client => return None,
+        Origin::Origin(origin) => origin,
+    };
+    let csp_request = csp::Request {
         url: request.url().into_url(),
         origin: origin.clone().into_url_origin(),
         redirect_count: request.redirect_count,
@@ -190,43 +197,56 @@ fn convert_request_to_csp_request(request: &Request, origin: &ImmutableOrigin) -
             ParserMetadata::NotParserInserted => csp::ParserMetadata::NotParserInserted,
             ParserMetadata::Default => csp::ParserMetadata::None,
         },
-    }
+    };
+    Some(csp_request)
 }
 
 /// <https://www.w3.org/TR/CSP/#should-block-request>
 pub fn should_request_be_blocked_by_csp(
-    request: &Request,
+    csp_request: &csp::Request,
     policy_container: &PolicyContainer,
 ) -> (csp::CheckResult, Vec<csp::Violation>) {
-    let origin = match &request.origin {
-        Origin::Client => return (csp::CheckResult::Allowed, Vec::new()),
-        Origin::Origin(origin) => origin,
-    };
-    let csp_request = convert_request_to_csp_request(request, origin);
-
     policy_container
         .csp_list
         .as_ref()
-        .map(|c| c.should_request_be_blocked(&csp_request))
+        .map(|c| c.should_request_be_blocked(csp_request))
         .unwrap_or((csp::CheckResult::Allowed, Vec::new()))
 }
 
 /// <https://www.w3.org/TR/CSP/#report-for-request>
 pub fn report_violations_for_request_by_csp(
-    request: &Request,
+    csp_request: &csp::Request,
     policy_container: &PolicyContainer,
 ) -> Vec<csp::Violation> {
-    let origin = match &request.origin {
-        Origin::Client => return Vec::new(),
-        Origin::Origin(origin) => origin,
-    };
-    let csp_request = convert_request_to_csp_request(request, origin);
-
     policy_container
         .csp_list
         .as_ref()
-        .map(|c| c.report_violations_for_request(&csp_request))
+        .map(|c| c.report_violations_for_request(csp_request))
         .unwrap_or_default()
+}
+
+fn should_response_be_blocked_by_csp(
+    csp_request: &csp::Request,
+    response: &Response,
+    policy_container: &PolicyContainer,
+) -> (csp::CheckResult, Vec<csp::Violation>) {
+    if response.is_network_error() {
+        return (csp::CheckResult::Allowed, Vec::new());
+    }
+    let csp_response = csp::Response {
+        url: response
+            .actual_response()
+            .url()
+            .cloned()
+            .expect("response must have a url")
+            .into_url(),
+        redirect_count: csp_request.redirect_count,
+    };
+    policy_container
+        .csp_list
+        .as_ref()
+        .map(|c| c.should_response_to_request_be_blocked(csp_request, &csp_response))
+        .unwrap_or((csp::CheckResult::Allowed, Vec::new()))
 }
 
 /// [Main fetch](https://fetch.spec.whatwg.org/#concept-main-fetch)
@@ -240,7 +260,8 @@ pub async fn main_fetch(
 ) -> Response {
     // Step 1: Let request be fetchParam's request.
     let request = &mut fetch_params.request;
-
+    // send early HTTP request to DevTools
+    send_early_httprequest_to_devtools(request, context);
     // Step 2: Let response be null.
     let mut response = None;
 
@@ -270,13 +291,15 @@ pub async fn main_fetch(
         RequestPolicyContainer::Client => PolicyContainer::default(),
         RequestPolicyContainer::PolicyContainer(container) => container.to_owned(),
     };
+    let csp_request = convert_request_to_csp_request(request);
+    if let Some(csp_request) = csp_request.as_ref() {
+        // Step 2.2.
+        let violations = report_violations_for_request_by_csp(csp_request, &policy_container);
 
-    // Step 2.2.
-    let violations = report_violations_for_request_by_csp(request, &policy_container);
-
-    if !violations.is_empty() {
-        target.process_csp_violations(request, violations);
-    }
+        if !violations.is_empty() {
+            target.process_csp_violations(request, violations);
+        }
+    };
 
     // Step 3.
     // TODO: handle request abort.
@@ -309,22 +332,24 @@ pub async fn main_fetch(
             request.insecure_requests_policy
         );
     }
+    if let Some(csp_request) = csp_request.as_ref() {
+        // Step 7. If should request be blocked due to a bad port, should fetching request be blocked
+        // as mixed content, or should request be blocked by Content Security Policy returns blocked,
+        // then set response to a network error.
+        let (check_result, violations) =
+            should_request_be_blocked_by_csp(csp_request, &policy_container);
 
-    // Step 7. If should request be blocked due to a bad port, should fetching request be blocked
-    // as mixed content, or should request be blocked by Content Security Policy returns blocked,
-    // then set response to a network error.
-    let (check_result, violations) = should_request_be_blocked_by_csp(request, &policy_container);
+        if !violations.is_empty() {
+            target.process_csp_violations(request, violations);
+        }
 
-    if !violations.is_empty() {
-        target.process_csp_violations(request, violations);
-    }
-
-    if check_result == csp::CheckResult::Blocked {
-        warn!("Request blocked by CSP");
-        response = Some(Response::network_error(NetworkError::Internal(
-            "Blocked by Content-Security-Policy".into(),
-        )))
-    }
+        if check_result == csp::CheckResult::Blocked {
+            warn!("Request blocked by CSP");
+            response = Some(Response::network_error(NetworkError::Internal(
+                "Blocked by Content-Security-Policy".into(),
+            )))
+        }
+    };
     if should_request_be_blocked_due_to_a_bad_port(&request.current_url()) {
         response = Some(Response::network_error(NetworkError::Internal(
             "Request attempted on bad port".into(),
@@ -530,6 +555,14 @@ pub async fn main_fetch(
             should_be_blocked_due_to_mime_type(request.destination, &response.headers);
         let should_replace_with_mixed_content = !response_is_network_error &&
             should_response_be_blocked_as_mixed_content(request, &response, &context.protocols);
+        let should_replace_with_csp_error = csp_request.is_some_and(|csp_request| {
+            let (check_result, violations) =
+                should_response_be_blocked_by_csp(&csp_request, &response, &policy_container);
+            if !violations.is_empty() {
+                target.process_csp_violations(request, violations);
+            }
+            check_result == csp::CheckResult::Blocked
+        });
 
         // Step 15.
         let mut network_error_response = response
@@ -553,7 +586,7 @@ pub async fn main_fetch(
 
         // Step 19. If response is not a network error and any of the following returns blocked
         // * should internalResponse to request be blocked as mixed content
-        // TODO: * should internalResponse to request be blocked by Content Security Policy
+        // * should internalResponse to request be blocked by Content Security Policy
         // * should internalResponse to request be blocked due to its MIME type
         // * should internalResponse to request be blocked due to nosniff
         let mut blocked_error_response;
@@ -571,6 +604,10 @@ pub async fn main_fetch(
         } else if should_replace_with_mixed_content {
             blocked_error_response =
                 Response::network_error(NetworkError::Internal("Blocked as mixed content".into()));
+            &blocked_error_response
+        } else if should_replace_with_csp_error {
+            blocked_error_response =
+                Response::network_error(NetworkError::Internal("Blocked due to CSP".into()));
             &blocked_error_response
         } else {
             internal_response
@@ -625,7 +662,7 @@ pub async fn main_fetch(
     let mut response_loaded = false;
     let mut response = if !response.is_network_error() && !request.integrity_metadata.is_empty() {
         // Step 19.1.
-        wait_for_response(request, &mut response, target, done_chan).await;
+        wait_for_response(request, &mut response, target, done_chan, context).await;
         response_loaded = true;
 
         // Step 19.2.
@@ -649,7 +686,7 @@ pub async fn main_fetch(
         // by sync fetch, but we overload it here for simplicity
         target.process_response(request, &response);
         if !response_loaded {
-            wait_for_response(request, &mut response, target, done_chan).await;
+            wait_for_response(request, &mut response, target, done_chan, context).await;
         }
         // overloaded similarly to process_response
         target.process_response_eof(request, &response);
@@ -668,14 +705,20 @@ pub async fn main_fetch(
 
     // Step 22.
     target.process_response(request, &response);
+    // Send Response to Devtools
+    send_response_to_devtools(request, context, &response, None);
 
     // Step 23.
     if !response_loaded {
-        wait_for_response(request, &mut response, target, done_chan).await;
+        wait_for_response(request, &mut response, target, done_chan, context).await;
     }
 
     // Step 24.
     target.process_response_eof(request, &response);
+    // Send Response to Devtools
+    // This is done after process_response_eof to ensure that the body is fully
+    // processed before sending the response to Devtools.
+    send_response_to_devtools(request, context, &response, None);
 
     if let Ok(http_cache) = context.state.http_cache.write() {
         http_cache.update_awaiting_consumers(request, &response);
@@ -691,14 +734,20 @@ async fn wait_for_response(
     response: &mut Response,
     target: Target<'_>,
     done_chan: &mut DoneChannel,
+    context: &FetchContext,
 ) {
     if let Some(ref mut ch) = *done_chan {
+        let mut devtools_body = context.devtools_chan.as_ref().map(|_| Vec::new());
         loop {
             match ch.1.recv().await {
                 Some(Data::Payload(vec)) => {
+                    if let Some(body) = devtools_body.as_mut() {
+                        body.extend(&vec);
+                    }
                     target.process_response_chunk(request, vec);
                 },
                 Some(Data::Done) => {
+                    send_response_to_devtools(request, context, response, devtools_body);
                     break;
                 },
                 Some(Data::Cancelled) => {
@@ -717,6 +766,11 @@ async fn wait_for_response(
             // obtained synchronously via scheme_fetch for data/file/about/etc
             // We should still send the body across as a chunk
             target.process_response_chunk(request, vec.clone());
+            if context.devtools_chan.is_some() {
+                // Now that we've replayed the entire cached body,
+                // notify the DevTools server with the full Response.
+                send_response_to_devtools(request, context, response, Some(vec.clone()));
+            }
         } else {
             assert_eq!(*body, ResponseBody::Empty)
         }
@@ -778,7 +832,7 @@ fn create_about_memory(url: ServoUrl, timing_type: ResourceTimingType) -> Respon
 
 /// Handle a request from the user interface to ignore validation errors for a certificate.
 fn handle_allowcert_request(request: &mut Request, context: &FetchContext) -> io::Result<()> {
-    let error = |string| Err(io::Error::new(io::ErrorKind::Other, string));
+    let error = |string| Err(io::Error::other(string));
 
     let body = match request.body.as_mut() {
         Some(body) => body,

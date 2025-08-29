@@ -15,25 +15,21 @@ import test
 import logging
 import random
 
-test_summary = {
-    test.Status.KILLED: 0,
-    test.Status.SURVIVED: 0,
-    test.Status.SKIPPED: 0,
-    test.Status.UNEXPECTED: 0
-}
+test_summary = {test.Status.KILLED: 0, test.Status.SURVIVED: 0, test.Status.SKIPPED: 0, test.Status.UNEXPECTED: 0}
 
 
-def get_folders_list(path):
+def get_folders_list(path: str) -> list[str]:
     folder_list = []
     for filename in listdir(path):
         if isdir(join(path, filename)):
             folder_name = join(path, filename)
             folder_list.append(folder_name)
         return folder_list
+    return folder_list
 
 
-def mutation_test_for(mutation_path):
-    test_mapping_file = join(mutation_path, 'test_mapping.json')
+def mutation_test_for(mutation_path: str) -> None:
+    test_mapping_file = join(mutation_path, "test_mapping.json")
     if isfile(test_mapping_file):
         json_data = open(test_mapping_file).read()
         test_mapping = json.loads(json_data)
@@ -41,7 +37,7 @@ def mutation_test_for(mutation_path):
         source_files = list(test_mapping.keys())
         random.shuffle(source_files)
         for src_file in source_files:
-            status = test.mutation_test(join(mutation_path, src_file.encode('utf-8')), test_mapping[src_file])
+            status = test.mutation_test(join(mutation_path, src_file.encode("utf-8")), test_mapping[src_file])
             test_summary[status] += 1
         # Run mutation test in all folder in the path.
         for folder in get_folders_list(mutation_path):

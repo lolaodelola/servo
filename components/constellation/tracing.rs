@@ -50,9 +50,6 @@ mod from_compositor {
         fn log_target(&self) -> &'static str {
             match self {
                 Self::Exit => target!("Exit"),
-                Self::GetFocusTopLevelBrowsingContext(..) => {
-                    target!("GetFocusTopLevelBrowsingContext")
-                },
                 Self::IsReadyToSaveImage(..) => target!("IsReadyToSaveImage"),
                 Self::AllowNavigationResponse(..) => target!("AllowNavigationResponse"),
                 Self::LoadUrl(..) => target!("LoadUrl"),
@@ -70,7 +67,7 @@ mod from_compositor {
                 Self::FocusWebView(..) => target!("FocusWebView"),
                 Self::BlurWebView => target!("BlurWebView"),
                 Self::ForwardInputEvent(_webview_id, event, ..) => event.log_target(),
-                Self::SetCursor(..) => target!("SetCursor"),
+                Self::RefreshCursor(..) => target!("RefreshCursor"),
                 Self::ToggleProfiler(..) => target!("EnableProfiler"),
                 Self::ExitFullScreen(_) => target!("ExitFullScreen"),
                 Self::MediaSessionAction(_) => target!("MediaSessionAction"),
@@ -78,6 +75,10 @@ mod from_compositor {
                 Self::SetScrollStates(..) => target!("SetScrollStates"),
                 Self::PaintMetric(..) => target!("PaintMetric"),
                 Self::EvaluateJavaScript(..) => target!("EvaluateJavaScript"),
+                Self::CreateMemoryReport(..) => target!("CreateMemoryReport"),
+                Self::SendImageKeysForPipeline(..) => target!("SendImageKeysForPipeline"),
+                Self::SetWebDriverResponseSender(..) => target!("SetWebDriverResponseSender"),
+                Self::PreferencesUpdated(..) => target!("PreferencesUpdated"),
             }
         }
     }
@@ -96,8 +97,10 @@ mod from_compositor {
                 InputEvent::Keyboard(..) => target_variant!("Keyboard"),
                 InputEvent::MouseButton(..) => target_variant!("MouseButton"),
                 InputEvent::MouseMove(..) => target_variant!("MouseMove"),
+                InputEvent::MouseLeftViewport(..) => target_variant!("MouseLeftViewport"),
                 InputEvent::Touch(..) => target_variant!("Touch"),
                 InputEvent::Wheel(..) => target_variant!("Wheel"),
+                InputEvent::Scroll(..) => target_variant!("Scroll"),
             }
         }
     }
@@ -212,6 +215,9 @@ mod from_script {
                 Self::SetCursor(..) => target_variant!("SetCursor"),
                 Self::NewFavicon(..) => target_variant!("NewFavicon"),
                 Self::HistoryChanged(..) => target_variant!("HistoryChanged"),
+                Self::HistoryTraversalComplete(..) => target_variant!("HistoryTraversalComplete"),
+                Self::GetWindowRect(..) => target_variant!("GetWindowRect"),
+                Self::GetScreenMetrics(..) => target_variant!("GetScreenMetrics"),
                 Self::NotifyFullscreenStateChanged(..) => {
                     target_variant!("NotifyFullscreenStateChanged")
                 },

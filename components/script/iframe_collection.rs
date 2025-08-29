@@ -2,20 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::Cell;
 use std::default::Default;
 
 use base::id::BrowsingContextId;
-use constellation_traits::{IFrameSizeMsg, WindowSizeType};
+use constellation_traits::{IFrameSizeMsg, ScriptToConstellationMessage, WindowSizeType};
 use embedder_traits::ViewportDetails;
 use fnv::FnvHashMap;
-use script_layout_interface::IFrameSizes;
+use layout_api::IFrameSizes;
 
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::htmliframeelement::HTMLIFrameElement;
 use crate::dom::node::{Node, ShadowIncluding};
-use crate::dom::types::Document;
+use crate::dom::types::{Document, Window};
 use crate::script_thread::with_script_thread;
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -29,25 +28,31 @@ pub(crate) struct IFrame {
 #[derive(Default, JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) struct IFrameCollection {
-    /// The version of the [`Document`] that this collection refers to. When the versions
-    /// do not match, the collection will need to be rebuilt.
-    document_version: Cell<u64>,
     /// The `<iframe>`s in the collection.
     iframes: Vec<IFrame>,
+    /// When true, the collection will need to be rebuilt.
+    invalid: bool,
 }
 
 impl IFrameCollection {
+    pub(crate) fn new() -> Self {
+        Self {
+            iframes: vec![],
+            invalid: true,
+        }
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.invalid = true;
+    }
+
     /// Validate that the collection is up-to-date with the given [`Document`]. If it isn't up-to-date
     /// rebuild it.
     pub(crate) fn validate(&mut self, document: &Document) {
-        // TODO: Whether the DOM has changed at all can lead to rebuilding this collection
-        // when it isn't necessary. A better signal might be if any `<iframe>` nodes have
-        // been connected or disconnected.
-        let document_node = DomRoot::from_ref(document.upcast::<Node>());
-        let document_version = document_node.inclusive_descendants_version();
-        if document_version == self.document_version.get() {
+        if !self.invalid {
             return;
         }
+        let document_node = DomRoot::from_ref(document.upcast::<Node>());
 
         // Preserve any old sizes, but only for `<iframe>`s that already have a
         // BrowsingContextId and a set size.
@@ -75,7 +80,7 @@ impl IFrameCollection {
                 }
             })
             .collect();
-        self.document_version.set(document_version);
+        self.invalid = false;
     }
 
     pub(crate) fn get(&self, browsing_context_id: BrowsingContextId) -> Option<&IFrame> {
@@ -111,13 +116,14 @@ impl IFrameCollection {
     /// message is only sent when the size actually changes.
     pub(crate) fn handle_new_iframe_sizes_after_layout(
         &mut self,
+        window: &Window,
         new_iframe_sizes: IFrameSizes,
-    ) -> Vec<IFrameSizeMsg> {
+    ) {
         if new_iframe_sizes.is_empty() {
-            return vec![];
+            return;
         }
 
-        new_iframe_sizes
+        let size_messages: Vec<_> = new_iframe_sizes
             .into_iter()
             .filter_map(|(browsing_context_id, iframe_size)| {
                 // Batch resize message to any local `Pipeline`s now, rather than waiting for them
@@ -151,7 +157,11 @@ impl IFrameCollection {
                     type_: size_type,
                 })
             })
-            .collect()
+            .collect();
+
+        if !size_messages.is_empty() {
+            window.send_to_constellation(ScriptToConstellationMessage::IFrameSizes(size_messages));
+        }
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = DomRoot<HTMLIFrameElement>> + use<'_> {

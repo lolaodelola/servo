@@ -10,11 +10,14 @@ use app_units::Au;
 use base::cross_process_instant::CrossProcessInstant;
 use cssparser::{Parser, ParserInput};
 use dom_struct::dom_struct;
-use euclid::default::{Rect, Size2D};
+use euclid::default::{Rect, SideOffsets2D, Size2D};
 use js::rust::{HandleObject, MutableHandleValue};
+use layout_api::BoxAreaType;
 use style::context::QuirksMode;
 use style::parser::{Parse, ParserContext};
 use style::stylesheets::{CssRuleType, Origin};
+use style::values::computed::Overflow;
+use style::values::specified::intersection_observer::IntersectionObserverMargin;
 use style_traits::{ParsingMode, ToCss};
 use url::Url;
 
@@ -36,7 +39,6 @@ use crate::dom::document::Document;
 use crate::dom::domrectreadonly::DOMRectReadOnly;
 use crate::dom::element::Element;
 use crate::dom::intersectionobserverentry::IntersectionObserverEntry;
-use crate::dom::intersectionobserverrootmargin::IntersectionObserverRootMargin;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::window::Window;
 use crate::script_runtime::{CanGc, JSContext};
@@ -82,12 +84,12 @@ pub(crate) struct IntersectionObserver {
     /// <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-rootmargin-slot>
     #[no_trace]
     #[ignore_malloc_size_of = "Defined in style"]
-    root_margin: RefCell<IntersectionObserverRootMargin>,
+    root_margin: RefCell<IntersectionObserverMargin>,
 
     /// <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-scrollmargin-slot>
     #[no_trace]
     #[ignore_malloc_size_of = "Defined in style"]
-    scroll_margin: RefCell<IntersectionObserverRootMargin>,
+    scroll_margin: RefCell<IntersectionObserverMargin>,
 
     /// <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-thresholds-slot>
     thresholds: RefCell<Vec<Finite<f64>>>,
@@ -104,8 +106,8 @@ impl IntersectionObserver {
         window: &Window,
         callback: Rc<IntersectionObserverCallback>,
         root: IntersectionRoot,
-        root_margin: IntersectionObserverRootMargin,
-        scroll_margin: IntersectionObserverRootMargin,
+        root_margin: IntersectionObserverMargin,
+        scroll_margin: IntersectionObserverMargin,
     ) -> Self {
         Self {
             reflector_: Reflector::new(),
@@ -408,18 +410,27 @@ impl IntersectionObserver {
     ///
     /// <https://w3c.github.io/IntersectionObserver/#intersectionobserver-root-intersection-rectangle>
     pub(crate) fn root_intersection_rectangle(&self, document: &Document) -> Option<Rect<Au>> {
+        let window = document.window();
         let intersection_rectangle = match &self.root {
             // Handle if root is an element.
             Some(ElementOrDocument::Element(element)) => {
                 // TODO: recheck scrollbar approach and clip-path clipping from Chromium implementation.
-
-                // > Otherwise, if the intersection root has a content clip,
-                // > it’s the element’s padding area.
-                // TODO(stevennovaryo): check for content clip
-
-                // > Otherwise, it’s the result of getting the bounding box for the intersection root.
-                // TODO: replace this once getBoundingBox() is implemented correctly.
-                DomRoot::upcast::<Node>(element.clone()).bounding_content_box_no_reflow()
+                if element.style().is_some_and(|style| {
+                    style.clone_overflow_x() != Overflow::Visible ||
+                        style.clone_overflow_y() != Overflow::Visible
+                }) {
+                    // > Otherwise, if the intersection root has a content clip, it’s the element’s padding area.
+                    window.box_area_query_without_reflow(
+                        &DomRoot::upcast::<Node>(element.clone()),
+                        BoxAreaType::Padding,
+                    )
+                } else {
+                    // > Otherwise, it’s the result of getting the bounding box for the intersection root.
+                    window.box_area_query_without_reflow(
+                        &DomRoot::upcast::<Node>(element.clone()),
+                        BoxAreaType::Border,
+                    )
+                }
             },
             // Handle if root is a Document, which includes implicit root and explicit Document root.
             _ => {
@@ -461,10 +472,7 @@ impl IntersectionObserver {
         // > the width of the undilated rectangle.
         // TODO(stevennovaryo): add check for same-origin-domain
         intersection_rectangle.map(|intersection_rectangle| {
-            let margin = self
-                .root_margin
-                .borrow()
-                .resolve_percentages_with_basis(intersection_rectangle);
+            let margin = self.resolve_percentages_with_basis(intersection_rectangle);
             intersection_rectangle.outer_rect(margin)
         })
     }
@@ -500,18 +508,15 @@ impl IntersectionObserver {
 
         // Step 7
         // > Set targetRect to the DOMRectReadOnly obtained by getting the bounding box for target.
-        // This is what we are currently using for getBoundingBox(). However, it is not correct,
-        // mainly because it is not considering transform and scroll offset.
-        // TODO: replace this once getBoundingBox() is implemented correctly.
-        let maybe_target_rect = target.upcast::<Node>().bounding_content_box_no_reflow();
+        let maybe_target_rect = document
+            .window()
+            .box_area_query_without_reflow(target.upcast::<Node>(), BoxAreaType::Border);
 
         // Following the implementation of Gecko, we will skip further processing if these
         // information not available. This would also handle display none element.
-        if maybe_root_bounds.is_none() || maybe_target_rect.is_none() {
+        let (Some(root_bounds), Some(target_rect)) = (maybe_root_bounds, maybe_target_rect) else {
             return IntersectionObservationOutput::default_skipped();
-        }
-        let root_bounds = maybe_root_bounds.unwrap();
-        let target_rect = maybe_target_rect.unwrap();
+        };
 
         // TODO(stevennovaryo): we should probably also consider adding visibity check, ideally
         //                      it would require new query from LayoutThread.
@@ -658,6 +663,16 @@ impl IntersectionObserver {
                 .set(intersection_output.is_visible);
         }
     }
+
+    fn resolve_percentages_with_basis(&self, containing_block: Rect<Au>) -> SideOffsets2D<Au> {
+        let inner = &self.root_margin.borrow().0;
+        SideOffsets2D::new(
+            inner.0.to_used_value(containing_block.height()),
+            inner.1.to_used_value(containing_block.width()),
+            inner.2.to_used_value(containing_block.height()),
+            inner.3.to_used_value(containing_block.width()),
+        )
+    }
 }
 
 impl IntersectionObserverMethods<crate::DomTypeHolder> for IntersectionObserver {
@@ -796,7 +811,7 @@ impl IntersectionObserverRegistration {
 }
 
 /// <https://w3c.github.io/IntersectionObserver/#parse-a-margin>
-fn parse_a_margin(value: Option<&DOMString>) -> Result<IntersectionObserverRootMargin, ()> {
+fn parse_a_margin(value: Option<&DOMString>) -> Result<IntersectionObserverMargin, ()> {
     // <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserverinit-rootmargin> &&
     // <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserverinit-scrollmargin>
     // > ... defaulting to "0px".
@@ -805,7 +820,7 @@ fn parse_a_margin(value: Option<&DOMString>) -> Result<IntersectionObserverRootM
         _ => "0px",
     };
 
-    // Create necessary style ParserContext and utilize stylo's IntersectionObserverRootMargin
+    // Create necessary style ParserContext and utilize stylo's IntersectionObserverMargin
     let mut input = ParserInput::new(value);
     let mut parser = Parser::new(&mut input);
 
@@ -822,7 +837,7 @@ fn parse_a_margin(value: Option<&DOMString>) -> Result<IntersectionObserverRootM
     );
 
     parser
-        .parse_entirely(|p| IntersectionObserverRootMargin::parse(&context, p))
+        .parse_entirely(|p| IntersectionObserverMargin::parse(&context, p))
         .map_err(|_| ())
 }
 

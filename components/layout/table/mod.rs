@@ -76,20 +76,19 @@ pub(crate) use construct::AnonymousTableContent;
 pub use construct::TableBuilder;
 use euclid::{Point2D, Size2D, UnknownUnit, Vector2D};
 use malloc_size_of_derive::MallocSizeOf;
-use script::layout_dom::{ServoLayoutElement, ServoLayoutNode};
+use script::layout_dom::{ServoLayoutElement, ServoThreadSafeLayoutNode};
 use servo_arc::Arc;
 use style::context::SharedStyleContext;
 use style::properties::ComputedValues;
 use style::properties::style_structs::Font;
 use style::selector_parser::PseudoElement;
-use style_traits::dom::OpaqueNode;
 
 use super::flow::BlockFormattingContext;
 use crate::SharedStyle;
 use crate::cell::ArcRefCell;
 use crate::flow::BlockContainer;
 use crate::formatting_contexts::IndependentFormattingContext;
-use crate::fragment_tree::{BaseFragmentInfo, Fragment};
+use crate::fragment_tree::BaseFragmentInfo;
 use crate::geom::PhysicalVec;
 use crate::layout_box_base::LayoutBoxBase;
 use crate::style_ext::BorderStyleColor;
@@ -232,7 +231,7 @@ impl TableSlotCell {
     pub fn mock_for_testing(id: usize, colspan: usize, rowspan: usize) -> Self {
         Self {
             base: LayoutBoxBase::new(
-                BaseFragmentInfo::new_for_node(OpaqueNode(id)),
+                BaseFragmentInfo::new_for_testing(id),
                 ComputedValues::initial_values_with_font_override(Font::initial_values()).to_arc(),
             ),
             contents: BlockFormattingContext {
@@ -398,34 +397,43 @@ pub(crate) enum TableLevelBox {
 }
 
 impl TableLevelBox {
-    pub(crate) fn invalidate_cached_fragment(&self) {
+    pub(crate) fn clear_fragment_layout_cache(&self) {
         match self {
             TableLevelBox::Caption(caption) => {
-                caption.borrow().context.base.invalidate_cached_fragment();
+                caption.borrow().context.base.clear_fragment_layout_cache();
             },
             TableLevelBox::Cell(cell) => {
-                cell.borrow().base.invalidate_cached_fragment();
+                cell.borrow().base.clear_fragment_layout_cache();
             },
             TableLevelBox::TrackGroup(track_group) => {
-                track_group.borrow().base.invalidate_cached_fragment()
+                track_group.borrow().base.clear_fragment_layout_cache()
             },
-            TableLevelBox::Track(track) => track.borrow().base.invalidate_cached_fragment(),
+            TableLevelBox::Track(track) => track.borrow().base.clear_fragment_layout_cache(),
         }
     }
 
-    pub(crate) fn fragments(&self) -> Vec<Fragment> {
+    pub(crate) fn with_base<T>(&self, callback: impl Fn(&LayoutBoxBase) -> T) -> T {
         match self {
-            TableLevelBox::Caption(caption) => caption.borrow().context.base.fragments(),
-            TableLevelBox::Cell(cell) => cell.borrow().base.fragments(),
-            TableLevelBox::TrackGroup(track_group) => track_group.borrow().base.fragments(),
-            TableLevelBox::Track(track) => track.borrow().base.fragments(),
+            TableLevelBox::Caption(caption) => callback(&caption.borrow().context.base),
+            TableLevelBox::Cell(cell) => callback(&cell.borrow().base),
+            TableLevelBox::TrackGroup(track_group) => callback(&track_group.borrow().base),
+            TableLevelBox::Track(track) => callback(&track.borrow().base),
+        }
+    }
+
+    pub(crate) fn with_base_mut<T>(&mut self, callback: impl Fn(&mut LayoutBoxBase) -> T) -> T {
+        match self {
+            TableLevelBox::Caption(caption) => callback(&mut caption.borrow_mut().context.base),
+            TableLevelBox::Cell(cell) => callback(&mut cell.borrow_mut().base),
+            TableLevelBox::TrackGroup(track_group) => callback(&mut track_group.borrow_mut().base),
+            TableLevelBox::Track(track) => callback(&mut track.borrow_mut().base),
         }
     }
 
     pub(crate) fn repair_style(
         &self,
         context: &SharedStyleContext<'_>,
-        node: &ServoLayoutNode,
+        node: &ServoThreadSafeLayoutNode,
         new_style: &Arc<ComputedValues>,
     ) {
         match self {

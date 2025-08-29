@@ -9,7 +9,7 @@ use std::rc::Rc;
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Prefix, local_name, ns};
 use js::rust::HandleObject;
-use script_layout_interface::QueryMsg;
+use layout_api::QueryMsg;
 use style::attr::AttrValue;
 use stylo_dom::ElementState;
 
@@ -20,8 +20,10 @@ use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterData
 use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::{
     EventHandlerNonNull, OnErrorEventHandlerNonNull,
 };
+use crate::dom::bindings::codegen::Bindings::EventTargetBinding::EventListenerOptions;
 use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::HTMLElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLLabelElementBinding::HTMLLabelElementMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::Node_Binding::NodeMethods;
 use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::ShadowRoot_Binding::ShadowRootMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
@@ -116,18 +118,18 @@ impl HTMLElement {
     /// `.outerText` in JavaScript.`
     ///
     /// <https://html.spec.whatwg.org/multipage/#get-the-text-steps>
-    pub(crate) fn get_inner_outer_text(&self, can_gc: CanGc) -> DOMString {
+    pub(crate) fn get_inner_outer_text(&self) -> DOMString {
         let node = self.upcast::<Node>();
         let window = node.owner_window();
         let element = self.as_element();
 
         // Step 1.
-        let element_not_rendered = !node.is_connected() || !element.has_css_layout_box(can_gc);
+        let element_not_rendered = !node.is_connected() || !element.has_css_layout_box();
         if element_not_rendered {
             return node.GetTextContent().unwrap();
         }
 
-        window.layout_reflow(QueryMsg::ElementInnerOuterTextQuery, can_gc);
+        window.layout_reflow(QueryMsg::ElementInnerOuterTextQuery);
         let text = window
             .layout()
             .query_element_inner_outer_text(node.to_trusted_node_address());
@@ -417,12 +419,19 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
         element.set_click_in_progress(false);
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-focus
-    fn Focus(&self, can_gc: CanGc) {
+    /// <https://html.spec.whatwg.org/multipage/#dom-focus>
+    fn Focus(&self, options: &FocusOptions, can_gc: CanGc) {
         // TODO: Mark the element as locked for focus and run the focusing steps.
-        // https://html.spec.whatwg.org/multipage/#focusing-steps
+        // <https://html.spec.whatwg.org/multipage/#focusing-steps>
         let document = self.owner_document();
-        document.request_focus(Some(self.upcast()), FocusInitiator::Local, can_gc);
+        document.request_focus_with_options(
+            Some(self.upcast()),
+            FocusInitiator::Local,
+            FocusOptions {
+                preventScroll: options.preventScroll,
+            },
+            can_gc,
+        );
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-blur
@@ -437,66 +446,66 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
         document.request_focus(None, FocusInitiator::Local, can_gc);
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetparent
-    fn GetOffsetParent(&self, can_gc: CanGc) -> Option<DomRoot<Element>> {
-        if self.is::<HTMLBodyElement>() || self.is::<HTMLHtmlElement>() {
+    /// <https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetparent>
+    fn GetOffsetParent(&self) -> Option<DomRoot<Element>> {
+        if self.is_body_element() || self.is::<HTMLHtmlElement>() {
             return None;
         }
 
         let node = self.upcast::<Node>();
         let window = self.owner_window();
-        let (element, _) = window.offset_parent_query(node, can_gc);
+        let (element, _) = window.offset_parent_query(node);
 
         element
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsettop
-    fn OffsetTop(&self, can_gc: CanGc) -> i32 {
-        if self.is::<HTMLBodyElement>() {
+    fn OffsetTop(&self) -> i32 {
+        if self.is_body_element() {
             return 0;
         }
 
         let node = self.upcast::<Node>();
         let window = self.owner_window();
-        let (_, rect) = window.offset_parent_query(node, can_gc);
+        let (_, rect) = window.offset_parent_query(node);
 
         rect.origin.y.to_nearest_px()
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetleft
-    fn OffsetLeft(&self, can_gc: CanGc) -> i32 {
-        if self.is::<HTMLBodyElement>() {
+    fn OffsetLeft(&self) -> i32 {
+        if self.is_body_element() {
             return 0;
         }
 
         let node = self.upcast::<Node>();
         let window = self.owner_window();
-        let (_, rect) = window.offset_parent_query(node, can_gc);
+        let (_, rect) = window.offset_parent_query(node);
 
         rect.origin.x.to_nearest_px()
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetwidth
-    fn OffsetWidth(&self, can_gc: CanGc) -> i32 {
+    fn OffsetWidth(&self) -> i32 {
         let node = self.upcast::<Node>();
         let window = self.owner_window();
-        let (_, rect) = window.offset_parent_query(node, can_gc);
+        let (_, rect) = window.offset_parent_query(node);
 
         rect.size.width.to_nearest_px()
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-htmlelement-offsetheight
-    fn OffsetHeight(&self, can_gc: CanGc) -> i32 {
+    fn OffsetHeight(&self) -> i32 {
         let node = self.upcast::<Node>();
         let window = self.owner_window();
-        let (_, rect) = window.offset_parent_query(node, can_gc);
+        let (_, rect) = window.offset_parent_query(node);
 
         rect.size.height.to_nearest_px()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#the-innertext-idl-attribute>
-    fn InnerText(&self, can_gc: CanGc) -> DOMString {
-        self.get_inner_outer_text(can_gc)
+    fn InnerText(&self) -> DOMString {
+        self.get_inner_outer_text()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#set-the-inner-text-steps>
@@ -505,8 +514,8 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-outertext>
-    fn GetOuterText(&self, can_gc: CanGc) -> Fallible<DOMString> {
-        Ok(self.get_inner_outer_text(can_gc))
+    fn GetOuterText(&self) -> Fallible<DOMString> {
+        Ok(self.get_inner_outer_text())
     }
 
     /// <https://html.spec.whatwg.org/multipage/#the-innertext-idl-attribute:dom-outertext-2>
@@ -595,6 +604,7 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
         // TODO: https://github.com/servo/servo/issues/12776
         false
     }
+
     /// <https://html.spec.whatwg.org/multipage#dom-attachinternals>
     fn AttachInternals(&self, can_gc: CanGc) -> Fallible<DomRoot<ElementInternals>> {
         let element = self.as_element();
@@ -607,7 +617,7 @@ impl HTMLElementMethods<crate::DomTypeHolder> for HTMLElement {
         // Note: the element can pass this check without yet being a custom
         // element, as long as there is a registered definition
         // that could upgrade it to one later.
-        let registry = self.owner_document().window().CustomElements();
+        let registry = self.owner_window().CustomElements();
         let definition = registry.lookup_definition(self.as_element().local_name(), None);
 
         // Step 3: If definition is null, then throw an "NotSupportedError" DOMException
@@ -717,7 +727,7 @@ fn to_camel_case(name: &str) -> Option<DOMString> {
     let mut result = String::with_capacity(name.len().saturating_sub(DATA_PREFIX.len()));
     let mut name_chars = name.chars();
     while let Some(curr_char) = name_chars.next() {
-        //check for hyphen followed by character
+        // check for hyphen followed by character
         if curr_char == DATA_HYPHEN_SEPARATOR {
             if let Some(next_char) = name_chars.next() {
                 if next_char.is_ascii_lowercase() {
@@ -815,6 +825,19 @@ impl HTMLElement {
             },
             _ => false,
         }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#the-body-element-2>
+    pub(crate) fn is_body_element(&self) -> bool {
+        let self_node = self.upcast::<Node>();
+        self_node.GetParentNode().is_some_and(|parent| {
+            let parent_node = parent.upcast::<Node>();
+            (self_node.is::<HTMLBodyElement>() || self_node.is::<HTMLFrameSetElement>()) &&
+                parent_node.is::<HTMLHtmlElement>() &&
+                self_node
+                    .preceding_siblings()
+                    .all(|n| !n.is::<HTMLBodyElement>() && !n.is::<HTMLFrameSetElement>())
+        })
     }
 
     /// <https://html.spec.whatwg.org/multipage/#category-submit>
@@ -1089,17 +1112,35 @@ impl VirtualMethods for HTMLElement {
             .attribute_mutated(attr, mutation, can_gc);
         let element = self.as_element();
         match (attr.local_name(), mutation) {
-            (name, AttributeMutation::Set(_)) if name.starts_with("on") => {
-                let source = &**attr.value();
+            // https://html.spec.whatwg.org/multipage/#event-handler-attributes:event-handler-content-attributes-3
+            (name, mutation)
+                if name.starts_with("on") && EventTarget::is_content_event_handler(name) =>
+            {
                 let evtarget = self.upcast::<EventTarget>();
-                let source_line = 1; //TODO(#9604) get current JS execution line
-                evtarget.set_event_handler_uncompiled(
-                    self.owner_window().get_url(),
-                    source_line,
-                    &name[2..],
-                    source,
-                );
+                let event_name = &name[2..];
+                match mutation {
+                    // https://html.spec.whatwg.org/multipage/#activate-an-event-handler
+                    AttributeMutation::Set(_) => {
+                        let source = &**attr.value();
+                        let source_line = 1; // TODO(#9604) get current JS execution line
+                        evtarget.set_event_handler_uncompiled(
+                            self.owner_window().get_url(),
+                            source_line,
+                            event_name,
+                            source,
+                        );
+                    },
+                    // https://html.spec.whatwg.org/multipage/#deactivate-an-event-handler
+                    AttributeMutation::Removed => {
+                        evtarget.remove_event_listener(
+                            event_name.into(),
+                            evtarget.get_event_handler_common(event_name, can_gc),
+                            EventListenerOptions { capture: false },
+                        );
+                    },
+                }
             },
+
             (&local_name!("form"), mutation) if self.is_form_associated_custom_element() => {
                 self.form_attribute_mutated(mutation, can_gc);
             },
@@ -1246,7 +1287,6 @@ impl FormControl for HTMLElement {
     }
 
     fn to_element(&self) -> &Element {
-        debug_assert!(self.is_form_associated_custom_element());
         self.as_element()
     }
 
@@ -1255,5 +1295,5 @@ impl FormControl for HTMLElement {
         true
     }
 
-    // TODO candidate_for_validation, satisfies_constraints traits
+    // TODO satisfies_constraints traits
 }

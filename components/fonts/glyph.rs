@@ -315,7 +315,7 @@ impl<'a> DetailedGlyphStore {
 
 // This struct is used by GlyphStore clients to provide new glyph data.
 // It should be allocated on the stack and passed by reference to GlyphStore.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct GlyphData {
     id: GlyphId,
     advance: Au,
@@ -606,7 +606,7 @@ impl GlyphStore {
     pub fn iter_glyphs_for_byte_range(
         &self,
         range: &Range<ByteIndex>,
-    ) -> impl Iterator<Item = GlyphInfo> + use<'_> {
+    ) -> impl Iterator<Item = GlyphInfo<'_>> + use<'_> {
         if range.begin() >= self.len() {
             panic!("iter_glyphs_for_range: range.begin beyond length!");
         }

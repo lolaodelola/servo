@@ -3,6 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use std::ptr;
+use std::ptr::NonNull;
 use std::sync::LazyLock;
 
 use js::conversions::jsstr_to_string;
@@ -88,11 +89,13 @@ unsafe extern "C" fn get_own_property_descriptor(
     let cx = unsafe { SafeJSContext::from_ptr(cx) };
 
     if id.is_symbol() {
-        if id.get().asBits_ == SymbolId(GetWellKnownSymbol(*cx, SymbolCode::toStringTag)).asBits_ {
+        if id.get().asBits_ ==
+            SymbolId(unsafe { GetWellKnownSymbol(*cx, SymbolCode::toStringTag) }).asBits_
+        {
             rooted!(in(*cx) let mut rval = UndefinedValue());
-            "WindowProperties".to_jsval(*cx, rval.handle_mut());
+            unsafe { "WindowProperties".to_jsval(*cx, rval.handle_mut()) };
             set_property_descriptor(
-                RustMutableHandle::from_raw(desc),
+                unsafe { RustMutableHandle::from_raw(desc) },
                 rval.handle(),
                 JSPROP_READONLY.into(),
                 unsafe { &mut *is_none },
@@ -102,12 +105,15 @@ unsafe extern "C" fn get_own_property_descriptor(
     }
 
     let mut found = false;
-    if !has_property_on_prototype(
-        *cx,
-        RustHandle::from_raw(proxy),
-        RustHandle::from_raw(id),
-        &mut found,
-    ) {
+    let lookup_succeeded = unsafe {
+        has_property_on_prototype(
+            *cx,
+            RustHandle::from_raw(proxy),
+            RustHandle::from_raw(id),
+            &mut found,
+        )
+    };
+    if !lookup_succeeded {
         return false;
     }
     if found {
@@ -115,7 +121,7 @@ unsafe extern "C" fn get_own_property_descriptor(
     }
 
     let s = if id.is_string() {
-        unsafe { jsstr_to_string(*cx, id.to_string()) }
+        unsafe { jsstr_to_string(*cx, NonNull::new(id.to_string()).unwrap()) }
     } else if id.is_int() {
         // If the property key is an integer index, convert it to a String too.
         // For indexed access on the window object, which may shadow this, see
@@ -135,7 +141,9 @@ unsafe extern "C" fn get_own_property_descriptor(
         .expect("global is not a window");
     if let Some(obj) = window.NamedGetter(s.into()) {
         rooted!(in(*cx) let mut rval = UndefinedValue());
-        obj.to_jsval(*cx, rval.handle_mut());
+        unsafe {
+            obj.to_jsval(*cx, rval.handle_mut());
+        }
         set_property_descriptor(
             unsafe { RustMutableHandle::from_raw(desc) },
             rval.handle(),

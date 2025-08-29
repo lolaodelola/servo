@@ -16,7 +16,7 @@ from .build_target import BuildTarget
 
 
 class Base:
-    def __init__(self, triple: str):
+    def __init__(self, triple: str) -> None:
         self.environ = os.environ.copy()
         self.triple = triple
         self.is_windows = False
@@ -29,13 +29,11 @@ class Base:
     def executable_suffix(self) -> str:
         return ""
 
-    def _platform_bootstrap(self, _force: bool) -> bool:
+    def _platform_bootstrap(self, force: bool) -> bool:
         raise NotImplementedError("Bootstrap installation detection not yet available.")
 
-    def _platform_bootstrap_gstreamer(self, _target: BuildTarget, _force: bool) -> bool:
-        raise NotImplementedError(
-            "GStreamer bootstrap support is not yet available for your OS."
-        )
+    def _platform_bootstrap_gstreamer(self, target: BuildTarget, force: bool) -> bool:
+        raise NotImplementedError("GStreamer bootstrap support is not yet available for your OS.")
 
     def is_gstreamer_installed(self, target: BuildTarget) -> bool:
         gstreamer_root = self.gstreamer_root(target)
@@ -56,7 +54,7 @@ class Base:
         except FileNotFoundError:
             return False
 
-    def bootstrap(self, force: bool, skip_platform: bool, skip_lints: bool):
+    def bootstrap(self, force: bool, skip_platform: bool, skip_lints: bool) -> None:
         installed_something = False
         if not skip_platform:
             installed_something |= self._platform_bootstrap(force)
@@ -69,7 +67,7 @@ class Base:
         if not installed_something:
             print("Dependencies were already installed!")
 
-    def install_rust_toolchain(self):
+    def install_rust_toolchain(self) -> None:
         # rustup 1.28.0, and rustup 1.28.1+ with RUSTUP_AUTO_INSTALL=0, require us to explicitly
         # install the Rust toolchain before trying to use it.
         print(" * Installing Rust toolchain...")
@@ -88,12 +86,11 @@ class Base:
         return True
 
     def install_cargo_deny(self, force: bool) -> bool:
-        def cargo_deny_installed():
+        def cargo_deny_installed() -> bool:
             if force or not shutil.which("cargo-deny"):
                 return False
             # Tidy needs at least version 0.18.1 installed.
-            result = subprocess.run(["cargo-deny", "--version"],
-                                    encoding='utf-8', capture_output=True)
+            result = subprocess.run(["cargo-deny", "--version"], encoding="utf-8", capture_output=True)
             (major, minor, micro) = result.stdout.strip().split(" ")[1].split(".", 2)
             return (int(major), int(minor), int(micro)) >= (0, 18, 1)
 
@@ -101,7 +98,7 @@ class Base:
             return False
 
         print(" * Installing cargo-deny...")
-        if subprocess.call(["cargo", "install", "cargo-deny", "--locked"]) != 0:
+        if subprocess.call(["cargo", "install", "cargo-deny@0.18.3", "--locked"]) != 0:
             raise EnvironmentError("Installation of cargo-deny failed.")
         return True
 
@@ -114,11 +111,11 @@ class Base:
 
     def passive_bootstrap(self) -> bool:
         """A bootstrap method that is called without explicitly invoking `./mach bootstrap`
-           but that is executed in the process of other `./mach` commands. This should be
-           as fast as possible."""
+        but that is executed in the process of other `./mach` commands. This should be
+        as fast as possible."""
         return False
 
-    def bootstrap_gstreamer(self, force: bool):
+    def bootstrap_gstreamer(self, force: bool) -> None:
         target = BuildTarget.from_triple(self.triple)
         if not self._platform_bootstrap_gstreamer(target, force):
             root = self.gstreamer_root(target)

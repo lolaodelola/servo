@@ -16,16 +16,17 @@ use content_security_policy::CspList;
 use crossbeam_channel::Receiver;
 use devtools_traits::{DevtoolScriptControlMsg, WorkerId};
 use dom_struct::dom_struct;
+use fonts::FontContext;
 use ipc_channel::ipc::IpcSender;
 use js::jsval::UndefinedValue;
 use js::panic::maybe_resume_unwind;
 use js::rust::{HandleValue, MutableHandleValue, ParentRuntime};
-use net_traits::IpcSend;
 use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{
     CredentialsMode, Destination, InsecureRequestsPolicy, ParserMetadata,
     RequestBuilder as NetRequestInit,
 };
+use net_traits::{IpcSend, ReferrerPolicy};
 use profile_traits::mem::{ProcessReports, perform_memory_report};
 use servo_url::{MutableOrigin, ServoUrl};
 use timers::TimerScheduler;
@@ -36,36 +37,44 @@ use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::ImageBitmapBinding::{
     ImageBitmapOptions, ImageBitmapSource,
 };
+use crate::dom::bindings::codegen::Bindings::ReportingObserverBinding::Report;
 use crate::dom::bindings::codegen::Bindings::RequestBinding::RequestInit;
 use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::codegen::Bindings::WorkerBinding::WorkerType;
 use crate::dom::bindings::codegen::Bindings::WorkerGlobalScopeBinding::WorkerGlobalScopeMethods;
 use crate::dom::bindings::codegen::UnionTypes::{
-    RequestOrUSVString, StringOrFunction, TrustedScriptURLOrUSVString,
+    RequestOrUSVString, TrustedScriptOrString, TrustedScriptOrStringOrFunction,
+    TrustedScriptURLOrUSVString,
 };
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible, report_pending_exception};
 use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::settings_stack::AutoEntryScript;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::crypto::Crypto;
+use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::dedicatedworkerglobalscope::DedicatedWorkerGlobalScope;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::idbfactory::IDBFactory;
 use crate::dom::performance::Performance;
 use crate::dom::promise::Promise;
+use crate::dom::reportingendpoint::{ReportingEndpoint, SendReportsToEndpoints};
+use crate::dom::reportingobserver::ReportingObserver;
 use crate::dom::trustedscripturl::TrustedScriptURL;
 use crate::dom::trustedtypepolicyfactory::TrustedTypePolicyFactory;
+use crate::dom::types::ImageBitmap;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::dom::window::{base64_atob, base64_btoa};
 use crate::dom::workerlocation::WorkerLocation;
 use crate::dom::workernavigator::WorkerNavigator;
-use crate::fetch;
+use crate::fetch::{CspViolationsProcessor, Fetch, load_whole_resource};
 use crate::messaging::{CommonScriptMsg, ScriptEventLoopReceiver, ScriptEventLoopSender};
 use crate::realms::{InRealm, enter_realm};
-use crate::script_runtime::{CanGc, JSContext, JSContextHelper, Runtime};
+use crate::script_runtime::{CanGc, IntroductionType, JSContext, JSContextHelper, Runtime};
 use crate::task::TaskCanceller;
 use crate::timers::{IsInterval, TimerCallback};
 
@@ -74,7 +83,7 @@ pub(crate) fn prepare_workerscope_init(
     devtools_sender: Option<IpcSender<DevtoolScriptControlMsg>>,
     worker_id: Option<WorkerId>,
 ) -> WorkerGlobalScopeInit {
-    let init = WorkerGlobalScopeInit {
+    WorkerGlobalScopeInit {
         resource_threads: global.resource_threads().clone(),
         mem_profiler_chan: global.mem_profiler_chan().clone(),
         to_devtools_sender: global.devtools_chan().cloned(),
@@ -86,9 +95,7 @@ pub(crate) fn prepare_workerscope_init(
         origin: global.origin().immutable().clone(),
         creation_url: global.creation_url().clone(),
         inherited_secure_context: Some(global.is_secure_context()),
-    };
-
-    init
+    }
 }
 
 // https://html.spec.whatwg.org/multipage/#the-workerglobalscope-common-interface
@@ -127,6 +134,7 @@ pub(crate) struct WorkerGlobalScope {
     #[no_trace]
     navigation_start: CrossProcessInstant,
     performance: MutNullableDom<Performance>,
+    indexeddb: MutNullableDom<IDBFactory>,
     trusted_types: MutNullableDom<TrustedTypePolicyFactory>,
 
     /// A [`TimerScheduler`] used to schedule timers for this [`WorkerGlobalScope`].
@@ -136,6 +144,16 @@ pub(crate) struct WorkerGlobalScope {
 
     #[no_trace]
     insecure_requests_policy: InsecureRequestsPolicy,
+
+    /// <https://w3c.github.io/reporting/#windoworworkerglobalscope-registered-reporting-observer-list>
+    reporting_observer_list: DomRefCell<Vec<DomRoot<ReportingObserver>>>,
+
+    /// <https://w3c.github.io/reporting/#windoworworkerglobalscope-reports>
+    report_list: DomRefCell<Vec<Report>>,
+
+    /// <https://w3c.github.io/reporting/#windoworworkerglobalscope-endpoints>
+    #[no_trace]
+    endpoints_list: DomRefCell<Vec<ReportingEndpoint>>,
 }
 
 impl WorkerGlobalScope {
@@ -150,6 +168,7 @@ impl WorkerGlobalScope {
         closing: Arc<AtomicBool>,
         #[cfg(feature = "webgpu")] gpu_id_hub: Arc<IdentityHub>,
         insecure_requests_policy: InsecureRequestsPolicy,
+        font_context: Option<Arc<FontContext>>,
     ) -> Self {
         // Install a pipeline-namespace in the current thread.
         PipelineNamespace::auto_install();
@@ -169,11 +188,13 @@ impl WorkerGlobalScope {
                 init.resource_threads,
                 MutableOrigin::new(init.origin),
                 init.creation_url,
+                None,
                 runtime.microtask_queue.clone(),
                 #[cfg(feature = "webgpu")]
                 gpu_id_hub,
                 init.inherited_secure_context,
                 false,
+                font_context,
             ),
             worker_id: init.worker_id,
             worker_name,
@@ -188,9 +209,13 @@ impl WorkerGlobalScope {
             _devtools_sender: init.from_devtools_sender,
             navigation_start: CrossProcessInstant::now(),
             performance: Default::default(),
+            indexeddb: Default::default(),
             timer_scheduler: RefCell::default(),
             insecure_requests_policy,
             trusted_types: Default::default(),
+            reporting_observer_list: Default::default(),
+            report_list: Default::default(),
+            endpoints_list: Default::default(),
         }
     }
 
@@ -230,7 +255,7 @@ impl WorkerGlobalScope {
         self.closing.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn get_url(&self) -> Ref<ServoUrl> {
+    pub(crate) fn get_url(&self) -> Ref<'_, ServoUrl> {
         self.worker_url.borrow()
     }
 
@@ -246,7 +271,7 @@ impl WorkerGlobalScope {
         self.globalscope.pipeline_id()
     }
 
-    pub(crate) fn policy_container(&self) -> Ref<PolicyContainer> {
+    pub(crate) fn policy_container(&self) -> Ref<'_, PolicyContainer> {
         self.policy_container.borrow()
     }
 
@@ -254,8 +279,61 @@ impl WorkerGlobalScope {
         self.policy_container.borrow_mut().set_csp_list(csp_list);
     }
 
+    pub(crate) fn set_referrer_policy(&self, referrer_policy: ReferrerPolicy) {
+        self.policy_container
+            .borrow_mut()
+            .set_referrer_policy(referrer_policy);
+    }
+
+    pub(crate) fn append_reporting_observer(&self, reporting_observer: DomRoot<ReportingObserver>) {
+        self.reporting_observer_list
+            .borrow_mut()
+            .push(reporting_observer);
+    }
+
+    pub(crate) fn remove_reporting_observer(&self, reporting_observer: &ReportingObserver) {
+        if let Some(index) = self
+            .reporting_observer_list
+            .borrow()
+            .iter()
+            .position(|observer| &**observer == reporting_observer)
+        {
+            self.reporting_observer_list.borrow_mut().remove(index);
+        }
+    }
+
+    pub(crate) fn registered_reporting_observers(&self) -> Vec<DomRoot<ReportingObserver>> {
+        self.reporting_observer_list.borrow().clone()
+    }
+
+    pub(crate) fn append_report(&self, report: Report) {
+        self.report_list.borrow_mut().push(report);
+        let trusted_worker = Trusted::new(self);
+        self.upcast::<GlobalScope>()
+            .task_manager()
+            .dom_manipulation_task_source()
+            .queue(task!(send_to_reporting_endpoints: move || {
+                let worker = trusted_worker.root();
+                let reports = std::mem::take(&mut *worker.report_list.borrow_mut());
+                worker.upcast::<GlobalScope>().send_reports_to_endpoints(
+                    reports,
+                    worker.endpoints_list.borrow().clone(),
+                );
+            }));
+    }
+
+    pub(crate) fn buffered_reports(&self) -> Vec<Report> {
+        self.report_list.borrow().clone()
+    }
+
+    pub(crate) fn set_endpoints_list(&self, endpoints: Option<Vec<ReportingEndpoint>>) {
+        if let Some(endpoints) = endpoints {
+            *self.endpoints_list.borrow_mut() = endpoints;
+        }
+    }
+
     /// Get a mutable reference to the [`TimerScheduler`] for this [`ServiceWorkerGlobalScope`].
-    pub(crate) fn timer_scheduler(&self) -> RefMut<TimerScheduler> {
+    pub(crate) fn timer_scheduler(&self) -> RefMut<'_, TimerScheduler> {
         self.timer_scheduler.borrow_mut()
     }
 
@@ -272,6 +350,14 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
     // https://html.spec.whatwg.org/multipage/#dom-workerglobalscope-self
     fn Self_(&self) -> DomRoot<WorkerGlobalScope> {
         DomRoot::from_ref(self)
+    }
+
+    // https://w3c.github.io/IndexedDB/#factory-interface
+    fn IndexedDB(&self) -> DomRoot<IDBFactory> {
+        self.indexeddb.or_init(|| {
+            let global_scope = self.upcast::<GlobalScope>();
+            IDBFactory::new(global_scope, CanGc::note())
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-workerglobalscope-location
@@ -330,22 +416,30 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
             )
             .pipeline_id(Some(self.upcast::<GlobalScope>().pipeline_id()));
 
-            let (url, source) = match fetch::load_whole_resource(
+            let (url, source) = match load_whole_resource(
                 request,
                 &global_scope.resource_threads().sender(),
                 global_scope,
+                &WorkerCspProcessor {
+                    global_scope: DomRoot::from_ref(global_scope),
+                },
                 can_gc,
             ) {
                 Err(_) => return Err(Error::Network),
                 Ok((metadata, bytes)) => (metadata.final_url, String::from_utf8(bytes).unwrap()),
             };
 
+            let options = self
+                .runtime
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .new_compile_options(url.as_str(), 1);
             let result = self.runtime.borrow().as_ref().unwrap().evaluate_script(
                 self.reflector().get_jsobject(),
                 &source,
-                url.as_str(),
-                1,
                 rval.handle_mut(),
+                options,
             );
 
             maybe_resume_unwind();
@@ -393,19 +487,26 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
     fn SetTimeout(
         &self,
         _cx: JSContext,
-        callback: StringOrFunction,
+        callback: TrustedScriptOrStringOrFunction,
         timeout: i32,
         args: Vec<HandleValue>,
-    ) -> i32 {
+        can_gc: CanGc,
+    ) -> Fallible<i32> {
         let callback = match callback {
-            StringOrFunction::String(i) => TimerCallback::StringTimerCallback(i),
-            StringOrFunction::Function(i) => TimerCallback::FunctionTimerCallback(i),
+            TrustedScriptOrStringOrFunction::String(i) => {
+                TimerCallback::StringTimerCallback(TrustedScriptOrString::String(i))
+            },
+            TrustedScriptOrStringOrFunction::TrustedScript(i) => {
+                TimerCallback::StringTimerCallback(TrustedScriptOrString::TrustedScript(i))
+            },
+            TrustedScriptOrStringOrFunction::Function(i) => TimerCallback::FunctionTimerCallback(i),
         };
         self.upcast::<GlobalScope>().set_timeout_or_interval(
             callback,
             args,
             Duration::from_millis(timeout.max(0) as u64),
             IsInterval::NonInterval,
+            can_gc,
         )
     }
 
@@ -419,19 +520,26 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
     fn SetInterval(
         &self,
         _cx: JSContext,
-        callback: StringOrFunction,
+        callback: TrustedScriptOrStringOrFunction,
         timeout: i32,
         args: Vec<HandleValue>,
-    ) -> i32 {
+        can_gc: CanGc,
+    ) -> Fallible<i32> {
         let callback = match callback {
-            StringOrFunction::String(i) => TimerCallback::StringTimerCallback(i),
-            StringOrFunction::Function(i) => TimerCallback::FunctionTimerCallback(i),
+            TrustedScriptOrStringOrFunction::String(i) => {
+                TimerCallback::StringTimerCallback(TrustedScriptOrString::String(i))
+            },
+            TrustedScriptOrStringOrFunction::TrustedScript(i) => {
+                TimerCallback::StringTimerCallback(TrustedScriptOrString::TrustedScript(i))
+            },
+            TrustedScriptOrStringOrFunction::Function(i) => TimerCallback::FunctionTimerCallback(i),
         };
         self.upcast::<GlobalScope>().set_timeout_or_interval(
             callback,
             args,
             Duration::from_millis(timeout.max(0) as u64),
             IsInterval::Interval,
+            can_gc,
         )
     }
 
@@ -446,17 +554,37 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
             .queue_function_as_microtask(callback);
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-createimagebitmap
+    /// <https://html.spec.whatwg.org/multipage/#dom-createimagebitmap>
     fn CreateImageBitmap(
         &self,
         image: ImageBitmapSource,
         options: &ImageBitmapOptions,
         can_gc: CanGc,
     ) -> Rc<Promise> {
-        let p = self
-            .upcast::<GlobalScope>()
-            .create_image_bitmap(image, options, can_gc);
-        p
+        ImageBitmap::create_image_bitmap(self.upcast(), image, 0, 0, None, None, options, can_gc)
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-createimagebitmap>
+    fn CreateImageBitmap_(
+        &self,
+        image: ImageBitmapSource,
+        sx: i32,
+        sy: i32,
+        sw: i32,
+        sh: i32,
+        options: &ImageBitmapOptions,
+        can_gc: CanGc,
+    ) -> Rc<Promise> {
+        ImageBitmap::create_image_bitmap(
+            self.upcast(),
+            image,
+            sx,
+            sy,
+            Some(sw),
+            Some(sh),
+            options,
+            can_gc,
+        )
     }
 
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
@@ -468,7 +596,7 @@ impl WorkerGlobalScopeMethods<crate::DomTypeHolder> for WorkerGlobalScope {
         comp: InRealm,
         can_gc: CanGc,
     ) -> Rc<Promise> {
-        fetch::Fetch(self.upcast(), input, init, comp, can_gc)
+        Fetch(self.upcast(), input, init, comp, can_gc)
     }
 
     // https://w3c.github.io/hr-time/#the-performance-attribute
@@ -521,12 +649,18 @@ impl WorkerGlobalScope {
         let _aes = AutoEntryScript::new(self.upcast());
         let cx = self.runtime.borrow().as_ref().unwrap().cx();
         rooted!(in(cx) let mut rval = UndefinedValue());
+        let mut options = self
+            .runtime
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .new_compile_options(self.worker_url.borrow().as_str(), 1);
+        options.set_introduction_type(IntroductionType::WORKER);
         match self.runtime.borrow().as_ref().unwrap().evaluate_script(
             self.reflector().get_jsobject(),
             &source,
-            self.worker_url.borrow().as_str(),
-            1,
             rval.handle_mut(),
+            options,
         ) {
             Ok(_) => (),
             Err(_) => {
@@ -576,6 +710,10 @@ impl WorkerGlobalScope {
                     reports_chan.send(ProcessReports::new(reports));
                 });
             },
+            CommonScriptMsg::ReportCspViolations(_, violations) => {
+                self.upcast::<GlobalScope>()
+                    .report_csp_violations(violations, None, None);
+            },
         }
         true
     }
@@ -585,5 +723,16 @@ impl WorkerGlobalScope {
         self.upcast::<GlobalScope>()
             .task_manager()
             .cancel_all_tasks_and_ignore_future_tasks();
+    }
+}
+
+struct WorkerCspProcessor {
+    global_scope: DomRoot<GlobalScope>,
+}
+
+impl CspViolationsProcessor for WorkerCspProcessor {
+    fn process_csp_violations(&self, violations: Vec<Violation>) {
+        self.global_scope
+            .report_csp_violations(violations, None, None);
     }
 }

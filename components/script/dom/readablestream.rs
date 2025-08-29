@@ -12,14 +12,14 @@ use base::id::{MessagePortId, MessagePortIndex};
 use constellation_traits::MessagePortImpl;
 use dom_struct::dom_struct;
 use ipc_channel::ipc::IpcSharedMemory;
-use js::conversions::ToJSValConvertible;
 use js::jsapi::{Heap, JSObject};
-use js::jsval::{JSVal, NullValue, ObjectValue, UndefinedValue};
+use js::jsval::{JSVal, ObjectValue, UndefinedValue};
 use js::rust::{
     HandleObject as SafeHandleObject, HandleValue as SafeHandleValue,
     MutableHandleValue as SafeMutableHandleValue,
 };
 use js::typedarray::ArrayBufferViewU8;
+use script_bindings::conversions::SafeToJSValConvertible;
 
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamBinding::{
@@ -29,12 +29,13 @@ use crate::dom::bindings::codegen::Bindings::ReadableStreamBinding::{
 use script_bindings::str::DOMString;
 
 use crate::dom::domexception::{DOMErrorName, DOMException};
-use script_bindings::conversions::StringificationBehavior;
+use script_bindings::conversions::{is_array_like, StringificationBehavior};
 use super::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategySize;
+use crate::dom::abortsignal::{AbortAlgorithm, AbortSignal};
 use crate::dom::bindings::codegen::Bindings::ReadableStreamDefaultReaderBinding::ReadableStreamDefaultReaderMethods;
 use crate::dom::bindings::codegen::Bindings::ReadableStreamDefaultControllerBinding::ReadableStreamDefaultController_Binding::ReadableStreamDefaultControllerMethods;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::UnderlyingSource as JsUnderlyingSource;
-use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult};
+use crate::dom::bindings::conversions::{ConversionBehavior, ConversionResult, SafeFromJSValConvertible};
 use crate::dom::bindings::error::{Error, ErrorToJsval, Fallible};
 use crate::dom::bindings::codegen::GenericBindings::WritableStreamDefaultWriterBinding::WritableStreamDefaultWriter_Binding::WritableStreamDefaultWriterMethods;
 use crate::dom::writablestream::WritableStream;
@@ -46,7 +47,7 @@ use crate::dom::bindings::utils::get_dictionary_property;
 use crate::dom::countqueuingstrategy::{extract_high_water_mark, extract_size_algorithm};
 use crate::dom::readablestreamgenericreader::ReadableStreamGenericReader;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::promise::Promise;
+use crate::dom::promise::{wait_for_all_promise, Promise};
 use crate::dom::readablebytestreamcontroller::ReadableByteStreamController;
 use crate::dom::readablestreambyobreader::ReadableStreamBYOBReader;
 use crate::dom::readablestreamdefaultcontroller::ReadableStreamDefaultController;
@@ -57,7 +58,6 @@ use crate::dom::underlyingsourcecontainer::UnderlyingSourceType;
 use crate::dom::writablestreamdefaultwriter::WritableStreamDefaultWriter;
 use script_bindings::codegen::GenericBindings::MessagePortBinding::MessagePortMethods;
 use crate::dom::messageport::MessagePort;
-use crate::js::conversions::FromJSValConvertible;
 use crate::realms::{enter_realm, InRealm};
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
@@ -99,6 +99,8 @@ enum ShutdownAction {
     ReadableStreamCancel,
     /// <https://streams.spec.whatwg.org/#writable-stream-default-writer-close-with-error-propagation>
     WritableStreamDefaultWriterCloseWithErrorPropagation,
+    /// <https://streams.spec.whatwg.org/#ref-for-rs-pipeTo-shutdown-with-action>
+    Abort,
 }
 
 impl js::gc::Rootable for PipeTo {}
@@ -113,7 +115,7 @@ impl js::gc::Rootable for PipeTo {}
 /// - Error and close states must be propagated: we'll do this by checking these states at every step.
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
-struct PipeTo {
+pub(crate) struct PipeTo {
     /// <https://streams.spec.whatwg.org/#ref-for-readablestream%E2%91%A7%E2%91%A0>
     reader: Dom<ReadableStreamDefaultReader>,
 
@@ -144,10 +146,15 @@ struct PipeTo {
     #[ignore_malloc_size_of = "Rc are hard"]
     shutting_down: Rc<Cell<bool>>,
 
+    /// The abort reason of the abort signal,
+    /// stored here because we must keep it across a microtask.
+    #[ignore_malloc_size_of = "mozjs"]
+    abort_reason: Rc<Heap<JSVal>>,
+
     /// The error potentially passed to shutdown,
     /// stored here because we must keep it across a microtask.
     #[ignore_malloc_size_of = "mozjs"]
-    shutdown_error: Rc<Heap<JSVal>>,
+    shutdown_error: Rc<RefCell<Option<Heap<JSVal>>>>,
 
     /// The promise returned by a shutdown action.
     /// We keep it to only continue when it is not pending anymore.
@@ -158,6 +165,42 @@ struct PipeTo {
     /// <https://streams.spec.whatwg.org/#rs-pipeTo-finalize>
     #[ignore_malloc_size_of = "Rc are hard"]
     result_promise: Rc<Promise>,
+}
+
+impl PipeTo {
+    /// Run the `abortAlgorithm` defined at
+    /// <https://streams.spec.whatwg.org/#readable-stream-pipe-to>
+    pub(crate) fn abort_with_reason(
+        &self,
+        cx: SafeJSContext,
+        global: &GlobalScope,
+        reason: SafeHandleValue,
+        realm: InRealm,
+        can_gc: CanGc,
+    ) {
+        // Abort should do nothing if we are already shutting down.
+        if self.shutting_down.get() {
+            return;
+        }
+
+        // Let error be signal’s abort reason.
+        // Note: storing it because it may need to be kept across a microtask,
+        // and see the note below as to why it is kept separately from `shutdown_error`.
+        self.abort_reason.set(reason.get());
+
+        // Note: setting the error now,
+        // will result in a rejection of the pipe promise, with this error.
+        // Unless any shutdown action raise their own error,
+        // in which case this error will be overwritten by the shutdown action error.
+        self.set_shutdown_error(reason);
+
+        // Let actions be an empty ordered set.
+        // Note: the actions are defined, and performed, inside `shutdown_with_an_action`.
+
+        // Shutdown with an action consisting of getting a promise to wait for all of the actions in actions,
+        // and with error.
+        self.shutdown(cx, global, Some(ShutdownAction::Abort), realm, can_gc);
+    }
 }
 
 impl Callback for PipeTo {
@@ -206,28 +249,7 @@ impl Callback for PipeTo {
                 // If dest.[[state]] is "writable",
                 // and ! WritableStreamCloseQueuedOrInFlight(dest) is false,
                 if dest.is_writable() && !dest.close_queued_or_in_flight() {
-                    let has_done = {
-                        if !result.is_object() {
-                            false
-                        } else {
-                            rooted!(in(*cx) let object = result.to_object());
-                            rooted!(in(*cx) let mut done = UndefinedValue());
-                            unsafe {
-                                get_dictionary_property(
-                                    *cx,
-                                    object.handle(),
-                                    "done",
-                                    done.handle_mut(),
-                                    can_gc,
-                                )
-                                .unwrap()
-                            }
-                        }
-                    };
-                    // If any chunks have been read but not yet written, write them to dest.
-                    let contained_bytes = self.write_chunk(cx, &global, result, can_gc);
-
-                    if !contained_bytes && !has_done {
+                    let Ok(done) = get_read_promise_done(cx, &result, can_gc) else {
                         // This is the case that the microtask ran in reaction
                         // to the closed promise of the reader,
                         // so we should wait for subsequent chunks,
@@ -235,6 +257,11 @@ impl Callback for PipeTo {
                         // (reader is closed, but there are still pending reads).
                         // Shutdown will happen when the last chunk has been received.
                         return;
+                    };
+
+                    if !done {
+                        // If any chunks have been read but not yet written, write them to dest.
+                        self.write_chunk(cx, &global, result, can_gc);
                     }
                 }
             }
@@ -264,6 +291,11 @@ impl Callback for PipeTo {
             PipeToState::PendingRead => {
                 // Write the chunk.
                 self.write_chunk(cx, &global, result, can_gc);
+
+                // An early return is necessary if the write algorithm aborted the pipe.
+                if self.shutting_down.get() {
+                    return;
+                }
 
                 // Wait for the writer to be ready again.
                 self.wait_for_writer_ready(&global, realm, can_gc);
@@ -296,12 +328,26 @@ impl Callback for PipeTo {
                     return;
                 }
 
+                let is_array_like = {
+                    if !result.is_object() {
+                        false
+                    } else {
+                        unsafe { is_array_like::<crate::DomTypeHolder>(*cx, result) }
+                    }
+                };
+
                 // Finalize, passing along error if it was given.
-                if !result.is_undefined() {
-                    // All actions either resolve with undefined,
+                if !result.is_undefined() && !is_array_like {
+                    // Most actions either resolve with undefined,
                     // or reject with an error,
                     // and the error should be used when finalizing.
-                    self.shutdown_error.set(result.get());
+                    // One exception is the `Abort` action,
+                    // which resolves with a list of undefined values.
+
+                    // If `result` isn't undefined or array-like,
+                    // then it is an error
+                    // and should overwrite the current shutdown error.
+                    self.set_shutdown_error(result);
                 }
                 self.finalize(cx, &global, can_gc);
             },
@@ -311,6 +357,16 @@ impl Callback for PipeTo {
 }
 
 impl PipeTo {
+    /// Setting shutdown error in a way that ensures it isn't
+    /// moved after it has been set.
+    fn set_shutdown_error(&self, error: SafeHandleValue) {
+        *self.shutdown_error.borrow_mut() = Some(Heap::default());
+        let Some(ref heap) = *self.shutdown_error.borrow() else {
+            unreachable!("Option set to Some(heap) above.");
+        };
+        heap.set(error.get())
+    }
+
     /// Wait for the writer to be ready,
     /// which implements the constraint that backpressure must be enforced.
     fn wait_for_writer_ready(&self, global: &GlobalScope, realm: InRealm, can_gc: CanGc) {
@@ -374,7 +430,7 @@ impl PipeTo {
                 get_dictionary_property(*cx, object.handle(), "value", bytes.handle_mut(), can_gc)
                     .expect("Chunk should have a value.")
             };
-            if !bytes.is_undefined() && has_value {
+            if has_value {
                 // Write the chunk.
                 let write_promise = self.writer.write(cx, global, bytes.handle(), can_gc);
                 self.pending_writes.borrow_mut().push_back(write_promise);
@@ -426,7 +482,7 @@ impl PipeTo {
         if source.is_errored() {
             rooted!(in(*cx) let mut source_error = UndefinedValue());
             source.get_stored_error(source_error.handle_mut());
-            self.shutdown_error.set(source_error.get());
+            self.set_shutdown_error(source_error.handle());
 
             // If preventAbort is false,
             if !self.prevent_abort {
@@ -469,7 +525,7 @@ impl PipeTo {
         if dest.is_errored() {
             rooted!(in(*cx) let mut dest_error = UndefinedValue());
             dest.get_stored_error(dest_error.handle_mut());
-            self.shutdown_error.set(dest_error.get());
+            self.set_shutdown_error(dest_error.handle());
 
             // If preventCancel is false,
             if !self.prevent_cancel {
@@ -558,7 +614,7 @@ impl PipeTo {
             let error =
                 Error::Type("Destination is closed or has closed queued or in flight".to_string());
             error.to_jsval(cx, global, dest_closed.handle_mut(), can_gc);
-            self.shutdown_error.set(dest_closed.get());
+            self.set_shutdown_error(dest_closed.handle());
 
             // If preventCancel is false,
             if !self.prevent_cancel {
@@ -629,14 +685,18 @@ impl PipeTo {
         realm: InRealm,
         can_gc: CanGc,
     ) {
-        rooted!(in(*cx) let mut error = self.shutdown_error.get());
+        rooted!(in(*cx) let mut error = UndefinedValue());
+        if let Some(shutdown_error) = self.shutdown_error.borrow().as_ref() {
+            error.set(shutdown_error.get());
+        }
+
         *self.state.borrow_mut() = PipeToState::ShuttingDownPendingAction;
 
         // Let p be the result of performing action.
         let promise = match action {
             ShutdownAction::WritableStreamAbort => {
                 let dest = self.writer.get_stream().expect("Stream must be set");
-                dest.abort(cx, global, error.handle(), can_gc)
+                dest.abort(cx, global, error.handle(), realm, can_gc)
             },
             ShutdownAction::ReadableStreamCancel => {
                 let source = self
@@ -647,6 +707,55 @@ impl PipeTo {
             },
             ShutdownAction::WritableStreamDefaultWriterCloseWithErrorPropagation => {
                 self.writer.close_with_error_propagation(cx, global, can_gc)
+            },
+            ShutdownAction::Abort => {
+                // Note: implementation of the the `abortAlgorithm`
+                // of the signal associated with this piping operation.
+
+                // Let error be signal’s abort reason.
+                rooted!(in(*cx) let mut error = UndefinedValue());
+                error.set(self.abort_reason.get());
+
+                // Let actions be an empty ordered set.
+                let mut actions = vec![];
+
+                // If preventAbort is false, append the following action to actions:
+                if !self.prevent_abort {
+                    let dest = self
+                        .writer
+                        .get_stream()
+                        .expect("Destination stream must be set");
+
+                    // If dest.[[state]] is "writable",
+                    let promise = if dest.is_writable() {
+                        // return ! WritableStreamAbort(dest, error)
+                        dest.abort(cx, global, error.handle(), realm, can_gc)
+                    } else {
+                        // Otherwise, return a promise resolved with undefined.
+                        Promise::new_resolved(global, cx, (), can_gc)
+                    };
+                    actions.push(promise);
+                }
+
+                // If preventCancel is false, append the following action action to actions:
+                if !self.prevent_cancel {
+                    let source = self.reader.get_stream().expect("Source stream must be set");
+
+                    // If source.[[state]] is "readable",
+                    let promise = if source.is_readable() {
+                        // return ! ReadableStreamCancel(source, error).
+                        source.cancel(cx, global, error.handle(), can_gc)
+                    } else {
+                        // Otherwise, return a promise resolved with undefined.
+                        Promise::new_resolved(global, cx, (), can_gc)
+                    };
+                    actions.push(promise);
+                }
+
+                // Shutdown with an action consisting
+                // of getting a promise to wait for all of the actions in actions,
+                // and with error.
+                wait_for_all_promise(cx, global, actions, realm, can_gc)
             },
         };
 
@@ -679,10 +788,13 @@ impl PipeTo {
             .expect("Releasing the reader should not fail");
 
         // If signal is not undefined, remove abortAlgorithm from signal.
-        // TODO: implement AbortSignal.
+        // Note: since `self.shutdown` is true at this point,
+        // the abort algorithm is a no-op,
+        // so for now not implementing this step.
 
-        rooted!(in(*cx) let mut error = self.shutdown_error.get());
-        if !error.is_null() {
+        if let Some(shutdown_error) = self.shutdown_error.borrow().as_ref() {
+            rooted!(in(*cx) let mut error = UndefinedValue());
+            error.set(shutdown_error.get());
             // If error was given, reject promise with error.
             self.result_promise.reject_native(&error.handle(), can_gc);
         } else {
@@ -1441,7 +1553,6 @@ impl ReadableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#readable-stream-cancel>
-    #[allow(unsafe_code)]
     pub(crate) fn cancel(
         &self,
         cx: SafeJSContext,
@@ -1459,12 +1570,10 @@ impl ReadableStream {
         // If stream.[[state]] is "errored", return a promise rejected with stream.[[storedError]].
         if self.is_errored() {
             let promise = Promise::new(global, can_gc);
-            unsafe {
-                rooted!(in(*cx) let mut rval = UndefinedValue());
-                self.stored_error.to_jsval(*cx, rval.handle_mut());
-                promise.reject_native(&rval.handle(), can_gc);
-                return promise;
-            }
+            rooted!(in(*cx) let mut rval = UndefinedValue());
+            self.stored_error.safe_to_jsval(cx, rval.handle_mut());
+            promise.reject_native(&rval.handle(), can_gc);
+            return promise;
         }
         // Perform ! ReadableStreamClose(stream).
         self.close(can_gc);
@@ -1636,9 +1745,10 @@ impl ReadableStream {
         cx: SafeJSContext,
         global: &GlobalScope,
         dest: &WritableStream,
+        prevent_close: bool,
         prevent_abort: bool,
         prevent_cancel: bool,
-        prevent_close: bool,
+        signal: Option<&AbortSignal>,
         realm: InRealm,
         can_gc: CanGc,
     ) -> Rc<Promise> {
@@ -1649,7 +1759,7 @@ impl ReadableStream {
 
         // If signal was not given, let signal be undefined.
         // Assert: either signal is undefined, or signal implements AbortSignal.
-        // TODO: implement AbortSignal.
+        // Note: done with the `signal` argument.
 
         // Assert: ! IsReadableStreamLocked(source) is false.
         assert!(!self.is_locked());
@@ -1682,9 +1792,6 @@ impl ReadableStream {
         // Let promise be a new promise.
         let promise = Promise::new(global, can_gc);
 
-        // If signal is not undefined,
-        // TODO: implement AbortSignal.
-
         // In parallel, but not really, using reader and writer, read all chunks from source and write them to dest.
         rooted!(in(*cx) let pipe_to = PipeTo {
             reader: Dom::from_ref(&reader),
@@ -1695,15 +1802,28 @@ impl ReadableStream {
             prevent_cancel,
             prevent_close,
             shutting_down: Default::default(),
+            abort_reason: Default::default(),
             shutdown_error: Default::default(),
             shutdown_action_promise:  Default::default(),
             result_promise: promise.clone(),
         });
 
-        // Note: set the shutdown error to null,
-        // to distinguish it from cases
-        // where the error is set to undefined.
-        pipe_to.shutdown_error.set(NullValue());
+        // If signal is not undefined,
+        // Note: moving the steps to here, so that the `PipeTo` is available.
+        if let Some(signal) = signal {
+            // Let abortAlgorithm be the following steps:
+            // Note: steps are implemented at call site.
+            rooted!(in(*cx) let abort_algorithm = AbortAlgorithm::StreamPiping(pipe_to.clone()));
+
+            // If signal is aborted, perform abortAlgorithm and return promise.
+            if signal.aborted() {
+                signal.run_abort_algorithm(cx, global, &abort_algorithm, realm, can_gc);
+                return promise;
+            }
+
+            // Add abortAlgorithm to signal.
+            signal.add(&abort_algorithm);
+        }
 
         // Note: perfom checks now, since streams can start as closed or errored.
         pipe_to.check_and_propagate_errors_forward(cx, global, realm, can_gc);
@@ -1926,7 +2046,7 @@ impl ReadableStreamMethods<crate::DomTypeHolder> for ReadableStream {
             // If ! IsReadableStreamLocked(this) is true,
             // return a promise rejected with a TypeError exception.
             let promise = Promise::new(&global, can_gc);
-            promise.reject_error(Error::Type("stream is not locked".to_owned()), can_gc);
+            promise.reject_error(Error::Type("stream is locked".to_owned()), can_gc);
             promise
         } else {
             // Return ! ReadableStreamCancel(this, reason).
@@ -1992,16 +2112,17 @@ impl ReadableStreamMethods<crate::DomTypeHolder> for ReadableStream {
         }
 
         // Let signal be options["signal"] if it exists, or undefined otherwise.
-        // TODO: implement AbortSignal.
+        let signal = options.signal.as_deref();
 
         // Return ! ReadableStreamPipeTo.
         self.pipe_to(
             cx,
             &global,
             destination,
+            options.preventClose,
             options.preventAbort,
             options.preventCancel,
-            options.preventClose,
+            signal,
             realm,
             can_gc,
         )
@@ -2029,7 +2150,7 @@ impl ReadableStreamMethods<crate::DomTypeHolder> for ReadableStream {
         }
 
         // Let signal be options["signal"] if it exists, or undefined otherwise.
-        // TODO: implement AbortSignal.
+        let signal = options.signal.as_deref();
 
         // Let promise be ! ReadableStreamPipeTo(this, transform["writable"],
         // options["preventClose"], options["preventAbort"], options["preventCancel"], signal).
@@ -2037,9 +2158,10 @@ impl ReadableStreamMethods<crate::DomTypeHolder> for ReadableStream {
             cx,
             &global,
             &transform.writable,
+            options.preventClose,
             options.preventAbort,
             options.preventCancel,
-            options.preventClose,
+            signal,
             realm,
             can_gc,
         );
@@ -2086,10 +2208,8 @@ pub(crate) unsafe fn get_type_and_value_from_message(
         .expect("Getting the value should not fail.");
 
     // Assert: type is a String.
-    let result = unsafe {
-        DOMString::from_jsval(*cx, type_.handle(), StringificationBehavior::Empty)
-            .expect("The type of the message should be a string")
-    };
+    let result = DOMString::safe_from_jsval(cx, type_.handle(), StringificationBehavior::Empty)
+        .expect("The type of the message should be a string");
     let ConversionResult::Success(type_string) = result else {
         unreachable!("The type of the message should be a string");
     };
@@ -2155,7 +2275,6 @@ impl CrossRealmTransformReadable {
 
     /// <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
     /// Add a handler for port’s messageerror event with the following steps:
-    #[allow(unsafe_code)]
     pub(crate) fn handle_error(
         &self,
         cx: SafeJSContext,
@@ -2167,7 +2286,7 @@ impl CrossRealmTransformReadable {
         // Let error be a new "DataCloneError" DOMException.
         let error = DOMException::new(global, DOMErrorName::DataCloneError, can_gc);
         rooted!(in(*cx) let mut rooted_error = UndefinedValue());
-        unsafe { error.to_jsval(*cx, rooted_error.handle_mut()) };
+        error.safe_to_jsval(cx, rooted_error.handle_mut());
 
         // Perform ! CrossRealmTransformSendError(port, error).
         port.cross_realm_transform_send_error(rooted_error.handle(), can_gc);
@@ -2194,7 +2313,7 @@ pub(crate) fn get_read_promise_done(
         rooted!(in(*cx) let object = v.to_object());
         rooted!(in(*cx) let mut done = UndefinedValue());
         match get_dictionary_property(*cx, object.handle(), "done", done.handle_mut(), can_gc) {
-            Ok(true) => match bool::from_jsval(*cx, done.handle(), ()) {
+            Ok(true) => match bool::safe_from_jsval(cx, done.handle(), ()) {
                 Ok(ConversionResult::Success(val)) => Ok(val),
                 Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.to_string())),
                 _ => Err(Error::Type("Unknown format for done property.".to_string())),
@@ -2222,7 +2341,11 @@ pub(crate) fn get_read_promise_bytes(
         rooted!(in(*cx) let mut bytes = UndefinedValue());
         match get_dictionary_property(*cx, object.handle(), "value", bytes.handle_mut(), can_gc) {
             Ok(true) => {
-                match Vec::<u8>::from_jsval(*cx, bytes.handle(), ConversionBehavior::EnforceRange) {
+                match Vec::<u8>::safe_from_jsval(
+                    cx,
+                    bytes.handle(),
+                    ConversionBehavior::EnforceRange,
+                ) {
                     Ok(ConversionResult::Success(val)) => Ok(val),
                     Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.to_string())),
                     _ => Err(Error::Type("Unknown format for bytes read.".to_string())),
@@ -2239,11 +2362,12 @@ impl Transferable for ReadableStream {
     type Index = MessagePortIndex;
     type Data = MessagePortImpl;
 
-    /// <https://streams.spec.whatwg.org/#ref-for-readablestream%E2%91%A1%E2%91%A0>
-    fn transfer(&self) -> Result<(MessagePortId, MessagePortImpl), ()> {
-        // If ! IsReadableStreamLocked(value) is true, throw a "DataCloneError" DOMException.
+    /// <https://streams.spec.whatwg.org/#ref-for-transfer-steps>
+    fn transfer(&self) -> Fallible<(MessagePortId, MessagePortImpl)> {
+        // Step 1. If ! IsReadableStreamLocked(value) is true, throw a
+        // "DataCloneError" DOMException.
         if self.is_locked() {
-            return Err(());
+            return Err(Error::DataClone(None));
         }
 
         let global = self.global();
@@ -2252,34 +2376,36 @@ impl Transferable for ReadableStream {
         let cx = GlobalScope::get_cx();
         let can_gc = CanGc::note();
 
-        // Let port1 be a new MessagePort in the current Realm.
+        // Step 2. Let port1 be a new MessagePort in the current Realm.
         let port_1 = MessagePort::new(&global, can_gc);
         global.track_message_port(&port_1, None);
 
-        // Let port2 be a new MessagePort in the current Realm.
+        // Step 3. Let port2 be a new MessagePort in the current Realm.
         let port_2 = MessagePort::new(&global, can_gc);
         global.track_message_port(&port_2, None);
 
-        // Entangle port1 and port2.
+        // Step 4. Entangle port1 and port2.
         global.entangle_ports(*port_1.message_port_id(), *port_2.message_port_id());
 
-        // Let writable be a new WritableStream in the current Realm.
+        // Step 5. Let writable be a new WritableStream in the current Realm.
         let writable = WritableStream::new_with_proto(&global, None, can_gc);
 
-        // Perform ! SetUpCrossRealmTransformWritable(writable, port1).
+        // Step 6. Perform ! SetUpCrossRealmTransformWritable(writable, port1).
         writable.setup_cross_realm_transform_writable(cx, &port_1, can_gc);
 
-        // Let promise be ! ReadableStreamPipeTo(value, writable, false, false, false).
-        let promise = self.pipe_to(cx, &global, &writable, false, false, false, comp, can_gc);
+        // Step 7. Let promise be ! ReadableStreamPipeTo(value, writable, false, false, false).
+        let promise = self.pipe_to(
+            cx, &global, &writable, false, false, false, None, comp, can_gc,
+        );
 
-        // Set promise.[[PromiseIsHandled]] to true.
+        // Step 8. Set promise.[[PromiseIsHandled]] to true.
         promise.set_promise_is_handled();
 
-        // Set dataHolder.[[port]] to ! StructuredSerializeWithTransfer(port2, « port2 »).
+        // Step 9. Set dataHolder.[[port]] to ! StructuredSerializeWithTransfer(port2, « port2 »).
         port_2.transfer()
     }
 
-    /// <https://streams.spec.whatwg.org/#ref-for-readablestream%E2%91%A1%E2%91%A0>
+    /// <https://streams.spec.whatwg.org/#ref-for-transfer-receiving-steps>
     fn transfer_receive(
         owner: &GlobalScope,
         id: MessagePortId,
@@ -2292,13 +2418,15 @@ impl Transferable for ReadableStream {
         // Note: dataHolder is used in `structuredclone.rs`, and value is created here.
         let value = ReadableStream::new_with_proto(owner, None, can_gc);
 
-        // Let deserializedRecord be ! StructuredDeserializeWithTransfer(dataHolder.[[port]], the current Realm).
+        // Step 1. Let deserializedRecord be !
+        // StructuredDeserializeWithTransfer(dataHolder.[[port]], the current
+        // Realm).
         // Done with the `Deserialize` derive of `MessagePortImpl`.
 
-        // Let port be deserializedRecord.[[Deserialized]].
+        // Step 2. Let port be deserializedRecord.[[Deserialized]].
         let transferred_port = MessagePort::transfer_receive(owner, id, port_impl)?;
 
-        // Perform ! SetUpCrossRealmTransformReadable(value, port).
+        // Step 3. Perform ! SetUpCrossRealmTransformReadable(value, port).
         value.setup_cross_realm_transform_readable(cx, &transferred_port, can_gc);
         Ok(value)
     }

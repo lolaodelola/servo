@@ -3,18 +3,18 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 //! Utilities for querying the layout, as needed by layout.
-use std::sync::Arc;
+use std::rc::Rc;
 
 use app_units::Au;
+use compositing_traits::display_list::ScrollTree;
 use euclid::default::{Point2D, Rect};
 use euclid::{SideOffsets2D, Size2D};
 use itertools::Itertools;
-use script::layout_dom::ServoLayoutNode;
-use script_layout_interface::wrapper_traits::{
-    LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
-};
-use script_layout_interface::{LayoutElementType, LayoutNodeType, OffsetParentResponse};
+use layout_api::wrapper_traits::{LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode};
+use layout_api::{BoxAreaType, LayoutElementType, LayoutNodeType, OffsetParentResponse};
+use script::layout_dom::{ServoLayoutNode, ServoThreadSafeLayoutNode};
 use servo_arc::Arc as ServoArc;
+use servo_geometry::{FastLayoutTransform, au_rect_to_f32_rect, f32_rect_to_au_rect};
 use servo_url::ServoUrl;
 use style::computed_values::display::T as Display;
 use style::computed_values::position::T as Position;
@@ -37,40 +37,85 @@ use style::values::generics::font::LineHeight;
 use style::values::generics::position::AspectRatio;
 use style::values::specified::GenericGridTemplateComponent;
 use style::values::specified::box_::DisplayInside;
+use style::values::specified::text::TextTransformCase;
 use style_traits::{ParsingMode, ToCss};
 
 use crate::ArcRefCell;
+use crate::display_list::StackingContextTree;
 use crate::dom::NodeExt;
-use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse};
+use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse, capitalize_string};
 use crate::fragment_tree::{
     BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo,
 };
 use crate::taffy::SpecificTaffyGridInfo;
 
-pub fn process_content_box_request(node: ServoLayoutNode<'_>) -> Option<Rect<Au>> {
+/// Get a scroll node that would represents this [`ServoLayoutNode`]'s transform and
+/// calculate its cumlative transform from its root scroll node to the scroll node.
+fn root_transform_for_layout_node(
+    scroll_tree: &ScrollTree,
+    node: ServoThreadSafeLayoutNode<'_>,
+) -> Option<FastLayoutTransform> {
+    let fragments = node.fragments_for_pseudo(None);
+    let box_fragment = fragments
+        .first()
+        .and_then(Fragment::retrieve_box_fragment)?
+        .borrow();
+    let scroll_tree_node_id = box_fragment
+        .spatial_tree_node
+        .borrow()
+        .expect("Should always have a scroll tree node when querying bounding box.");
+    Some(scroll_tree.cumulative_node_to_root_transform(&scroll_tree_node_id))
+}
+
+pub(crate) fn process_box_area_request(
+    stacking_context_tree: &StackingContextTree,
+    node: ServoThreadSafeLayoutNode<'_>,
+    area: BoxAreaType,
+) -> Option<Rect<Au>> {
     let rects: Vec<_> = node
         .fragments_for_pseudo(None)
         .iter()
-        .filter_map(Fragment::cumulative_border_box_rect)
+        .filter_map(|node| node.cumulative_box_area_rect(area))
         .collect();
     if rects.is_empty() {
         return None;
     }
-
-    Some(rects.iter().fold(Rect::zero(), |unioned_rect, rect| {
+    let rect_union = rects.iter().fold(Rect::zero(), |unioned_rect, rect| {
         rect.to_untyped().union(&unioned_rect)
-    }))
+    });
+
+    let Some(transform) =
+        root_transform_for_layout_node(&stacking_context_tree.compositor_info.scroll_tree, node)
+    else {
+        return Some(rect_union);
+    };
+
+    transform_au_rectangle(rect_union, transform)
 }
 
-pub fn process_content_boxes_request(node: ServoLayoutNode<'_>) -> Vec<Rect<Au>> {
-    node.fragments_for_pseudo(None)
+pub(crate) fn process_box_areas_request(
+    stacking_context_tree: &StackingContextTree,
+    node: ServoThreadSafeLayoutNode<'_>,
+    area: BoxAreaType,
+) -> Vec<Rect<Au>> {
+    let fragments = node.fragments_for_pseudo(None);
+    let box_areas = fragments
         .iter()
-        .filter_map(Fragment::cumulative_border_box_rect)
-        .map(|rect| rect.to_untyped())
+        .filter_map(|node| node.cumulative_box_area_rect(area))
+        .map(|rect| rect.to_untyped());
+
+    let Some(transform) =
+        root_transform_for_layout_node(&stacking_context_tree.compositor_info.scroll_tree, node)
+    else {
+        return box_areas.collect();
+    };
+
+    box_areas
+        .filter_map(|rect| transform_au_rectangle(rect, transform))
         .collect()
 }
 
-pub fn process_client_rect_request(node: ServoLayoutNode<'_>) -> Rect<i32> {
+pub fn process_client_rect_request(node: ServoThreadSafeLayoutNode<'_>) -> Rect<i32> {
     node.fragments_for_pseudo(None)
         .first()
         .map(Fragment::client_rect)
@@ -79,8 +124,8 @@ pub fn process_client_rect_request(node: ServoLayoutNode<'_>) -> Rect<i32> {
 
 /// <https://drafts.csswg.org/cssom-view/#scrolling-area>
 pub fn process_node_scroll_area_request(
-    requested_node: Option<ServoLayoutNode<'_>>,
-    fragment_tree: Option<Arc<FragmentTree>>,
+    requested_node: Option<ServoThreadSafeLayoutNode<'_>>,
+    fragment_tree: Option<Rc<FragmentTree>>,
 ) -> Rect<i32> {
     let Some(tree) = fragment_tree else {
         return Rect::zero();
@@ -92,7 +137,7 @@ pub fn process_node_scroll_area_request(
             .first()
             .map(Fragment::scrolling_area)
             .unwrap_or_default(),
-        None => tree.get_scrolling_area_for_viewport(),
+        None => tree.scrollable_overflow(),
     };
 
     Rect::new(
@@ -213,7 +258,7 @@ pub fn process_resolved_style_request(
                 let content_rect = box_fragment.content_rect;
                 let margins = box_fragment.margin;
                 let padding = box_fragment.padding;
-                let specific_layout_info = box_fragment.specific_layout_info.clone();
+                let specific_layout_info = box_fragment.specific_layout_info().cloned();
                 (content_rect, margins, padding, specific_layout_info)
             },
             Fragment::Positioning(positioning_fragment) => {
@@ -268,7 +313,8 @@ pub fn process_resolved_style_request(
         .to_css_string()
     };
 
-    node.fragments_for_pseudo(*pseudo)
+    node.to_threadsafe()
+        .fragments_for_pseudo(*pseudo)
         .first()
         .map(resolve_for_fragment)
         .unwrap_or_else(|| computed_style(None))
@@ -441,7 +487,11 @@ fn offset_parent_fragments(node: ServoLayoutNode<'_>) -> Option<OffsetParentFrag
     //  * The element is the root element.
     //  * The element is the HTML body element.
     //  * The element’s computed value of the position property is fixed.
-    let fragment = node.fragments_for_pseudo(None).first().cloned()?;
+    let fragment = node
+        .to_threadsafe()
+        .fragments_for_pseudo(None)
+        .first()
+        .cloned()?;
     let flags = fragment.base()?.flags;
     if flags.intersects(
         FragmentFlags::IS_ROOT_ELEMENT | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
@@ -464,14 +514,22 @@ fn offset_parent_fragments(node: ServoLayoutNode<'_>) -> Option<OffsetParentFrag
     while let Some(parent_node) = maybe_parent_node {
         maybe_parent_node = parent_node.parent_node();
 
-        if let Some(parent_fragment) = parent_node.fragments_for_pseudo(None).first() {
+        if let Some(parent_fragment) = parent_node
+            .to_threadsafe()
+            .fragments_for_pseudo(None)
+            .first()
+        {
             let parent_fragment = match parent_fragment {
                 Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => box_fragment,
                 _ => continue,
             };
 
-            let grandparent_fragment =
-                maybe_parent_node.and_then(|node| node.fragments_for_pseudo(None).first().cloned());
+            let grandparent_fragment = maybe_parent_node.and_then(|node| {
+                node.to_threadsafe()
+                    .fragments_for_pseudo(None)
+                    .first()
+                    .cloned()
+            });
 
             if parent_fragment.borrow().style.get_box().position != Position::Static {
                 return Some(OffsetParentFragments {
@@ -514,8 +572,12 @@ pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetPa
     // [1]: https://github.com/w3c/csswg-drafts/issues/4541
     // > 1. If the element is the HTML body element or does not have any associated CSS
     //      layout box return zero and terminate this algorithm.
-    let fragment = node.fragments_for_pseudo(None).first().cloned()?;
-    let mut border_box = fragment.cumulative_border_box_rect()?;
+    let fragment = node
+        .to_threadsafe()
+        .fragments_for_pseudo(None)
+        .first()
+        .cloned()?;
+    let mut border_box = fragment.cumulative_box_area_rect(BoxAreaType::Border)?;
 
     // 2.  If the offsetParent of the element is null return the x-coordinate of the left
     //     border edge of the first CSS layout box associated with the element, relative to
@@ -777,11 +839,17 @@ fn rendered_text_collection_steps(
                 // rules are slightly modified: collapsible spaces at the end of lines are always
                 // collapsed, but they are only removed if the line is the last line of the block,
                 // or it ends with a br element. Soft hyphens should be preserved.
-                let mut transformed_text: String = TextTransformation::new(
-                    with_white_space_rules_applied,
-                    style.clone_text_transform().case(),
-                )
-                .collect();
+                let text_transform = style.clone_text_transform().case();
+                let mut transformed_text: String =
+                    TextTransformation::new(with_white_space_rules_applied, text_transform)
+                        .collect();
+
+                // Since iterator for capitalize not doing anything, we must handle it outside here
+                // FIXME: This assumes the element always start at a word boundary. But can fail:
+                // a<span style="text-transform: capitalize">b</span>c
+                if TextTransformCase::Capitalize == text_transform {
+                    transformed_text = capitalize_string(&transformed_text, true);
+                }
 
                 let is_preformatted_element =
                     white_space_collapse == WhiteSpaceCollapseValue::Preserve;
@@ -1098,4 +1166,19 @@ where
         resolve_for_declarations::<E>(context, Some(&*parent_style), declarations, shared_lock);
 
     Some(computed_values.clone_font())
+}
+
+fn transform_au_rectangle(
+    rect_to_transform: Rect<Au>,
+    transform: FastLayoutTransform,
+) -> Option<Rect<Au>> {
+    let rect_to_transform = &au_rect_to_f32_rect(rect_to_transform).cast_unit();
+    let outer_transformed_rect = match transform {
+        FastLayoutTransform::Offset(offset) => Some(rect_to_transform.translate(offset)),
+        FastLayoutTransform::Transform { transform, .. } => {
+            transform.outer_transformed_rect(rect_to_transform)
+        },
+    };
+    outer_transformed_rect
+        .map(|transformed_rect| f32_rect_to_au_rect(transformed_rect.to_untyped()))
 }

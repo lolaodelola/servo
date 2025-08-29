@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::option::Option;
 use std::result::Result;
 
+use base::generic_channel::{GenericSender, RoutedReceiver};
 use base::id::PipelineId;
 #[cfg(feature = "bluetooth")]
 use bluetooth_traits::BluetoothRequest;
@@ -16,7 +17,7 @@ use crossbeam_channel::{Receiver, SendError, Sender, select};
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg};
 use ipc_channel::ipc::IpcSender;
 use net_traits::FetchResponseMsg;
-use net_traits::image_cache::PendingImageResponse;
+use net_traits::image_cache::ImageCacheResponseMessage;
 use profile_traits::mem::{self as profile_mem, OpaqueSender, ReportsChan};
 use profile_traits::time::{self as profile_time};
 use script_traits::{Painter, ScriptThreadMessage};
@@ -27,6 +28,7 @@ use webgpu_traits::WebGPUMsg;
 
 use crate::dom::abstractworker::WorkerScriptMsg;
 use crate::dom::bindings::trace::CustomTraceable;
+use crate::dom::csp::Violation;
 use crate::dom::dedicatedworkerglobalscope::DedicatedWorkerScriptMsg;
 use crate::dom::serviceworkerglobalscope::ServiceWorkerScriptMsg;
 use crate::dom::worker::TrustedWorkerAddress;
@@ -35,12 +37,13 @@ use crate::task::TaskBox;
 use crate::task_queue::{QueuedTask, QueuedTaskConversion, TaskQueue};
 use crate::task_source::TaskSourceName;
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum MixedMessage {
     FromConstellation(ScriptThreadMessage),
     FromScript(MainThreadScriptMsg),
     FromDevtools(DevtoolScriptControlMsg),
-    FromImageCache(PendingImageResponse),
+    FromImageCache(ImageCacheResponseMessage),
     #[cfg(feature = "webgpu")]
     FromWebGPUServer(WebGPUMsg),
     TimerFired,
@@ -58,9 +61,10 @@ impl MixedMessage {
                 ScriptThreadMessage::ThemeChange(id, ..) => Some(*id),
                 ScriptThreadMessage::ResizeInactive(id, ..) => Some(*id),
                 ScriptThreadMessage::UnloadDocument(id) => Some(*id),
-                ScriptThreadMessage::ExitPipeline(id, ..) => Some(*id),
+                ScriptThreadMessage::ExitPipeline(_webview_id, id, ..) => Some(*id),
                 ScriptThreadMessage::ExitScriptThread => None,
                 ScriptThreadMessage::SendInputEvent(id, ..) => Some(*id),
+                ScriptThreadMessage::RefreshCursor(id, ..) => Some(*id),
                 ScriptThreadMessage::Viewport(id, ..) => Some(*id),
                 ScriptThreadMessage::GetTitle(id) => Some(*id),
                 ScriptThreadMessage::SetDocumentActivity(id, ..) => Some(*id),
@@ -92,19 +96,32 @@ impl MixedMessage {
                 ScriptThreadMessage::SetWebGPUPort(..) => None,
                 ScriptThreadMessage::SetScrollStates(id, ..) => Some(*id),
                 ScriptThreadMessage::EvaluateJavaScript(id, _, _) => Some(*id),
+                ScriptThreadMessage::SendImageKeysBatch(..) => None,
+                ScriptThreadMessage::PreferencesUpdated(..) => None,
             },
             MixedMessage::FromScript(inner_msg) => match inner_msg {
                 MainThreadScriptMsg::Common(CommonScriptMsg::Task(_, _, pipeline_id, _)) => {
                     *pipeline_id
                 },
                 MainThreadScriptMsg::Common(CommonScriptMsg::CollectReports(_)) => None,
+                MainThreadScriptMsg::Common(CommonScriptMsg::ReportCspViolations(
+                    pipeline_id,
+                    _,
+                )) => Some(*pipeline_id),
                 MainThreadScriptMsg::NavigationResponse { pipeline_id, .. } => Some(*pipeline_id),
                 MainThreadScriptMsg::WorkletLoaded(pipeline_id) => Some(*pipeline_id),
                 MainThreadScriptMsg::RegisterPaintWorklet { pipeline_id, .. } => Some(*pipeline_id),
                 MainThreadScriptMsg::Inactive => None,
                 MainThreadScriptMsg::WakeUp => None,
             },
-            MixedMessage::FromImageCache(response) => Some(response.pipeline_id),
+            MixedMessage::FromImageCache(response) => match response {
+                ImageCacheResponseMessage::NotifyPendingImageLoadStatus(response) => {
+                    Some(response.pipeline_id)
+                },
+                ImageCacheResponseMessage::VectorImageRasterizationComplete(response) => {
+                    Some(response.pipeline_id)
+                },
+            },
             MixedMessage::FromDevtools(_) | MixedMessage::TimerFired => None,
             #[cfg(feature = "webgpu")]
             MixedMessage::FromWebGPUServer(..) => None,
@@ -149,6 +166,8 @@ pub(crate) enum CommonScriptMsg {
         Option<PipelineId>,
         TaskSourceName,
     ),
+    /// Report CSP violations in the script
+    ReportCspViolations(PipelineId, Vec<Violation>),
 }
 
 impl fmt::Debug for CommonScriptMsg {
@@ -158,6 +177,7 @@ impl fmt::Debug for CommonScriptMsg {
             CommonScriptMsg::Task(ref category, ref task, _, _) => {
                 f.debug_tuple("Task").field(category).field(task).finish()
             },
+            CommonScriptMsg::ReportCspViolations(..) => write!(f, "ReportCspViolations(...)"),
         }
     }
 }
@@ -314,19 +334,19 @@ pub(crate) struct ScriptThreadSenders {
 
     /// A [`Sender`] that sends messages to the `Constellation`.
     #[no_trace]
-    pub(crate) constellation_sender: IpcSender<ScriptThreadMessage>,
+    pub(crate) constellation_sender: GenericSender<ScriptThreadMessage>,
 
     /// A [`Sender`] that sends messages to the `Constellation` associated with
     /// particular pipelines.
     #[no_trace]
     pub(crate) pipeline_to_constellation_sender:
-        IpcSender<(PipelineId, ScriptToConstellationMessage)>,
+        GenericSender<(PipelineId, ScriptToConstellationMessage)>,
 
     /// The shared [`IpcSender`] which is sent to the `ImageCache` when requesting an image. The
     /// messages on this channel are routed to crossbeam [`Sender`] on the router thread, which
     /// in turn sends messages to [`ScriptThreadReceivers::image_cache_receiver`].
     #[no_trace]
-    pub(crate) image_cache_sender: IpcSender<PendingImageResponse>,
+    pub(crate) image_cache_sender: IpcSender<ImageCacheResponseMessage>,
 
     /// For providing contact with the time profiler.
     #[no_trace]
@@ -351,11 +371,11 @@ pub(crate) struct ScriptThreadSenders {
 pub(crate) struct ScriptThreadReceivers {
     /// A [`Receiver`] that receives messages from the constellation.
     #[no_trace]
-    pub(crate) constellation_receiver: Receiver<ScriptThreadMessage>,
+    pub(crate) constellation_receiver: RoutedReceiver<ScriptThreadMessage>,
 
     /// The [`Receiver`] which receives incoming messages from the `ImageCache`.
     #[no_trace]
-    pub(crate) image_cache_receiver: Receiver<PendingImageResponse>,
+    pub(crate) image_cache_receiver: Receiver<ImageCacheResponseMessage>,
 
     /// For receiving commands from an optional devtools server. Will be ignored if no such server
     /// exists. When devtools are not active this will be [`crossbeam_channel::never()`].
@@ -385,7 +405,7 @@ impl ScriptThreadReceivers {
                     .expect("Spurious wake-up of the event-loop, task-queue has no tasks available");
                 MixedMessage::FromScript(event)
             },
-            recv(self.constellation_receiver) -> msg => MixedMessage::FromConstellation(msg.unwrap()),
+            recv(self.constellation_receiver) -> msg => MixedMessage::FromConstellation(msg.unwrap().unwrap()),
             recv(self.devtools_server_receiver) -> msg => MixedMessage::FromDevtools(msg.unwrap()),
             recv(self.image_cache_receiver) -> msg => MixedMessage::FromImageCache(msg.unwrap()),
             recv(timer_scheduler.wait_channel()) -> _ => MixedMessage::TimerFired,
@@ -418,6 +438,14 @@ impl ScriptThreadReceivers {
         task_queue: &TaskQueue<MainThreadScriptMsg>,
     ) -> Option<MixedMessage> {
         if let Ok(message) = self.constellation_receiver.try_recv() {
+            let message = message
+                .inspect_err(|e| {
+                    log::warn!(
+                        "ScriptThreadReceivers IPC error on constellation_receiver: {:?}",
+                        e
+                    );
+                })
+                .ok()?;
             return MixedMessage::FromConstellation(message).into();
         }
         if let Ok(message) = task_queue.take_tasks_and_recv() {

@@ -15,7 +15,8 @@ pub(crate) fn make_marker<'dom>(
     context: &LayoutContext,
     info: &NodeAndStyleInfo<'dom>,
 ) -> Option<(NodeAndStyleInfo<'dom>, Vec<PseudoElementContentItem>)> {
-    let marker_info = info.pseudo(context, style::selector_parser::PseudoElement::Marker)?;
+    let marker_info =
+        info.with_pseudo_element(context, style::selector_parser::PseudoElement::Marker)?;
     let style = &marker_info.style;
     let list_style = style.get_list();
 
@@ -35,6 +36,7 @@ pub(crate) fn make_marker<'dom>(
         Image::CrossFade(..) |
         Image::PaintWorklet(..) |
         Image::None => None,
+        Image::LightDark(..) => unreachable!("light-dark() should be disabled"),
     };
     let content = marker_image().or_else(|| {
         Some(vec![PseudoElementContentItem::Text(

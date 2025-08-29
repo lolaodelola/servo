@@ -44,7 +44,7 @@ pub(crate) struct ServoShellPreferences {
     /// Overrides directives specified via `SERVO_TRACING` if set.
     /// See: <https://docs.rs/tracing-subscriber/0.3.19/tracing_subscriber/filter/struct.EnvFilter.html#directives>
     pub tracing_filter: Option<String>,
-    /// The initial requested size of the window.
+    /// The initial requested inner size of the window.
     pub initial_window_size: Size2D<u32, DeviceIndependentPixel>,
     /// An override for the screen resolution. This is useful for testing behavior on different screen sizes,
     /// such as the screen of a mobile device.
@@ -57,11 +57,18 @@ pub(crate) struct ServoShellPreferences {
     /// Where to load userscripts from, if any.
     /// and if the option isn't passed userscripts won't be loaded.
     pub userscripts_directory: Option<PathBuf>,
+    /// `None` to disable WebDriver or `Some` with a port number to start a server to listen to
+    /// remote WebDriver commands.
+    pub webdriver_port: Option<u16>,
 
     /// Log filter given in the `log_filter` spec as a String, if any.
     /// If a filter is passed, the logger should adjust accordingly.
     #[cfg(target_env = "ohos")]
     pub log_filter: Option<String>,
+
+    /// Log also to a file
+    #[cfg(target_env = "ohos")]
+    pub log_to_file: bool,
 }
 
 impl Default for ServoShellPreferences {
@@ -80,8 +87,11 @@ impl Default for ServoShellPreferences {
             output_image_path: None,
             exit_after_stable_image: false,
             userscripts_directory: None,
+            webdriver_port: None,
             #[cfg(target_env = "ohos")]
             log_filter: None,
+            #[cfg(target_env = "ohos")]
+            log_to_file: false,
         }
     }
 }
@@ -264,7 +274,7 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
     opts.optopt(
         "",
         "window-size",
-        "Set the initial window size in logical (device independenrt) pixels",
+        "Set the initial window size in logical (device independent) pixels",
         "1024x740",
     );
     opts.optopt(
@@ -274,6 +284,7 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
         "1024x768",
     );
     opts.optflag("M", "multiprocess", "Run in multiprocess mode");
+    opts.optflag("I", "force-ipc", "Use ipc_channel in singleprocess mode");
     opts.optflag("B", "bhm", "Background Hang Monitor enabled");
     opts.optflag("S", "sandbox", "Run in a sandbox if multiprocess");
     opts.optopt(
@@ -363,6 +374,13 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
         "FILTER",
     );
 
+    #[cfg(target_env = "ohos")]
+    opts.optflag(
+        "",
+        "log-to-file",
+        "Also log to a file (/data/app/el2/100/base/org.servo.servo/cache/servo.log)",
+    );
+
     opts.optflag(
         "",
         "enable-experimental-web-platform-features",
@@ -434,6 +452,9 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
         log::debug!("Set log_filter to: {:?}", log_filter);
         log_filter
     };
+
+    #[cfg(target_env = "ohos")]
+    let log_to_file = opt_match.opt_present("log-to-file");
 
     let mut debug_options = DebugOptions::default();
     for debug_string in opt_match.opt_strs("Z") {
@@ -519,11 +540,9 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
         preferences.devtools_server_port = port;
     }
 
-    let webdriver_port = opt_match.opt_default("webdriver", "7000").map(|port| {
-        port.parse().unwrap_or_else(|err| {
-            args_fail(&format!("Error parsing option: --webdriver ({})", err))
-        })
-    });
+    if opt_match.opt_present("webdriver") {
+        preferences.dom_testing_html_input_element_select_files_enabled = true;
+    }
 
     let parse_resolution_string = |string: String| {
         let components: Vec<u32> = string
@@ -571,14 +590,13 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
         vec![
             "dom_async_clipboard_enabled",
             "dom_fontface_enabled",
-            "dom_imagebitmap_enabled",
             "dom_intersection_observer_enabled",
             "dom_mouse_event_which_enabled",
+            "dom_navigator_sendbeacon_enabled",
             "dom_notification_enabled",
             "dom_offscreen_canvas_enabled",
             "dom_permissions_enabled",
             "dom_resize_observer_enabled",
-            "dom_svg_enabled",
             "dom_trusted_types_enabled",
             "dom_webgl2_enabled",
             "dom_webgpu_enabled",
@@ -630,6 +648,12 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
         preferences.js_ion_enabled = false;
     }
 
+    let webdriver_port = opt_match.opt_default("webdriver", "7000").map(|port| {
+        port.parse().unwrap_or_else(|err| {
+            args_fail(&format!("Error parsing option: --webdriver ({})", err))
+        })
+    });
+
     let exit_after_load = opt_match.opt_present("x") || output_image_path.is_some();
     let wait_for_stable_image = exit_after_load;
     let servoshell_preferences = ServoShellPreferences {
@@ -646,8 +670,11 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
         userscripts_directory: opt_match
             .opt_default("userscripts", "resources/user-agent-js")
             .map(PathBuf::from),
+        webdriver_port,
         #[cfg(target_env = "ohos")]
         log_filter,
+        #[cfg(target_env = "ohos")]
+        log_to_file,
         ..Default::default()
     };
 
@@ -668,8 +695,8 @@ pub(crate) fn parse_command_line_arguments(args: Vec<String>) -> ArgumentParsing
         nonincremental_layout,
         user_stylesheets,
         hard_fail: opt_match.opt_present("f") && !opt_match.opt_present("F"),
-        webdriver_port,
         multiprocess: opt_match.opt_present("M"),
+        force_ipc: opt_match.opt_present("I"),
         background_hang_monitor: opt_match.opt_present("B"),
         sandbox: opt_match.opt_present("S"),
         random_pipeline_closure_probability,

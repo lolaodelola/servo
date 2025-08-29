@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::time::SystemTime;
 
-use log::{debug, info};
+use cookie::Cookie;
+use itertools::Itertools;
+use log::info;
 use net_traits::CookieSource;
 use net_traits::pub_domains::reg_suffix;
 use serde::{Deserialize, Serialize};
@@ -175,47 +177,53 @@ impl CookieStorage {
 
     // http://tools.ietf.org/html/rfc6265#section-5.4
     pub fn cookies_for_url(&mut self, url: &ServoUrl, source: CookieSource) -> Option<String> {
-        let filterer = |c: &&mut ServoCookie| -> bool {
-            debug!(
-                " === SENT COOKIE : {} {} {:?} {:?}",
-                c.cookie.name(),
-                c.cookie.value(),
-                c.cookie.domain(),
-                c.cookie.path()
-            );
-            debug!(
-                " === SENT COOKIE RESULT {}",
-                c.appropriate_for_url(url, source)
-            );
-            // Step 1
-            c.appropriate_for_url(url, source)
-        };
-        // Step 2
-        let domain = reg_host(url.host_str().unwrap_or(""));
-        let cookies = self.cookies_map.entry(domain).or_default();
+        // Let cookie-list be the set of cookies from the cookie store
+        let cookie_list = self.cookies_data_for_url(url, source);
 
-        let mut url_cookies: Vec<&mut ServoCookie> = cookies.iter_mut().filter(filterer).collect();
-        url_cookies.sort_by(|a, b| CookieStorage::cookie_comparator(a, b));
-
-        let reducer = |acc: String, c: &mut &mut ServoCookie| -> String {
-            // Step 3
-            c.touch();
-
-            // Step 4
+        let reducer = |acc: String, cookie: Cookie<'static>| -> String {
+            // Serialize the cookie-list into a cookie-string by processing each cookie in the cookie-list in order:
+            // If the cookies' name is not empty, output the cookie's name followed by the %x3D ("=") character.
+            // If the cookies' value is not empty, output the cookie's value.
+            // If there is an unprocessed cookie in the cookie-list, output the characters %x3B and %x20 ("; ").
+            // Security: the above steps allow for "nameless" cookies which have proved to be a security footgun
+            // especially with the new cookie name prefix proposals
             (match acc.len() {
                 0 => acc,
                 _ => acc + "; ",
-            }) + c.cookie.name() +
+            }) + cookie.name() +
                 "=" +
-                c.cookie.value()
+                cookie.value()
         };
-        let result = url_cookies.iter_mut().fold("".to_owned(), reducer);
+
+        // Serialize the cookie-list into a cookie-string by processing each cookie in the cookie-list in order
+        let result = cookie_list.fold("".to_owned(), reducer);
 
         info!(" === COOKIES SENT: {}", result);
         match result.len() {
             0 => None,
             _ => Some(result),
         }
+    }
+
+    /// <https://cookiestore.spec.whatwg.org/#query-cookies>
+    pub fn query_cookies(&mut self, url: &ServoUrl, name: Option<String>) -> Vec<Cookie<'static>> {
+        // 1. Retrieve cookie-list given request-uri and "non-HTTP" source
+        let cookie_list = self.cookies_data_for_url(url, CookieSource::NonHTTP);
+
+        // 3. For each cookie in cookie-list, run these steps:
+        // 3.2. If name is given, then run these steps:
+        if let Some(name) = name {
+            // Let cookieName be the result of running UTF-8 decode without BOM on cookie’s name.
+            // If cookieName does not equal name, then continue.
+            cookie_list.filter(|cookie| cookie.name() == name).collect()
+        } else {
+            cookie_list.collect()
+        }
+
+        // Note: we do not convert the list into CookieListItem's here, we do that in script to not not have to define
+        // the binding types in net.
+
+        // Return list
     }
 
     pub fn cookies_data_for_url<'a>(
@@ -229,7 +237,12 @@ impl CookieStorage {
         cookies
             .iter_mut()
             .filter(move |c| c.appropriate_for_url(url, source))
+            .sorted_by(|a: &&mut ServoCookie, b: &&mut ServoCookie| {
+                // The user agent SHOULD sort the cookie-list
+                CookieStorage::cookie_comparator(a, b)
+            })
             .map(|c| {
+                // Update the last-access-time of each cookie in the cookie-list to the current date and time
                 c.touch();
                 c.cookie.clone()
             })

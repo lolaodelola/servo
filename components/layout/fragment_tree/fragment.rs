@@ -9,6 +9,7 @@ use base::id::PipelineId;
 use base::print_tree::PrintTree;
 use euclid::{Point2D, Rect, Size2D, UnknownUnit};
 use fonts::{ByteIndex, FontMetrics, GlyphStore};
+use layout_api::BoxAreaType;
 use malloc_size_of_derive::MallocSizeOf;
 use range::Range as ServoRange;
 use servo_arc::Arc as ServoArc;
@@ -162,7 +163,7 @@ impl Fragment {
         }
     }
 
-    pub fn unclipped_scrolling_area(&self) -> PhysicalRect<Au> {
+    pub(crate) fn scrolling_area(&self) -> PhysicalRect<Au> {
         match self {
             Fragment::Box(fragment) | Fragment::Float(fragment) => {
                 let fragment = fragment.borrow();
@@ -172,36 +173,43 @@ impl Fragment {
         }
     }
 
-    pub fn scrolling_area(&self) -> PhysicalRect<Au> {
+    pub(crate) fn scrollable_overflow_for_parent(&self) -> PhysicalRect<Au> {
         match self {
             Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                let fragment = fragment.borrow();
-                fragment
-                    .offset_by_containing_block(&fragment.reachable_scrollable_overflow_region())
-            },
-            _ => self.scrollable_overflow_for_parent(),
-        }
-    }
-
-    pub fn scrollable_overflow_for_parent(&self) -> PhysicalRect<Au> {
-        match self {
-            Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                fragment.borrow().scrollable_overflow_for_parent()
+                return fragment.borrow().scrollable_overflow_for_parent();
             },
             Fragment::AbsoluteOrFixedPositioned(_) => PhysicalRect::zero(),
-            Fragment::Positioning(fragment) => fragment.borrow().scrollable_overflow,
+            Fragment::Positioning(fragment) => fragment.borrow().scrollable_overflow_for_parent(),
             Fragment::Text(fragment) => fragment.borrow().rect,
             Fragment::Image(fragment) => fragment.borrow().rect,
             Fragment::IFrame(fragment) => fragment.borrow().rect,
         }
     }
 
-    pub(crate) fn cumulative_border_box_rect(&self) -> Option<PhysicalRect<Au>> {
+    pub(crate) fn calculate_scrollable_overflow_for_parent(&self) -> PhysicalRect<Au> {
+        self.calculate_scrollable_overflow();
+        self.scrollable_overflow_for_parent()
+    }
+
+    pub(crate) fn calculate_scrollable_overflow(&self) {
         match self {
             Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                let fragment = fragment.borrow();
-                Some(fragment.offset_by_containing_block(&fragment.border_rect()))
+                fragment.borrow_mut().calculate_scrollable_overflow()
             },
+            Fragment::Positioning(fragment) => {
+                fragment.borrow_mut().calculate_scrollable_overflow()
+            },
+            _ => {},
+        }
+    }
+
+    pub(crate) fn cumulative_box_area_rect(&self, area: BoxAreaType) -> Option<PhysicalRect<Au>> {
+        match self {
+            Fragment::Box(fragment) | Fragment::Float(fragment) => Some(match area {
+                BoxAreaType::Content => fragment.borrow().cumulative_content_box_rect(),
+                BoxAreaType::Padding => fragment.borrow().cumulative_padding_box_rect(),
+                BoxAreaType::Border => fragment.borrow().cumulative_border_box_rect(),
+            }),
             Fragment::Positioning(fragment) => {
                 let fragment = fragment.borrow();
                 Some(fragment.offset_by_containing_block(&fragment.rect))
@@ -317,6 +325,13 @@ impl Fragment {
             Fragment::Text(..) => unreachable!("Should never try to repair style of TextFragment"),
             Fragment::Image(image_fragment) => image_fragment.borrow_mut().style = style.clone(),
             Fragment::IFrame(iframe_fragment) => iframe_fragment.borrow_mut().style = style.clone(),
+        }
+    }
+
+    pub(crate) fn retrieve_box_fragment(&self) -> Option<&ArcRefCell<BoxFragment>> {
+        match self {
+            Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => Some(box_fragment),
+            _ => None,
         }
     }
 }

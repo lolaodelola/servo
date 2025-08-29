@@ -10,16 +10,39 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
 use base::cross_process_instant::CrossProcessInstant;
-use log::debug;
-use serde_json::{Map, Value};
+use base::id::PipelineId;
+use log::{debug, warn};
+use serde_json::{Map, Value, json};
 
-/// General actor system infrastructure.
 use crate::StreamId;
+use crate::protocol::{ClientRequest, JsonPacketStream};
 
-#[derive(PartialEq)]
-pub enum ActorMessageStatus {
-    Processed,
-    Ignored,
+/// Error replies.
+///
+/// <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#error-packets>
+#[derive(Debug)]
+pub enum ActorError {
+    MissingParameter,
+    BadParameterType,
+    UnrecognizedPacketType,
+    /// Custom errors, not defined in the protocol docs.
+    /// This includes send errors, and errors that prevent Servo from sending a reply.
+    Internal,
+}
+
+impl ActorError {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ActorError::MissingParameter => "missingParameter",
+            ActorError::BadParameterType => "badParameterType",
+            ActorError::UnrecognizedPacketType => "unrecognizedPacketType",
+            // The devtools frontend always checks for specific protocol errors by catching a JS exception `e` whose
+            // message contains the error name, and checking `e.message.includes("someErrorName")`. As a result, the
+            // only error name we can safely use for custom errors is the empty string, because any other error name we
+            // use may be a substring of some upstream error name.
+            ActorError::Internal => "",
+        }
+    }
 }
 
 /// A common trait for all devtools actors that encompasses an immutable name
@@ -28,12 +51,12 @@ pub enum ActorMessageStatus {
 pub(crate) trait Actor: Any + ActorAsAny {
     fn handle_message(
         &self,
+        request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         stream_id: StreamId,
-    ) -> Result<ActorMessageStatus, ()>;
+    ) -> Result<(), ActorError>;
     fn name(&self) -> String;
     fn cleanup(&self, _id: StreamId) {}
 }
@@ -58,6 +81,12 @@ pub struct ActorRegistry {
     new_actors: RefCell<Vec<Box<dyn Actor + Send>>>,
     old_actors: RefCell<Vec<String>>,
     script_actors: RefCell<HashMap<String, String>>,
+
+    /// Lookup table for SourceActor names associated with a given PipelineId.
+    source_actor_names: RefCell<HashMap<PipelineId, Vec<String>>>,
+    /// Lookup table for inline source content associated with a given PipelineId.
+    inline_source_content: RefCell<HashMap<PipelineId, String>>,
+
     shareable: Option<Arc<Mutex<ActorRegistry>>>,
     next: Cell<u32>,
     start_stamp: CrossProcessInstant,
@@ -71,6 +100,8 @@ impl ActorRegistry {
             new_actors: RefCell::new(vec![]),
             old_actors: RefCell::new(vec![]),
             script_actors: RefCell::new(HashMap::new()),
+            source_actor_names: RefCell::new(HashMap::new()),
+            inline_source_content: RefCell::new(HashMap::new()),
             shareable: None,
             next: Cell::new(0),
             start_stamp: CrossProcessInstant::now(),
@@ -164,8 +195,8 @@ impl ActorRegistry {
         actor.actor_as_any_mut().downcast_mut::<T>().unwrap()
     }
 
-    /// Attempt to process a message as directed by its `to` property. If the actor is not
-    /// found or does not indicate that it knew how to process the message, ignore the failure.
+    /// Attempt to process a message as directed by its `to` property. If the actor is not found, does not support the
+    /// message, or failed to handle the message, send an error reply instead.
     pub(crate) fn handle_message(
         &mut self,
         msg: &Map<String, Value>,
@@ -181,17 +212,22 @@ impl ActorRegistry {
         };
 
         match self.actors.get(to) {
-            None => log::warn!("message received for unknown actor \"{}\"", to),
+            None => {
+                // <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#packets>
+                let msg = json!({ "from": to, "error": "noSuchActor" });
+                let _ = stream.write_json_packet(&msg);
+            },
             Some(actor) => {
                 let msg_type = msg.get("type").unwrap().as_str().unwrap();
-                if actor.handle_message(self, msg_type, msg, stream, stream_id)? !=
-                    ActorMessageStatus::Processed
-                {
-                    log::warn!(
-                        "unexpected message type \"{}\" found for actor \"{}\"",
-                        msg_type,
-                        to
-                    );
+                if let Err(error) = ClientRequest::handle(stream, to, |req| {
+                    actor.handle_message(req, self, msg_type, msg, stream_id)
+                }) {
+                    // <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#error-packets>
+                    let error = json!({
+                        "from": actor.name(), "error": error.name()
+                    });
+                    warn!("Sending devtools protocol error: error={error:?} request={msg:?}");
+                    let _ = stream.write_json_packet(&error);
                 }
             },
         }
@@ -214,5 +250,37 @@ impl ActorRegistry {
     pub fn drop_actor_later(&self, name: String) {
         let mut actors = self.old_actors.borrow_mut();
         actors.push(name);
+    }
+
+    pub fn register_source_actor(&self, pipeline_id: PipelineId, actor_name: &str) {
+        self.source_actor_names
+            .borrow_mut()
+            .entry(pipeline_id)
+            .or_default()
+            .push(actor_name.to_owned());
+    }
+
+    pub fn source_actor_names_for_pipeline(&mut self, pipeline_id: PipelineId) -> Vec<String> {
+        if let Some(source_actor_names) = self.source_actor_names.borrow_mut().get(&pipeline_id) {
+            return source_actor_names.clone();
+        }
+
+        vec![]
+    }
+
+    pub fn set_inline_source_content(&mut self, pipeline_id: PipelineId, content: String) {
+        assert!(
+            self.inline_source_content
+                .borrow_mut()
+                .insert(pipeline_id, content)
+                .is_none()
+        );
+    }
+
+    pub fn inline_source_content(&mut self, pipeline_id: PipelineId) -> Option<String> {
+        self.inline_source_content
+            .borrow()
+            .get(&pipeline_id)
+            .cloned()
     }
 }

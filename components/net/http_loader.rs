@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_recursion::async_recursion;
 use base::cross_process_instant::CrossProcessInstant;
-use base::id::{HistoryStateId, PipelineId};
+use base::id::{BrowsingContextId, HistoryStateId, PipelineId};
 use crossbeam_channel::Sender;
 use devtools_traits::{
     ChromeToDevtoolsControlMsg, DevtoolsControlMsg, HttpRequest as DevtoolsHttpRequest,
@@ -59,14 +59,14 @@ use net_traits::{
 use profile_traits::mem::{Report, ReportKind};
 use profile_traits::path;
 use servo_arc::Arc;
-use servo_url::{ImmutableOrigin, ServoUrl};
+use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use tokio::sync::mpsc::{
     Receiver as TokioReceiver, Sender as TokioSender, UnboundedReceiver, UnboundedSender, channel,
     unbounded_channel,
 };
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::async_runtime::HANDLE;
+use crate::async_runtime::spawn_task;
 use crate::connector::{CertificateErrorOverrideManager, Connector};
 use crate::cookie::ServoCookie;
 use crate::cookie_storage::CookieStorage;
@@ -223,8 +223,11 @@ fn strict_origin_when_cross_origin(
     strip_url_for_use_as_referrer(referrer_url, true)
 }
 
-/// <https://html.spec.whatwg.org/multipage/#concept-site-same-site>
+/// <https://html.spec.whatwg.org/multipage/#same-site>
 fn is_same_site(site_a: &ImmutableOrigin, site_b: &ImmutableOrigin) -> bool {
+    // First steps are for
+    // https://html.spec.whatwg.org/multipage/#concept-site-same-site
+    //
     // Step 1. If A and B are the same opaque origin, then return true.
     if !site_a.is_tuple() && !site_b.is_tuple() && site_a == site_b {
         return true;
@@ -244,7 +247,12 @@ fn is_same_site(site_a: &ImmutableOrigin, site_b: &ImmutableOrigin) -> bool {
     }
 
     // Step 4. If A's and B's host values are not equal, then return false.
-    if host_a != host_b {
+    // Includes the steps of https://html.spec.whatwg.org/multipage/#obtain-a-site
+    if let (Host::Domain(domain_a), Host::Domain(domain_b)) = (host_a, host_b) {
+        if reg_suffix(domain_a) != reg_suffix(domain_b) {
+            return false;
+        }
+    } else if host_a != host_b {
         return false;
     }
 
@@ -389,7 +397,9 @@ fn prepare_devtools_request(
     pipeline_id: PipelineId,
     connect_time: Duration,
     send_time: Duration,
+    destination: Destination,
     is_xhr: bool,
+    browsing_context_id: BrowsingContextId,
 ) -> ChromeToDevtoolsControlMsg {
     let started_date_time = SystemTime::now();
     let request = DevtoolsHttpRequest {
@@ -405,14 +415,16 @@ fn prepare_devtools_request(
             .as_secs() as i64,
         connect_time,
         send_time,
+        destination,
         is_xhr,
+        browsing_context_id,
     };
-    let net_event = NetworkEvent::HttpRequest(request);
+    let net_event = NetworkEvent::HttpRequestUpdate(request);
 
     ChromeToDevtoolsControlMsg::NetworkEvent(request_id, net_event)
 }
 
-fn send_request_to_devtools(
+pub fn send_request_to_devtools(
     msg: ChromeToDevtoolsControlMsg,
     devtools_chan: &Sender<DevtoolsControlMsg>,
 ) {
@@ -421,23 +433,92 @@ fn send_request_to_devtools(
         .unwrap();
 }
 
-fn send_response_to_devtools(
-    devtools_chan: &Sender<DevtoolsControlMsg>,
-    request_id: String,
+pub fn send_response_to_devtools(
+    request: &Request,
+    context: &FetchContext,
+    response: &Response,
+    body_data: Option<Vec<u8>>,
+) {
+    let meta = match response.metadata() {
+        Ok(FetchMetadata::Unfiltered(m)) => m,
+        Ok(FetchMetadata::Filtered { unsafe_, .. }) => unsafe_,
+        Err(_) => {
+            log::warn!("No metadata available, skipping devtools response.");
+            return;
+        },
+    };
+    send_response_values_to_devtools(
+        meta.headers.map(Serde::into_inner),
+        meta.status,
+        body_data,
+        request,
+        context.devtools_chan.clone(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn send_response_values_to_devtools(
     headers: Option<HeaderMap>,
     status: HttpStatus,
-    pipeline_id: PipelineId,
+    body: Option<Vec<u8>>,
+    request: &Request,
+    devtools_chan: Option<StdArc<Mutex<Sender<DevtoolsControlMsg>>>>,
 ) {
-    let response = DevtoolsHttpResponse {
-        headers,
-        status,
-        body: None,
-        pipeline_id,
-    };
-    let net_event_response = NetworkEvent::HttpResponse(response);
+    if let (Some(devtools_chan), Some(pipeline_id), Some(webview_id)) = (
+        devtools_chan,
+        request.pipeline_id,
+        request.target_webview_id,
+    ) {
+        let browsing_context_id = webview_id.0;
 
-    let msg = ChromeToDevtoolsControlMsg::NetworkEvent(request_id, net_event_response);
-    let _ = devtools_chan.send(DevtoolsControlMsg::FromChrome(msg));
+        let devtoolsresponse = DevtoolsHttpResponse {
+            headers,
+            status,
+            body,
+            pipeline_id,
+            browsing_context_id,
+        };
+        let net_event_response = NetworkEvent::HttpResponse(devtoolsresponse);
+
+        let msg =
+            ChromeToDevtoolsControlMsg::NetworkEvent(request.id.0.to_string(), net_event_response);
+
+        let _ = devtools_chan
+            .lock()
+            .unwrap()
+            .send(DevtoolsControlMsg::FromChrome(msg));
+    }
+}
+
+pub fn send_early_httprequest_to_devtools(request: &Request, context: &FetchContext) {
+    if let (Some(devtools_chan), Some(browsing_context_id), Some(pipeline_id)) = (
+        context.devtools_chan.as_ref(),
+        request.target_webview_id.map(|id| id.0),
+        request.pipeline_id,
+    ) {
+        // Build the partial DevtoolsHttpRequest
+        let devtools_request = DevtoolsHttpRequest {
+            url: request.current_url().clone(),
+            method: request.method.clone(),
+            headers: request.headers.clone(),
+            body: None,
+            pipeline_id,
+            started_date_time: SystemTime::now(),
+            time_stamp: 0,
+            connect_time: Duration::from_millis(0),
+            send_time: Duration::from_millis(0),
+            destination: request.destination,
+            is_xhr: false,
+            browsing_context_id,
+        };
+
+        let msg = ChromeToDevtoolsControlMsg::NetworkEvent(
+            request.id.0.to_string(),
+            NetworkEvent::HttpRequest(devtools_request),
+        );
+
+        send_request_to_devtools(msg, &devtools_chan.lock().unwrap());
+    }
 }
 
 fn auth_from_cache(
@@ -493,7 +574,7 @@ impl BodySink {
         match self {
             BodySink::Chunked(sender) => {
                 let sender = sender.clone();
-                HANDLE.spawn(async move {
+                spawn_task(async move {
                     let _ = sender
                         .send(Ok(Frame::data(Bytes::copy_from_slice(&bytes))))
                         .await;
@@ -525,9 +606,11 @@ async fn obtain_response(
     source_is_null: bool,
     pipeline_id: &Option<PipelineId>,
     request_id: Option<&str>,
+    destination: Destination,
     is_xhr: bool,
     context: &FetchContext,
     fetch_terminated: UnboundedSender<bool>,
+    browsing_context_id: Option<BrowsingContextId>,
 ) -> Result<(HyperResponse<Decoder>, Option<ChromeToDevtoolsControlMsg>), NetworkError> {
     {
         let mut headers = request_headers.clone();
@@ -708,21 +791,28 @@ async fn obtain_response(
 
                 let msg = if let Some(request_id) = request_id {
                     if let Some(pipeline_id) = pipeline_id {
-                        Some(prepare_devtools_request(
-                            request_id,
-                            closure_url,
-                            method.clone(),
-                            headers,
-                            Some(devtools_bytes.lock().unwrap().clone()),
-                            pipeline_id,
-                            (connect_end - connect_start).unsigned_abs(),
-                            (send_end - send_start).unsigned_abs(),
-                            is_xhr,
-                        ))
-                    // TODO: ^This is not right, connect_start is taken before contructing the
-                    // request and connect_end at the end of it. send_start is takend before the
-                    // connection too. I'm not sure it's currently possible to get the time at the
-                    // point between the connection and the start of a request.
+                        if let Some(browsing_context_id) = browsing_context_id {
+                            Some(prepare_devtools_request(
+                                request_id,
+                                closure_url,
+                                method.clone(),
+                                headers,
+                                Some(devtools_bytes.lock().unwrap().clone()),
+                                pipeline_id,
+                                (connect_end - connect_start).unsigned_abs(),
+                                (send_end - send_start).unsigned_abs(),
+                                destination,
+                                is_xhr,
+                                browsing_context_id,
+                            ))
+                        } else {
+                            debug!("Not notifying devtools (no browsing_context_id)");
+                            None
+                        }
+                        // TODO: ^This is not right, connect_start is taken before contructing the
+                        // request and connect_end at the end of it. send_start is takend before the
+                        // connection too. I'm not sure it's currently possible to get the time at the
+                        // point between the connection and the start of a request.
                     } else {
                         debug!("Not notifying devtools (no pipeline_id)");
                         None
@@ -1848,12 +1938,7 @@ async fn http_network_fetch(
 
     // Step 5
     let url = request.current_url();
-
-    let request_id = context
-        .devtools_chan
-        .as_ref()
-        .map(|_| uuid::Uuid::new_v4().simple().to_string());
-
+    let request_id = request.id.0.to_string();
     if log_enabled!(log::Level::Info) {
         info!("{:?} request for {}", request.method, url);
         for header in request.headers.iter() {
@@ -1879,6 +1964,8 @@ async fn http_network_fetch(
         let _ = fetch_terminated_sender.send(false);
     }
 
+    let browsing_context_id = request.target_webview_id.map(|id| id.0);
+
     let response_future = obtain_response(
         &context.state.client,
         &url,
@@ -1891,13 +1978,14 @@ async fn http_network_fetch(
             .map(|body| body.source_is_null())
             .unwrap_or(false),
         &request.pipeline_id,
-        request_id.as_deref(),
+        Some(&request_id),
+        request.destination,
         is_xhr,
         context,
         fetch_terminated_sender,
+        browsing_context_id,
     );
 
-    let pipeline_id = request.pipeline_id;
     // This will only get the headers, the body is read later
     let (res, msg) = match response_future.await {
         Ok(wrapped_response) => wrapped_response,
@@ -1929,7 +2017,7 @@ async fn http_network_fetch(
         .iter()
         .map(|header_value| header_value.to_str().unwrap_or(""))
         .collect();
-    let wildcard_present = header_strings.iter().any(|header_str| *header_str == "*");
+    let wildcard_present = header_strings.contains(&"*");
     // The spec: https://www.w3.org/TR/resource-timing-2/#sec-timing-allow-origin
     // says that a header string is either an origin or a wildcard so we can just do a straight
     // check against the document origin
@@ -1973,17 +2061,8 @@ async fn http_network_fetch(
     // We're about to spawn a future to be waited on here
     let (done_sender, done_receiver) = unbounded_channel();
     *done_chan = Some((done_sender.clone(), done_receiver));
-    let meta = match response
-        .metadata()
-        .expect("Response metadata should exist at this stage")
-    {
-        FetchMetadata::Unfiltered(m) => m,
-        FetchMetadata::Filtered { unsafe_, .. } => unsafe_,
-    };
 
     let devtools_sender = context.devtools_chan.clone();
-    let meta_status = meta.status;
-    let meta_headers = meta.headers;
     let cancellation_listener = context.cancellation_listener.clone();
     if cancellation_listener.cancelled() {
         return Response::network_error(NetworkError::Internal("Fetch aborted".into()));
@@ -1997,28 +2076,21 @@ async fn http_network_fetch(
         if let Some(m) = msg {
             send_request_to_devtools(m, &sender);
         }
-
-        // --- Tell devtools that we got a response
-        // Send an HttpResponse message to devtools with the corresponding request_id
-        if let Some(pipeline_id) = pipeline_id {
-            send_response_to_devtools(
-                &sender,
-                request_id.unwrap(),
-                meta_headers.map(Serde::into_inner),
-                meta_status,
-                pipeline_id,
-            );
-        }
     }
 
     let done_sender2 = done_sender.clone();
     let done_sender3 = done_sender.clone();
     let timing_ptr2 = context.timing.clone();
     let timing_ptr3 = context.timing.clone();
-    let url1 = request.url();
+    let devtools_request = request.clone();
+    let url1 = devtools_request.url();
     let url2 = url1.clone();
 
-    HANDLE.spawn(
+    let status = response.status.clone();
+    let headers = response.headers.clone();
+    let devtools_chan = context.devtools_chan.clone();
+
+    spawn_task(
         res.into_body()
             .map_err(|e| {
                 warn!("Error streaming response body: {:?}", e);
@@ -2043,7 +2115,15 @@ async fn http_network_fetch(
                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
                     _ => vec![],
                 };
+                let devtools_response_body = completed_body.clone();
                 *body = ResponseBody::Done(completed_body);
+                send_response_values_to_devtools(
+                    Some(headers),
+                    status,
+                    Some(devtools_response_body),
+                    &devtools_request,
+                    devtools_chan,
+                );
                 timing_ptr2
                     .lock()
                     .unwrap()
@@ -2564,7 +2644,7 @@ fn set_the_sec_fetch_site_header(r: &mut Request) {
             header = SecFetchSite::CrossSite;
 
             // Step 5.3 If r’s origin is not same site with url’s origin, then break.
-            if is_same_site(request_origin, &url.origin()) {
+            if !is_same_site(request_origin, &url.origin()) {
                 break;
             }
 

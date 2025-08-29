@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use canvas_traits::webgl::{GlType, WebGLContextId, WebGLMsg, WebGLThreads, webgl_channel};
 use compositing_traits::rendering_context::RenderingContext;
 use compositing_traits::{
-    WebrenderExternalImageApi, WebrenderExternalImageRegistry, WebrenderImageSource,
+    CrossProcessCompositorApi, ExternalImageSource, WebrenderExternalImageApi,
+    WebrenderExternalImageRegistry,
 };
 use euclid::default::Size2D;
 use fnv::FnvHashMap;
@@ -17,7 +18,6 @@ use log::debug;
 use surfman::chains::{SwapChainAPI, SwapChains, SwapChainsAPI};
 use surfman::{Device, SurfaceTexture};
 use webrender::RenderApiSender;
-use webrender_api::DocumentId;
 #[cfg(feature = "webxr")]
 use webxr::SurfmanGL as WebXRSurfman;
 #[cfg(feature = "webxr")]
@@ -36,8 +36,8 @@ impl WebGLComm {
     /// Creates a new `WebGLComm` object.
     pub fn new(
         rendering_context: Rc<dyn RenderingContext>,
+        compositor_api: CrossProcessCompositorApi,
         webrender_api_sender: RenderApiSender,
-        webrender_doc: DocumentId,
         external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
         api_type: GlType,
     ) -> WebGLComm {
@@ -57,8 +57,8 @@ impl WebGLComm {
 
         // This implementation creates a single `WebGLThread` for all the pipelines.
         let init = WebGLThreadInit {
+            compositor_api,
             webrender_api_sender,
-            webrender_doc,
             external_images,
             sender: sender.clone(),
             receiver,
@@ -134,10 +134,10 @@ impl WebGLExternalImages {
 }
 
 impl WebrenderExternalImageApi for WebGLExternalImages {
-    fn lock(&mut self, id: u64) -> (WebrenderImageSource, Size2D<i32>) {
+    fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, Size2D<i32>) {
         let id = WebGLContextId(id);
         let (texture_id, size) = self.lock_swap_chain(id).unwrap_or_default();
-        (WebrenderImageSource::TextureHandle(texture_id), size)
+        (ExternalImageSource::NativeTexture(texture_id), size)
     }
 
     fn unlock(&mut self, id: u64) {

@@ -37,7 +37,9 @@ use crate::dom::htmlscriptelement::HTMLScriptElement;
 use crate::dom::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::node::Node;
 use crate::dom::processinginstruction::ProcessingInstruction;
-use crate::dom::servoparser::{ElementAttribute, ParsingAlgorithm, create_element_for_token};
+use crate::dom::servoparser::{
+    ElementAttribute, ParsingAlgorithm, attach_declarative_shadow_inner, create_element_for_token,
+};
 use crate::dom::virtualmethods::vtable_for;
 use crate::script_runtime::CanGc;
 
@@ -138,6 +140,15 @@ enum ParseOperation {
         #[ignore_malloc_size_of = "Defined in style"]
         #[no_trace]
         mode: ServoQuirksMode,
+    },
+
+    AttachDeclarativeShadowRoot {
+        location: ParseNodeId,
+        template: ParseNodeId,
+        attributes: Vec<Attribute>,
+        /// Used to notify the parser thread whether or not attaching the shadow root succeeded
+        #[no_trace]
+        sender: Sender<bool>,
     },
 }
 
@@ -245,21 +256,23 @@ impl Tokenizer {
         };
         tokenizer.insert_node(0, Dom::from_ref(document.upcast()));
 
-        let sink = Sink::new(to_tokenizer_sender.clone());
-        let mut ctxt_parse_node = None;
+        let sink = Sink::new(
+            to_tokenizer_sender.clone(),
+            document.allow_declarative_shadow_roots(),
+        );
         let mut form_parse_node = None;
-        let mut fragment_context_is_some = false;
-        if let Some(fc) = fragment_context {
+        let mut parser_fragment_context = None;
+        if let Some(fragment_context) = fragment_context {
             let node = sink.new_parse_node();
-            tokenizer.insert_node(node.id, Dom::from_ref(fc.context_elem));
-            ctxt_parse_node = Some(node);
+            tokenizer.insert_node(node.id, Dom::from_ref(fragment_context.context_elem));
+            parser_fragment_context =
+                Some((node, fragment_context.context_element_allows_scripting));
 
-            form_parse_node = fc.form_elem.map(|form_elem| {
+            form_parse_node = fragment_context.form_elem.map(|form_elem| {
                 let node = sink.new_parse_node();
                 tokenizer.insert_node(node.id, Dom::from_ref(form_elem));
                 node
             });
-            fragment_context_is_some = true;
         };
 
         // Create new thread for HtmlTokenizer. This is where parser actions
@@ -271,8 +284,7 @@ impl Tokenizer {
             .spawn(move || {
                 run(
                     sink,
-                    fragment_context_is_some,
-                    ctxt_parse_node,
+                    parser_fragment_context,
                     form_parse_node,
                     to_tokenizer_sender,
                     html_tokenizer_receiver,
@@ -562,35 +574,61 @@ impl Tokenizer {
             ParseOperation::SetQuirksMode { mode } => {
                 document.set_quirks_mode(mode);
             },
+            ParseOperation::AttachDeclarativeShadowRoot {
+                location,
+                template,
+                attributes,
+                sender,
+            } => {
+                let location = self.get_node(&location);
+                let template = self.get_node(&template);
+                let attributes: Vec<_> = attributes
+                    .into_iter()
+                    .map(|attribute| HtmlAttribute {
+                        name: attribute.name,
+                        value: StrTendril::from(attribute.value),
+                    })
+                    .collect();
+
+                let did_succeed =
+                    attach_declarative_shadow_inner(&location, &template, &attributes);
+                sender.send(did_succeed).unwrap();
+            },
         }
     }
 }
 
+/// Run the parser.
+///
+/// The `fragment_context` argument is `Some` in the fragment case and describes the context
+/// node as well as whether scripting is enabled for the context node. Note that whether or not
+/// scripting is enabled for the context node does not affect whether scripting is enabled for the
+/// parser, that is determined by the `scripting_enabled` argument.
 fn run(
     sink: Sink,
-    fragment_context_is_some: bool,
-    ctxt_parse_node: Option<ParseNode>,
+    fragment_context: Option<(ParseNode, bool)>,
     form_parse_node: Option<ParseNode>,
     sender: Sender<ToTokenizerMsg>,
     receiver: Receiver<ToHtmlTokenizerMsg>,
     scripting_enabled: bool,
 ) {
     let options = TreeBuilderOpts {
-        ignore_missing_rules: true,
         scripting_enabled,
         ..Default::default()
     };
 
-    let html_tokenizer = if fragment_context_is_some {
-        let tb =
-            TreeBuilder::new_for_fragment(sink, ctxt_parse_node.unwrap(), form_parse_node, options);
+    let html_tokenizer = if let Some((context_node, context_scripting_enabled)) = fragment_context {
+        let tree_builder =
+            TreeBuilder::new_for_fragment(sink, context_node, form_parse_node, options);
 
         let tok_options = TokenizerOpts {
-            initial_state: Some(tb.tokenizer_state_for_context_elem()),
+            initial_state: Some(
+                tree_builder.tokenizer_state_for_context_elem(context_scripting_enabled),
+            ),
             ..Default::default()
         };
 
-        HtmlTokenizer::new(tb, tok_options)
+        HtmlTokenizer::new(tree_builder, tok_options)
     } else {
         HtmlTokenizer::new(TreeBuilder::new(sink, options), Default::default())
     };
@@ -642,10 +680,11 @@ pub(crate) struct Sink {
     next_parse_node_id: Cell<ParseNodeId>,
     document_node: ParseNode,
     sender: Sender<ToTokenizerMsg>,
+    allow_declarative_shadow_roots: bool,
 }
 
 impl Sink {
-    fn new(sender: Sender<ToTokenizerMsg>) -> Sink {
+    fn new(sender: Sender<ToTokenizerMsg>, allow_declarative_shadow_roots: bool) -> Sink {
         let sink = Sink {
             current_line: Cell::new(1),
             parse_node_data: RefCell::new(HashMap::new()),
@@ -655,6 +694,7 @@ impl Sink {
                 qual_name: None,
             },
             sender,
+            allow_declarative_shadow_roots,
         };
         let data = ParseNodeData::default();
         sink.insert_parse_node_data(0, data);
@@ -919,5 +959,37 @@ impl TreeSink for Sink {
 
     fn pop(&self, node: &Self::Handle) {
         self.send_op(ParseOperation::Pop { node: node.id });
+    }
+
+    fn allow_declarative_shadow_roots(&self, _intended_parent: &Self::Handle) -> bool {
+        self.allow_declarative_shadow_roots
+    }
+
+    fn attach_declarative_shadow(
+        &self,
+        location: &Self::Handle,
+        template: &Self::Handle,
+        attributes: &[HtmlAttribute],
+    ) -> bool {
+        let attributes = attributes
+            .iter()
+            .map(|attribute| Attribute {
+                name: attribute.name.clone(),
+                value: String::from(attribute.value.clone()),
+            })
+            .collect();
+
+        // Unfortunately the parser can only proceed after it knows whether attaching the shadow root
+        // succeeded or failed. Attaching a shadow root can fail for many different reasons,
+        // and so we need to block until the script thread has processed this operation.
+        let (sender, receiver) = unbounded();
+        self.send_op(ParseOperation::AttachDeclarativeShadowRoot {
+            location: location.id,
+            template: template.id,
+            attributes,
+            sender,
+        });
+
+        receiver.recv().unwrap()
     }
 }

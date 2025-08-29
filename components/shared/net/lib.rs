@@ -7,10 +7,11 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::{LazyLock, OnceLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use base::cross_process_instant::CrossProcessInstant;
-use base::id::HistoryStateId;
+use base::generic_channel::{GenericSend, GenericSender, SendResult};
+use base::id::{CookieStoreId, HistoryStateId};
 use content_security_policy::{self as csp};
 use cookie::Cookie;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -32,6 +33,7 @@ use servo_url::{ImmutableOrigin, ServoUrl};
 
 use crate::filemanager_thread::FileManagerThreadMsg;
 use crate::http_status::HttpStatus;
+use crate::indexeddb_thread::IndexedDBThreadMsg;
 use crate::request::{Request, RequestBuilder};
 use crate::response::{HttpsState, Response, ResponseInit};
 use crate::storage_thread::StorageThreadMsg;
@@ -40,6 +42,8 @@ pub mod blob_url_store;
 pub mod filemanager_thread;
 pub mod http_status;
 pub mod image_cache;
+pub mod indexeddb_thread;
+pub mod mime_classifier;
 pub mod policy_container;
 pub mod pub_domains;
 pub mod quality;
@@ -386,6 +390,12 @@ impl<T: FetchResponseListener> Action<T> for FetchResponseMsg {
     }
 }
 
+/// Handle to an async runtime,
+/// only used to shut it down for now.
+pub trait AsyncRuntime: Send {
+    fn shutdown(&mut self);
+}
+
 /// Handle to a resource thread
 pub type CoreResourceThread = IpcSender<CoreResourceMsg>;
 
@@ -412,14 +422,20 @@ where
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResourceThreads {
     pub core_thread: CoreResourceThread,
-    storage_thread: IpcSender<StorageThreadMsg>,
+    storage_thread: GenericSender<StorageThreadMsg>,
+    idb_thread: IpcSender<IndexedDBThreadMsg>,
 }
 
 impl ResourceThreads {
-    pub fn new(c: CoreResourceThread, s: IpcSender<StorageThreadMsg>) -> ResourceThreads {
+    pub fn new(
+        c: CoreResourceThread,
+        s: GenericSender<StorageThreadMsg>,
+        i: IpcSender<IndexedDBThreadMsg>,
+    ) -> ResourceThreads {
         ResourceThreads {
             core_thread: c,
             storage_thread: s,
+            idb_thread: i,
         }
     }
 
@@ -438,12 +454,22 @@ impl IpcSend<CoreResourceMsg> for ResourceThreads {
     }
 }
 
-impl IpcSend<StorageThreadMsg> for ResourceThreads {
-    fn send(&self, msg: StorageThreadMsg) -> IpcSendResult {
+impl IpcSend<IndexedDBThreadMsg> for ResourceThreads {
+    fn send(&self, msg: IndexedDBThreadMsg) -> IpcSendResult {
+        self.idb_thread.send(msg)
+    }
+
+    fn sender(&self) -> IpcSender<IndexedDBThreadMsg> {
+        self.idb_thread.clone()
+    }
+}
+
+impl GenericSend<StorageThreadMsg> for ResourceThreads {
+    fn send(&self, msg: StorageThreadMsg) -> SendResult {
         self.storage_thread.send(msg)
     }
 
-    fn sender(&self) -> IpcSender<StorageThreadMsg> {
+    fn sender(&self) -> GenericSender<StorageThreadMsg> {
         self.storage_thread.clone()
     }
 }
@@ -501,6 +527,12 @@ pub enum CoreResourceMsg {
     SetCookieForUrl(ServoUrl, Serde<Cookie<'static>>, CookieSource),
     /// Store a set of cookies for a given originating URL
     SetCookiesForUrl(ServoUrl, Vec<Serde<Cookie<'static>>>, CookieSource),
+    SetCookieForUrlAsync(
+        CookieStoreId,
+        ServoUrl,
+        Serde<Cookie<'static>>,
+        CookieSource,
+    ),
     /// Retrieve the stored cookies for a given URL
     GetCookiesForUrl(ServoUrl, IpcSender<Option<String>>, CookieSource),
     /// Get a cookie by name for a given originating URL
@@ -509,8 +541,13 @@ pub enum CoreResourceMsg {
         IpcSender<Vec<Serde<Cookie<'static>>>>,
         CookieSource,
     ),
+    GetCookieDataForUrlAsync(CookieStoreId, ServoUrl, Option<String>),
+    GetAllCookieDataForUrlAsync(CookieStoreId, ServoUrl, Option<String>),
     DeleteCookies(ServoUrl),
     DeleteCookie(ServoUrl, String),
+    DeleteCookieAsync(CookieStoreId, ServoUrl, String),
+    NewCookieListener(CookieStoreId, IpcSender<CookieAsyncResponse>, ServoUrl),
+    RemoveCookieListener(CookieStoreId),
     /// Get a history state by a given history state id
     GetHistoryState(HistoryStateId, IpcSender<Option<Vec<u8>>>),
     /// Set a history state for a given history state id
@@ -531,13 +568,16 @@ pub enum CoreResourceMsg {
 // FIXME: https://github.com/servo/servo/issues/34591
 #[expect(clippy::large_enum_variant)]
 enum ToFetchThreadMessage {
-    Cancel(Vec<RequestId>),
+    Cancel(Vec<RequestId>, CoreResourceThread),
     StartFetch(
         /* request_builder */ RequestBuilder,
         /* response_init */ Option<ResponseInit>,
         /* callback  */ BoxedFetchCallback,
+        /* core resource thread channel */ CoreResourceThread,
     ),
     FetchResponse(FetchResponseMsg),
+    /// Stop the background thread.
+    Exit,
 }
 
 pub type BoxedFetchCallback = Box<dyn FnMut(FetchResponseMsg) + Send + 'static>;
@@ -549,8 +589,6 @@ struct FetchThread {
     /// A list of active fetches. A fetch is no longer active once the
     /// [`FetchResponseMsg::ProcessResponseEOF`] is received.
     active_fetches: HashMap<RequestId, BoxedFetchCallback>,
-    /// A reference to the [`CoreResourceThread`] used to kick off fetch requests.
-    core_resource_thread: CoreResourceThread,
     /// A crossbeam receiver attached to the router proxy which converts incoming fetch
     /// updates from IPC messages to crossbeam messages as well as another sender which
     /// handles requests from clients wanting to do fetches.
@@ -561,7 +599,7 @@ struct FetchThread {
 }
 
 impl FetchThread {
-    fn spawn(core_resource_thread: &CoreResourceThread) -> Sender<ToFetchThreadMessage> {
+    fn spawn() -> (Sender<ToFetchThreadMessage>, JoinHandle<()>) {
         let (sender, receiver) = unbounded();
         let (to_fetch_sender, from_fetch_sender) = ipc::channel().unwrap();
 
@@ -573,28 +611,30 @@ impl FetchThread {
                 let _ = sender_clone.send(ToFetchThreadMessage::FetchResponse(message));
             }),
         );
-
-        let core_resource_thread = core_resource_thread.clone();
-        thread::Builder::new()
+        let join_handle = thread::Builder::new()
             .name("FetchThread".to_owned())
             .spawn(move || {
                 let mut fetch_thread = FetchThread {
                     active_fetches: HashMap::new(),
-                    core_resource_thread,
                     receiver,
                     to_fetch_sender,
                 };
                 fetch_thread.run();
             })
             .expect("Thread spawning failed");
-        sender
+        (sender, join_handle)
     }
 
     fn run(&mut self) {
         loop {
             match self.receiver.recv().unwrap() {
-                ToFetchThreadMessage::StartFetch(request_builder, response_init, callback) => {
-                    self.active_fetches.insert(request_builder.id, callback);
+                ToFetchThreadMessage::StartFetch(
+                    request_builder,
+                    response_init,
+                    callback,
+                    core_resource_thread,
+                ) => {
+                    let request_builder_id = request_builder.id;
 
                     // Only redirects have a `response_init` field.
                     let message = match response_init {
@@ -609,7 +649,9 @@ impl FetchThread {
                         ),
                     };
 
-                    self.core_resource_thread.send(message).unwrap();
+                    core_resource_thread.send(message).unwrap();
+
+                    self.active_fetches.insert(request_builder_id, callback);
                 },
                 ToFetchThreadMessage::FetchResponse(fetch_response_msg) => {
                     let request_id = fetch_response_msg.request_id();
@@ -626,20 +668,40 @@ impl FetchThread {
                         self.active_fetches.remove(&request_id);
                     }
                 },
-                ToFetchThreadMessage::Cancel(request_ids) => {
+                ToFetchThreadMessage::Cancel(request_ids, core_resource_thread) => {
                     // Errors are ignored here, because Servo sends many cancellation requests when shutting down.
                     // At this point the networking task might be shut down completely, so just ignore errors
                     // during this time.
-                    let _ = self
-                        .core_resource_thread
-                        .send(CoreResourceMsg::Cancel(request_ids));
+                    let _ = core_resource_thread.send(CoreResourceMsg::Cancel(request_ids));
                 },
+                ToFetchThreadMessage::Exit => break,
             }
         }
     }
 }
 
 static FETCH_THREAD: OnceLock<Sender<ToFetchThreadMessage>> = OnceLock::new();
+
+/// Start the fetch thread,
+/// and returns the join handle to the background thread.
+pub fn start_fetch_thread() -> JoinHandle<()> {
+    let (sender, join_handle) = FetchThread::spawn();
+    FETCH_THREAD
+        .set(sender)
+        .expect("Fetch thread should be set only once on start-up");
+    join_handle
+}
+
+/// Send the exit message to the background thread,
+/// after which the caller can,
+/// and should,
+/// join on the thread.
+pub fn exit_fetch_thread() {
+    let _ = FETCH_THREAD
+        .get()
+        .expect("Fetch thread should always be initialized on start-up")
+        .send(ToFetchThreadMessage::Exit);
+}
 
 /// Instruct the resource thread to make a new fetch request.
 pub fn fetch_async(
@@ -649,21 +711,26 @@ pub fn fetch_async(
     callback: BoxedFetchCallback,
 ) {
     let _ = FETCH_THREAD
-        .get_or_init(|| FetchThread::spawn(core_resource_thread))
+        .get()
+        .expect("Fetch thread should always be initialized on start-up")
         .send(ToFetchThreadMessage::StartFetch(
             request,
             response_init,
             callback,
+            core_resource_thread.clone(),
         ));
 }
 
 /// Instruct the resource thread to cancel an existing request. Does nothing if the
 /// request has already completed or has not been fetched yet.
-pub fn cancel_async_fetch(request_ids: Vec<RequestId>) {
+pub fn cancel_async_fetch(request_ids: Vec<RequestId>, core_resource_thread: &CoreResourceThread) {
     let _ = FETCH_THREAD
         .get()
-        .expect("Tried to cancel request in process that hasn't started one.")
-        .send(ToFetchThreadMessage::Cancel(request_ids));
+        .expect("Fetch thread should always be initialized on start-up")
+        .send(ToFetchThreadMessage::Cancel(
+            request_ids,
+            core_resource_thread.clone(),
+        ));
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -919,6 +986,26 @@ pub enum CookieSource {
     HTTP,
     /// A non-HTTP API
     NonHTTP,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CookieChange {
+    changed: Vec<Serde<Cookie<'static>>>,
+    deleted: Vec<Serde<Cookie<'static>>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum CookieData {
+    Change(CookieChange),
+    Get(Option<Serde<Cookie<'static>>>),
+    GetAll(Vec<Serde<Cookie<'static>>>),
+    Set(Result<(), ()>),
+    Delete(Result<(), ()>),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CookieAsyncResponse {
+    pub data: CookieData,
 }
 
 /// Network errors that have to be exported out of the loaders

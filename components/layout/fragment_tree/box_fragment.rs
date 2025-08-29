@@ -4,6 +4,7 @@
 
 use app_units::{Au, MAX_AU, MIN_AU};
 use atomic_refcell::AtomicRefCell;
+use base::id::ScrollTreeNodeId;
 use base::print_tree::PrintTree;
 use malloc_size_of_derive::MallocSizeOf;
 use servo_arc::Arc as ServoArc;
@@ -55,6 +56,37 @@ pub(crate) enum SpecificLayoutInfo {
 }
 
 #[derive(MallocSizeOf)]
+pub(crate) struct BlockLevelLayoutInfo {
+    /// When the `clear` property is not set to `none`, it may introduce clearance.
+    /// Clearance is some extra spacing that is added above the top margin,
+    /// so that the element doesn't overlap earlier floats in the same BFC.
+    /// The presence of clearance prevents the top margin from collapsing with
+    /// earlier margins or with the bottom margin of the parent block.
+    /// <https://drafts.csswg.org/css2/#clearance>
+    pub clearance: Option<Au>,
+
+    pub block_margins_collapsed_with_children: CollapsedBlockMargins,
+}
+
+#[derive(MallocSizeOf)]
+pub(crate) struct BoxFragmentRareData {
+    /// Information that is specific to a layout system (e.g., grid, table, etc.).
+    pub specific_layout_info: Option<SpecificLayoutInfo>,
+}
+
+impl BoxFragmentRareData {
+    /// Create a new rare data based on information given to the fragment. Ideally, We should
+    /// avoid creating rare data as much as possible to reduce the memory cost.
+    fn try_boxed_from(specific_layout_info: Option<SpecificLayoutInfo>) -> Option<Box<Self>> {
+        specific_layout_info.map(|info| {
+            Box::new(BoxFragmentRareData {
+                specific_layout_info: Some(info),
+            })
+        })
+    }
+}
+
+#[derive(MallocSizeOf)]
 pub(crate) struct BoxFragment {
     pub base: BaseFragment,
 
@@ -73,23 +105,16 @@ pub(crate) struct BoxFragment {
     pub border: PhysicalSides<Au>,
     pub margin: PhysicalSides<Au>,
 
-    /// When the `clear` property is not set to `none`, it may introduce clearance.
-    /// Clearance is some extra spacing that is added above the top margin,
-    /// so that the element doesn't overlap earlier floats in the same BFC.
-    /// The presence of clearance prevents the top margin from collapsing with
-    /// earlier margins or with the bottom margin of the parent block.
-    /// <https://drafts.csswg.org/css2/#clearance>
-    pub clearance: Option<Au>,
-
     /// When this [`BoxFragment`] is for content that has a baseline, this tracks
     /// the first and last baselines of that content. This is used to propagate baselines
     /// to things such as tables and inline formatting contexts.
     baselines: Baselines,
 
-    block_margins_collapsed_with_children: Option<Box<CollapsedBlockMargins>>,
-
-    /// The scrollable overflow of this box fragment.
-    pub scrollable_overflow_from_children: PhysicalRect<Au>,
+    /// The scrollable overflow of this box fragment in the same coordiante system as
+    /// [`Self::content_rect`] ie a rectangle within the parent fragment's content
+    /// rectangle. This does not take into account any transforms this fragment applies.
+    /// This is handled when calling [`Self::scrollable_overflow_for_parent`].
+    scrollable_overflow: Option<PhysicalRect<Au>>,
 
     /// The resolved box insets if this box is `position: sticky`. These are calculated
     /// during `StackingContextTree` construction because they rely on the size of the
@@ -98,8 +123,17 @@ pub(crate) struct BoxFragment {
 
     pub background_mode: BackgroundMode,
 
-    /// Additional information of from layout that could be used by Javascripts and devtools.
-    pub specific_layout_info: Option<SpecificLayoutInfo>,
+    /// Rare data that not all kinds of [`BoxFragment`] would have.
+    pub rare_data: Option<Box<BoxFragmentRareData>>,
+
+    /// Additional information for block-level boxes.
+    pub block_level_layout_info: Option<Box<BlockLevelLayoutInfo>>,
+
+    /// The containing spatial tree node of this [`BoxFragment`]. This is assigned during
+    /// `StackingContextTree` construction, so isn't available before that time. This is
+    /// used to for determining final viewport size and position of this node and will
+    /// also be used in the future for hit testing.
+    pub spatial_tree_node: AtomicRefCell<Option<ScrollTreeNodeId>>,
 }
 
 impl BoxFragment {
@@ -112,12 +146,9 @@ impl BoxFragment {
         padding: PhysicalSides<Au>,
         border: PhysicalSides<Au>,
         margin: PhysicalSides<Au>,
-        clearance: Option<Au>,
+        specific_layout_info: Option<SpecificLayoutInfo>,
     ) -> BoxFragment {
-        let scrollable_overflow_from_children =
-            children.iter().fold(PhysicalRect::zero(), |acc, child| {
-                acc.union(&child.scrollable_overflow_for_parent())
-            });
+        let rare_data = BoxFragmentRareData::try_boxed_from(specific_layout_info);
 
         BoxFragment {
             base: base_fragment_info.into(),
@@ -128,13 +159,13 @@ impl BoxFragment {
             padding,
             border,
             margin,
-            clearance,
             baselines: Baselines::default(),
-            block_margins_collapsed_with_children: None,
-            scrollable_overflow_from_children,
+            scrollable_overflow: None,
             resolved_sticky_insets: AtomicRefCell::default(),
             background_mode: BackgroundMode::Normal,
-            specific_layout_info: None,
+            rare_data,
+            block_level_layout_info: None,
+            spatial_tree_node: AtomicRefCell::default(),
         }
     }
 
@@ -187,29 +218,80 @@ impl BoxFragment {
         self.background_mode = BackgroundMode::None;
     }
 
-    pub fn with_specific_layout_info(mut self, info: Option<SpecificLayoutInfo>) -> Self {
-        self.specific_layout_info = info;
-        self
+    pub fn specific_layout_info(&self) -> Option<&SpecificLayoutInfo> {
+        self.rare_data.as_ref()?.specific_layout_info.as_ref()
     }
 
-    pub fn with_block_margins_collapsed_with_children(
+    pub fn with_block_level_layout_info(
         mut self,
-        collapsed_margins: CollapsedBlockMargins,
+        block_margins_collapsed_with_children: CollapsedBlockMargins,
+        clearance: Option<Au>,
     ) -> Self {
-        self.block_margins_collapsed_with_children = Some(collapsed_margins.into());
+        self.block_level_layout_info = Some(Box::new(BlockLevelLayoutInfo {
+            block_margins_collapsed_with_children,
+            clearance,
+        }));
         self
     }
 
     /// Get the scrollable overflow for this [`BoxFragment`] relative to its
     /// containing block.
     pub fn scrollable_overflow(&self) -> PhysicalRect<Au> {
+        self.scrollable_overflow
+            .expect("Should only call `scrollable_overflow()` after calculating overflow")
+    }
+
+    /// This is an implementation of:
+    /// - <https://drafts.csswg.org/css-overflow-3/#scrollable>.
+    /// - <https://drafts.csswg.org/cssom-view/#scrolling-area>
+    pub(crate) fn calculate_scrollable_overflow(&mut self) {
         let physical_padding_rect = self.padding_rect();
         let content_origin = self.content_rect.origin.to_vector();
-        physical_padding_rect.union(
-            &self
-                .scrollable_overflow_from_children
-                .translate(content_origin),
-        )
+
+        // > The scrollable overflow area is the union of:
+        // > * The scroll container’s own padding box.
+        // > * All line boxes directly contained by the scroll container.
+        // > * The border boxes of all boxes for which it is the containing block and
+        // >   whose border boxes are positioned not wholly in the unreachable
+        // >   scrollable overflow region, accounting for transforms by projecting
+        // >   each box onto the plane of the element that establishes its 3D
+        // >   rendering context.
+        // > * The margin areas of grid item and flex item boxes for which the box
+        // >   establishes a containing block.
+        // > * The scrollable overflow areas of all of the above boxes (including zero-area
+        // >   boxes and accounting for transforms as described above), provided they
+        // >   themselves have overflow: visible (i.e. do not themselves trap the overflow)
+        // >   and that scrollable overflow is not already clipped (e.g. by the clip property
+        // >   or the contain property).
+        // > * Additional padding added to the scrollable overflow rectangle as necessary
+        //     to enable scroll positions that satisfy the requirements of both place-content:
+        //     start and place-content: end alignment.
+        //
+        // TODO(mrobinson): Below we are handling the border box and the scrollable
+        // overflow together, but from the specification it seems that if the border
+        // box of an item is in the "wholly unreachable scrollable overflow region", but
+        // its scrollable overflow is not, it should also be excluded.
+        let scrollable_overflow = self
+            .children
+            .iter()
+            .fold(physical_padding_rect, |acc, child| {
+                let scrollable_overflow_from_child = child
+                    .calculate_scrollable_overflow_for_parent()
+                    .translate(content_origin);
+
+                // Note that this doesn't just exclude scrollable overflow outside the
+                // wholly unrechable scrollable overflow area, but also clips it. This
+                // makes the resulting value more like the "scroll area" rather than the
+                // "scrollable overflow."
+                let scrollable_overflow_from_child = self
+                    .clip_wholly_unreachable_scrollable_overflow(
+                        scrollable_overflow_from_child,
+                        physical_padding_rect,
+                    );
+                acc.union(&scrollable_overflow_from_child)
+            });
+
+        self.scrollable_overflow = Some(scrollable_overflow)
     }
 
     pub(crate) fn set_containing_block(&mut self, containing_block: &PhysicalRect<Au>) {
@@ -218,6 +300,18 @@ impl BoxFragment {
 
     pub fn offset_by_containing_block(&self, rect: &PhysicalRect<Au>) -> PhysicalRect<Au> {
         rect.translate(self.cumulative_containing_block_rect.origin.to_vector())
+    }
+
+    pub(crate) fn cumulative_content_box_rect(&self) -> PhysicalRect<Au> {
+        self.offset_by_containing_block(&self.margin_rect())
+    }
+
+    pub(crate) fn cumulative_padding_box_rect(&self) -> PhysicalRect<Au> {
+        self.offset_by_containing_block(&self.padding_rect())
+    }
+
+    pub(crate) fn cumulative_border_box_rect(&self) -> PhysicalRect<Au> {
+        self.offset_by_containing_block(&self.border_rect())
     }
 
     pub(crate) fn padding_rect(&self) -> PhysicalRect<Au> {
@@ -254,7 +348,6 @@ impl BoxFragment {
                 \npadding rect={:?}\
                 \nborder rect={:?}\
                 \nmargin={:?}\
-                \nclearance={:?}\
                 \nscrollable_overflow={:?}\
                 \nbaselines={:?}\
                 \noverflow={:?}",
@@ -263,7 +356,6 @@ impl BoxFragment {
             self.padding_rect(),
             self.border_rect(),
             self.margin,
-            self.clearance,
             self.scrollable_overflow(),
             self.baselines,
             self.style.effective_overflow(self.base.flags),
@@ -275,7 +367,7 @@ impl BoxFragment {
         tree.end_level();
     }
 
-    pub fn scrollable_overflow_for_parent(&self) -> PhysicalRect<Au> {
+    pub(crate) fn scrollable_overflow_for_parent(&self) -> PhysicalRect<Au> {
         let mut overflow = self.border_rect();
         if !self.style.establishes_scroll_container(self.base.flags) {
             // https://www.w3.org/TR/css-overflow-3/#scrollable
@@ -298,45 +390,46 @@ impl BoxFragment {
             }
         }
 
+        if !self
+            .style
+            .has_effective_transform_or_perspective(self.base.flags)
+        {
+            return overflow;
+        }
+
         // <https://drafts.csswg.org/css-overflow-3/#scrollable-overflow-region>
         // > ...accounting for transforms by projecting each box onto the plane of
         // > the element that establishes its 3D rendering context. [CSS3-TRANSFORMS]
         // Both boxes and its scrollable overflow (if it is included) should be transformed accordingly.
         //
-        // TODO(stevennovaryo): We are supposed to handle perspective transform and 3d context, but it is yet to happen.
-        if self
-            .style
-            .has_effective_transform_or_perspective(self.base.flags)
-        {
-            if let Some(transform) =
-                self.calculate_transform_matrix(&self.border_rect().to_untyped())
-            {
-                if let Some(transformed_overflow_box) =
-                    transform.outer_transformed_rect(&overflow.to_webrender().to_rect())
-                {
-                    overflow =
-                        f32_rect_to_au_rect(transformed_overflow_box.to_untyped()).cast_unit();
-                }
-            }
-        }
-
-        overflow
+        // TODO(stevennovaryo): We are supposed to handle perspective transform and 3d
+        // contexts, but it is yet to happen.
+        self.calculate_transform_matrix(&self.border_rect().to_untyped())
+            .and_then(|transform| {
+                transform.outer_transformed_rect(&overflow.to_webrender().to_rect())
+            })
+            .map(|transformed_rect| f32_rect_to_au_rect(transformed_rect.to_untyped()).cast_unit())
+            .unwrap_or(overflow)
     }
 
-    /// <https://drafts.csswg.org/css-overflow/#unreachable-scrollable-overflow-region>
-    /// > area beyond the scroll origin in either axis is considered the unreachable scrollable overflow region
-    ///
-    /// Return the clipped the scrollable overflow based on its scroll origin, determined by overflow direction.
-    /// For an element, the clip rect is the padding rect and for viewport, it is the initial containing block.
-    pub fn clip_unreachable_scrollable_overflow_region(
+    /// Return the clipped the scrollable overflow based on its scroll origin, determined
+    /// by overflow direction. For an element, the clip rect is the padding rect and for
+    /// viewport, it is the initial containing block.
+    pub(crate) fn clip_wholly_unreachable_scrollable_overflow(
         &self,
         scrollable_overflow: PhysicalRect<Au>,
         clipping_rect: PhysicalRect<Au>,
     ) -> PhysicalRect<Au> {
+        // From <https://drafts.csswg.org/css-overflow/#unreachable-scrollable-overflow-region>:
+        // > Unless otherwise adjusted (e.g. by content alignment [css-align-3]), the area
+        // > beyond the scroll origin in either axis is considered the unreachable scrollable
+        // > overflow region: content rendered here is not accessible to the reader, see § 2.2
+        // > Scrollable Overflow. A scroll container is said to be scrolled to its scroll
+        // > origin when its scroll origin coincides with the corresponding corner of its
+        // > scrollport. This scroll position, the scroll origin position, usually, but not
+        // > always, coincides with the initial scroll position.
         let scrolling_direction = self.style.overflow_direction();
-        let mut scrollable_overflow_box = scrollable_overflow.to_box2d();
         let mut clipping_box = clipping_rect.to_box2d();
-
         if scrolling_direction.rightward {
             clipping_box.max.x = MAX_AU;
         } else {
@@ -349,24 +442,14 @@ impl BoxFragment {
             clipping_box.min.y = MIN_AU;
         }
 
-        scrollable_overflow_box = scrollable_overflow_box.intersection_unchecked(&clipping_box);
+        let scrollable_overflow_box = scrollable_overflow
+            .to_box2d()
+            .intersection_unchecked(&clipping_box);
 
         match scrollable_overflow_box.is_negative() {
             true => PhysicalRect::zero(),
             false => scrollable_overflow_box.to_rect(),
         }
-    }
-
-    /// <https://drafts.csswg.org/css-overflow/#unreachable-scrollable-overflow-region>
-    /// > area beyond the scroll origin in either axis is considered the unreachable scrollable overflow region
-    ///
-    /// Return the clipped the scrollable overflow based on its scroll origin, determined by overflow direction.
-    /// This will coincides with the scrollport if the fragment is a scroll container.
-    pub fn reachable_scrollable_overflow_region(&self) -> PhysicalRect<Au> {
-        self.clip_unreachable_scrollable_overflow_region(
-            self.scrollable_overflow(),
-            self.padding_rect(),
-        )
     }
 
     pub(crate) fn calculate_resolved_insets_if_positioned(&self) -> PhysicalSides<AuOrAuto> {
@@ -421,9 +504,7 @@ impl BoxFragment {
             return convert_to_au_or_auto(PhysicalSides::new(top, right, bottom, left));
         }
 
-        debug_assert!(
-            position == ComputedPosition::Fixed || position == ComputedPosition::Absolute
-        );
+        debug_assert!(position.is_absolutely_positioned());
 
         let margin_rect = self.margin_rect();
         let (top, bottom) = match (&insets.top, &insets.bottom) {
@@ -463,26 +544,19 @@ impl BoxFragment {
     /// <https://www.w3.org/TR/css-tables-3/#table-wrapper-box>
     pub(crate) fn is_table_wrapper(&self) -> bool {
         matches!(
-            self.specific_layout_info,
+            self.specific_layout_info(),
             Some(SpecificLayoutInfo::TableWrapper)
         )
     }
 
     pub(crate) fn has_collapsed_borders(&self) -> bool {
-        match &self.specific_layout_info {
+        match self.specific_layout_info() {
             Some(SpecificLayoutInfo::TableCellWithCollapsedBorders) => true,
             Some(SpecificLayoutInfo::TableGridWithCollapsedBorders(_)) => true,
             Some(SpecificLayoutInfo::TableWrapper) => {
                 self.style.get_inherited_table().border_collapse == BorderCollapse::Collapse
             },
             _ => false,
-        }
-    }
-
-    pub(crate) fn block_margins_collapsed_with_children(&self) -> CollapsedBlockMargins {
-        match self.block_margins_collapsed_with_children.as_ref() {
-            Some(collapsed_block_margins) => *(collapsed_block_margins).clone(),
-            _ => CollapsedBlockMargins::zero(),
         }
     }
 }

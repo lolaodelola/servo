@@ -28,6 +28,7 @@ use style::values::generics::position::{GenericAspectRatio, PreferredRatio};
 use style::values::generics::transform::{GenericRotate, GenericScale, GenericTranslate};
 use style::values::specified::align::AlignFlags;
 use style::values::specified::{Overflow, WillChangeBits, box_ as stylo};
+use unicode_bidi::Level;
 use webrender_api as wr;
 use webrender_api::units::LayoutTransform;
 
@@ -35,8 +36,9 @@ use crate::dom_traversal::{Contents, NonReplacedContents};
 use crate::fragment_tree::FragmentFlags;
 use crate::geom::{
     AuOrAuto, LengthPercentageOrAuto, LogicalSides, LogicalSides1D, LogicalVec2, PhysicalSides,
-    PhysicalSize, Size, Sizes,
+    PhysicalSize,
 };
+use crate::sizing::{Size, Sizes};
 use crate::table::TableLayoutStyle;
 use crate::{ContainingBlock, IndefiniteContainingBlock};
 
@@ -223,7 +225,7 @@ impl AspectRatio {
         }
     }
 
-    pub(crate) fn from_content_ratio(i_over_b: CSSFloat) -> Self {
+    pub(crate) fn from_logical_content_ratio(i_over_b: CSSFloat) -> Self {
         Self {
             box_sizing_adjustment: LogicalVec2::zero(),
             i_over_b,
@@ -365,6 +367,7 @@ pub(crate) trait ComputedValuesExt {
     ) -> bool;
     fn is_inline_box(&self, fragment_flags: FragmentFlags) -> bool;
     fn overflow_direction(&self) -> OverflowDirection;
+    fn to_bidi_level(&self) -> Level;
 }
 
 impl ComputedValuesExt for ComputedValues {
@@ -595,6 +598,15 @@ impl ComputedValuesExt for ComputedValues {
         let mut overflow_x = style_box.overflow_x;
         let mut overflow_y = style_box.overflow_y;
 
+        // https://www.w3.org/TR/css-overflow-3/#overflow-propagation
+        // The element from which the value is propagated must then have a used overflow value of visible.
+        if fragment_flags.contains(FragmentFlags::PROPAGATED_OVERFLOW_TO_VIEWPORT) {
+            return AxesOverflow {
+                x: Overflow::Visible,
+                y: Overflow::Visible,
+            };
+        }
+
         // From <https://www.w3.org/TR/css-overflow-4/#overflow-control>:
         // "On replaced elements, the used values of all computed values other than visible is clip."
         if fragment_flags.contains(FragmentFlags::IS_REPLACED) {
@@ -651,6 +663,10 @@ impl ComputedValuesExt for ComputedValues {
 
     /// Return true if this style is a normal block and establishes
     /// a new block formatting context.
+    ///
+    /// NOTE: This should be kept in sync with the checks in `impl
+    /// TElement::compute_layout_damage` for `ServoLayoutElement` in
+    /// `components/script/layout_dom/element.rs`.
     fn establishes_block_formatting_context(&self, fragment_flags: FragmentFlags) -> bool {
         if self.establishes_scroll_container(fragment_flags) {
             return true;
@@ -884,6 +900,14 @@ impl ComputedValuesExt for ComputedValues {
             preferred_ratio = PreferredRatio::None;
         }
 
+        let to_logical_ratio = |physical_ratio| {
+            if self.writing_mode.is_horizontal() {
+                physical_ratio
+            } else {
+                1.0 / physical_ratio
+            }
+        };
+
         match (auto, preferred_ratio) {
             // The value `auto`. Either the ratio was not specified, or was
             // degenerate and set to PreferredRatio::None above.
@@ -892,19 +916,20 @@ impl ComputedValuesExt for ComputedValues {
             // ratio; otherwise the box has no preferred aspect ratio. Size
             // calculations involving the aspect ratio work with the content box
             // dimensions always."
-            (_, PreferredRatio::None) => natural_aspect_ratio.map(AspectRatio::from_content_ratio),
+            (_, PreferredRatio::None) => natural_aspect_ratio
+                .map(to_logical_ratio)
+                .map(AspectRatio::from_logical_content_ratio),
             // "If both auto and a <ratio> are specified together, the preferred
             // aspect ratio is the specified ratio of width / height unless it
             // is a replaced element with a natural aspect ratio, in which case
             // that aspect ratio is used instead. In all cases, size
             // calculations involving the aspect ratio work with the content box
             // dimensions always."
-            (true, PreferredRatio::Ratio(preferred_ratio)) => {
-                Some(AspectRatio::from_content_ratio(
-                    natural_aspect_ratio
-                        .unwrap_or_else(|| (preferred_ratio.0).0 / (preferred_ratio.1).0),
-                ))
-            },
+            (true, PreferredRatio::Ratio(preferred_ratio)) => Some({
+                let physical_ratio = natural_aspect_ratio
+                    .unwrap_or_else(|| (preferred_ratio.0).0 / (preferred_ratio.1).0);
+                AspectRatio::from_logical_content_ratio(to_logical_ratio(physical_ratio))
+            }),
 
             // "The box’s preferred aspect ratio is the specified ratio of width
             // / height. Size calculations involving the aspect ratio work with
@@ -917,7 +942,7 @@ impl ComputedValuesExt for ComputedValues {
                     BoxSizing::BorderBox => *padding_border_sums,
                 };
                 Some(AspectRatio {
-                    i_over_b: (preferred_ratio.0).0 / (preferred_ratio.1).0,
+                    i_over_b: to_logical_ratio((preferred_ratio.0).0 / (preferred_ratio.1).0),
                     box_sizing_adjustment,
                 })
             },
@@ -1015,6 +1040,17 @@ impl ComputedValuesExt for ComputedValues {
         OverflowDirection {
             rightward,
             downward,
+        }
+    }
+
+    /// The default bidirectional embedding level for the writing mode of this style.
+    ///
+    /// Returns bidi level 0 if the mode is LTR, or 1 otherwise.
+    fn to_bidi_level(&self) -> Level {
+        if self.writing_mode.is_bidi_ltr() {
+            Level::ltr()
+        } else {
+            Level::rtl()
         }
     }
 }

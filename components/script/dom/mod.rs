@@ -143,7 +143,7 @@
 //! Implementing methods for a DOM object
 //! =====================================
 //!
-//! * `dom::bindings::codegen::Bindings::FooBindings::FooMethods` for methods
+//! * `dom::bindings::codegen::Bindings::FooBinding::FooMethods` for methods
 //!   defined through IDL;
 //! * `&self` public methods for public helpers;
 //! * `&self` methods for private helpers.
@@ -183,7 +183,7 @@
 //! * defining the DOM struct `Foo` with a `#[dom_struct]` attribute, a
 //!   superclass or `Reflector` member, and other members as appropriate;
 //! * implementing the
-//!   `dom::bindings::codegen::Bindings::FooBindings::FooMethods` trait for
+//!   `dom::bindings::codegen::Bindings::FooBinding::FooMethods` trait for
 //!   `Foo`;
 //! * adding/updating the match arm in create_element in
 //!   `components/script/dom/create.rs` (only applicable to new types inheriting
@@ -211,31 +211,20 @@ pub(crate) mod types {
 }
 
 pub(crate) mod abortcontroller;
+pub(crate) mod abortsignal;
 #[allow(dead_code)]
 pub(crate) mod abstractrange;
 pub(crate) mod abstractworker;
 pub(crate) mod abstractworkerglobalscope;
 pub(crate) mod activation;
-pub(crate) mod analysernode;
 pub(crate) mod animationevent;
 pub(crate) mod attr;
-pub(crate) mod audiobuffer;
-pub(crate) mod audiobuffersourcenode;
-pub(crate) mod audiocontext;
-pub(crate) mod audiodestinationnode;
-pub(crate) mod audiolistener;
-pub(crate) mod audionode;
-pub(crate) mod audioparam;
-pub(crate) mod audioscheduledsourcenode;
-pub(crate) mod audiotrack;
-pub(crate) mod audiotracklist;
-pub(crate) mod baseaudiocontext;
+pub(crate) mod audio;
+pub(crate) use self::audio::*;
 pub(crate) mod beforeunloadevent;
 pub(crate) mod bindings;
-pub(crate) mod biquadfilternode;
 pub(crate) mod blob;
 #[cfg(feature = "bluetooth")]
-#[allow(clippy::module_inception)]
 pub(crate) mod bluetooth;
 #[cfg(feature = "bluetooth")]
 pub(crate) use self::bluetooth::*;
@@ -246,8 +235,6 @@ pub(crate) mod canvaspattern;
 #[allow(dead_code)]
 pub(crate) mod canvasrenderingcontext2d;
 pub(crate) mod cdatasection;
-pub(crate) mod channelmergernode;
-pub(crate) mod channelsplitternode;
 pub(crate) mod characterdata;
 pub(crate) mod client;
 pub(crate) mod clipboard;
@@ -258,11 +245,13 @@ pub(crate) mod closewatcher;
 pub(crate) mod comment;
 pub(crate) mod compositionevent;
 pub(crate) mod console;
-pub(crate) mod constantsourcenode;
+pub(crate) mod cookiestore;
 pub(crate) mod countqueuingstrategy;
 mod create;
 pub(crate) mod crypto;
 pub(crate) mod cryptokey;
+pub(crate) mod csp;
+pub(crate) mod csppolicyviolationreport;
 pub(crate) mod css;
 pub(crate) mod cssconditionrule;
 pub(crate) mod cssfontfacerule;
@@ -284,9 +273,13 @@ pub(crate) mod cssstylevalue;
 pub(crate) mod csssupportsrule;
 pub(crate) mod customelementregistry;
 pub(crate) mod customevent;
+pub(crate) mod customstateset;
 pub(crate) mod datatransfer;
 pub(crate) mod datatransferitem;
 pub(crate) mod datatransferitemlist;
+pub(crate) mod debuggeradddebuggeeevent;
+pub(crate) mod debuggergetpossiblebreakpointsevent;
+pub(crate) mod debuggerglobalscope;
 pub(crate) mod dedicatedworkerglobalscope;
 pub(crate) mod defaultteereadrequest;
 pub(crate) mod defaultteeunderlyingsource;
@@ -294,6 +287,7 @@ pub(crate) mod dissimilaroriginlocation;
 pub(crate) mod dissimilaroriginwindow;
 #[allow(dead_code)]
 pub(crate) mod document;
+pub(crate) mod document_event_handler;
 pub(crate) mod documentfragment;
 pub(crate) mod documentorshadowroot;
 pub(crate) mod documenttype;
@@ -330,13 +324,8 @@ pub(crate) mod fontface;
 pub(crate) mod fontfaceset;
 pub(crate) mod formdata;
 pub(crate) mod formdataevent;
-pub(crate) mod gainnode;
 pub(crate) mod gamepad;
-pub(crate) mod gamepadbutton;
-pub(crate) mod gamepadbuttonlist;
-pub(crate) mod gamepadevent;
-pub(crate) mod gamepadhapticactuator;
-pub(crate) mod gamepadpose;
+pub(crate) use self::gamepad::*;
 #[allow(dead_code)]
 pub(crate) mod globalscope;
 pub(crate) mod hashchangeevent;
@@ -359,6 +348,7 @@ pub(crate) mod htmldialogelement;
 pub(crate) mod htmldirectoryelement;
 pub(crate) mod htmldivelement;
 pub(crate) mod htmldlistelement;
+pub(crate) mod htmldocument;
 pub(crate) mod htmlelement;
 pub(crate) mod htmlembedelement;
 pub(crate) mod htmlfieldsetelement;
@@ -418,18 +408,25 @@ pub(crate) mod htmltrackelement;
 pub(crate) mod htmlulistelement;
 pub(crate) mod htmlunknownelement;
 pub(crate) mod htmlvideoelement;
-pub(crate) mod iirfilternode;
+pub(crate) mod idbdatabase;
+pub(crate) mod idbfactory;
+pub(crate) mod idbindex;
+pub(crate) mod idbkeyrange;
+pub(crate) mod idbobjectstore;
+pub(crate) mod idbopendbrequest;
+pub(crate) mod idbrequest;
+pub(crate) mod idbtransaction;
+pub(crate) mod idbversionchangeevent;
 pub(crate) mod imagebitmap;
+pub(crate) mod imagebitmaprenderingcontext;
 pub(crate) mod imagedata;
 pub(crate) mod inputevent;
 pub(crate) mod intersectionobserver;
 pub(crate) mod intersectionobserverentry;
-pub(crate) mod intersectionobserverrootmargin;
 pub(crate) mod keyboardevent;
 pub(crate) mod location;
 pub(crate) mod mediadeviceinfo;
 pub(crate) mod mediadevices;
-pub(crate) mod mediaelementaudiosourcenode;
 pub(crate) mod mediaerror;
 pub(crate) mod mediafragmentparser;
 pub(crate) mod medialist;
@@ -438,10 +435,7 @@ pub(crate) mod mediaquerylist;
 pub(crate) mod mediaquerylistevent;
 pub(crate) mod mediasession;
 pub(crate) mod mediastream;
-pub(crate) mod mediastreamaudiodestinationnode;
-pub(crate) mod mediastreamaudiosourcenode;
 pub(crate) mod mediastreamtrack;
-pub(crate) mod mediastreamtrackaudiosourcenode;
 pub(crate) mod messagechannel;
 pub(crate) mod messageevent;
 #[allow(dead_code)]
@@ -461,16 +455,12 @@ pub(crate) mod nodeiterator;
 #[allow(dead_code)]
 pub(crate) mod nodelist;
 pub(crate) mod notification;
-pub(crate) mod offlineaudiocompletionevent;
-pub(crate) mod offlineaudiocontext;
 pub(crate) mod offscreencanvas;
 pub(crate) mod offscreencanvasrenderingcontext2d;
-pub(crate) mod oscillatornode;
 pub(crate) mod pagetransitionevent;
 pub(crate) mod paintrenderingcontext2d;
 pub(crate) mod paintsize;
 pub(crate) mod paintworkletglobalscope;
-pub(crate) mod pannernode;
 pub(crate) mod path2d;
 pub(crate) mod performance;
 #[allow(dead_code)]
@@ -486,6 +476,7 @@ pub(crate) mod performancepainttiming;
 pub(crate) mod performanceresourcetiming;
 pub(crate) mod permissions;
 pub(crate) mod permissionstatus;
+pub(crate) mod pipelineid;
 pub(crate) mod plugin;
 pub(crate) mod pluginarray;
 #[allow(dead_code)]
@@ -497,6 +488,7 @@ pub(crate) mod progressevent;
 pub(crate) mod promise;
 pub(crate) mod promisenativehandler;
 pub(crate) mod promiserejectionevent;
+pub(crate) mod quotaexceedederror;
 pub(crate) mod radionodelist;
 pub(crate) mod range;
 pub(crate) mod raredata;
@@ -508,6 +500,8 @@ pub(crate) mod readablestreambyobrequest;
 pub(crate) mod readablestreamdefaultcontroller;
 pub(crate) mod readablestreamdefaultreader;
 pub(crate) mod readablestreamgenericreader;
+pub(crate) mod reportingendpoint;
+pub(crate) mod reportingobserver;
 pub(crate) mod request;
 pub(crate) mod resizeobserver;
 pub(crate) mod resizeobserverentry;
@@ -538,11 +532,11 @@ pub(crate) mod servointernals;
 pub(crate) mod servoparser;
 pub(crate) mod shadowroot;
 pub(crate) mod staticrange;
-pub(crate) mod stereopannernode;
 pub(crate) mod storage;
 pub(crate) mod storageevent;
 pub(crate) mod stylepropertymapreadonly;
 pub(crate) mod stylesheet;
+pub(crate) mod stylesheetcontentscache;
 pub(crate) mod stylesheetlist;
 pub(crate) mod submitevent;
 pub(crate) mod subtlecrypto;
@@ -577,7 +571,10 @@ pub(crate) mod testworkletglobalscope;
 pub(crate) mod text;
 pub(crate) mod textcontrol;
 pub(crate) mod textdecoder;
+pub(crate) mod textdecodercommon;
+pub(crate) mod textdecoderstream;
 pub(crate) mod textencoder;
+pub(crate) mod textencoderstream;
 pub(crate) mod textmetrics;
 pub(crate) mod texttrack;
 pub(crate) mod texttrackcue;
@@ -606,34 +603,15 @@ pub(crate) mod userscripts;
 pub(crate) mod validation;
 pub(crate) mod validitystate;
 pub(crate) mod values;
-pub(crate) mod vertexarrayobject;
 pub(crate) mod videotrack;
 pub(crate) mod videotracklist;
 pub(crate) mod virtualmethods;
 pub(crate) mod visibilitystateentry;
 pub(crate) mod vttcue;
 pub(crate) mod vttregion;
-pub(crate) mod webgl2renderingcontext;
-pub(crate) mod webgl_extensions;
-pub(crate) mod webgl_validations;
-pub(crate) mod webglactiveinfo;
-pub(crate) mod webglbuffer;
-pub(crate) mod webglcontextevent;
-pub(crate) mod webglframebuffer;
-pub(crate) mod webglobject;
-pub(crate) mod webglprogram;
-pub(crate) mod webglquery;
-pub(crate) mod webglrenderbuffer;
-pub(crate) mod webglrenderingcontext;
-pub(crate) mod webglsampler;
-pub(crate) mod webglshader;
-pub(crate) mod webglshaderprecisionformat;
-pub(crate) mod webglsync;
-pub(crate) mod webgltexture;
-pub(crate) mod webgltransformfeedback;
-pub(crate) mod webgluniformlocation;
-pub(crate) mod webglvertexarrayobject;
-pub(crate) mod webglvertexarrayobjectoes;
+pub(crate) mod webgl;
+pub(crate) use self::webgl::extensions::ext::*;
+pub(crate) use self::webgl::*;
 pub(crate) mod websocket;
 #[cfg(feature = "webxr")]
 mod webxr;
@@ -670,4 +648,3 @@ pub(crate) mod xmlserializer;
 pub(crate) mod xpathevaluator;
 pub(crate) mod xpathexpression;
 pub(crate) mod xpathresult;
-pub(crate) use self::webgl_extensions::ext::*;

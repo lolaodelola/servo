@@ -2,19 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::default::Default;
-use std::f64::consts::PI;
-use std::mem;
 use std::rc::Rc;
-use std::slice::from_ref;
 use std::str::FromStr;
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base::cross_process_instant::CrossProcessInstant;
 use base::id::WebViewId;
@@ -22,24 +18,22 @@ use canvas_traits::canvas::CanvasId;
 use canvas_traits::webgl::{self, WebGLContextId, WebGLMsg};
 use chrono::Local;
 use constellation_traits::{NavigationHistoryBehavior, ScriptToConstellationMessage};
-use content_security_policy::{self as csp, CspList, PolicyDisposition};
+use content_security_policy::{CspList, PolicyDisposition};
 use cookie::Cookie;
 use cssparser::match_ignore_ascii_case;
 use data_url::mime::Mime;
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use dom_struct::dom_struct;
-use embedder_traits::{
-    AllowOrDeny, AnimationState, CompositorHitTestResult, ContextMenuResult, EditingActionEvent,
-    EmbedderMsg, FocusSequenceNumber, ImeEvent, InputEvent, LoadStatus, MouseButton,
-    MouseButtonAction, MouseButtonEvent, TouchEvent, TouchEventType, TouchId, WheelEvent,
-};
+use embedder_traits::{AllowOrDeny, AnimationState, EmbedderMsg, FocusSequenceNumber, LoadStatus};
 use encoding_rs::{Encoding, UTF_8};
-use euclid::default::{Point2D, Rect, Size2D};
+use euclid::Point2D;
+use euclid::default::{Rect, Size2D};
+use fnv::FnvHashMap;
 use html5ever::{LocalName, Namespace, QualName, local_name, ns};
 use hyper_serde::Serde;
 use ipc_channel::ipc;
-use js::rust::{HandleObject, HandleValue};
-use keyboard_types::{Code, Key, KeyState, Modifiers};
+use js::rust::{HandleObject, HandleValue, MutableHandleValue};
+use layout_api::{PendingRestyle, ReflowGoal, ReflowPhasesRun, RestyleReason, TrustedNodeAddress};
 use metrics::{InteractiveFlag, InteractiveWindow, ProgressiveWebMetrics};
 use net_traits::CookieSource::NonHTTP;
 use net_traits::CoreResourceMsg::{GetCookiesForUrl, SetCookiesForUrl};
@@ -48,14 +42,14 @@ use net_traits::pub_domains::is_pub_domain;
 use net_traits::request::{InsecureRequestsPolicy, RequestBuilder};
 use net_traits::response::HttpsState;
 use net_traits::{FetchResponseListener, IpcSend, ReferrerPolicy};
-use num_traits::ToPrimitive;
 use percent_encoding::percent_decode;
 use profile_traits::ipc as profile_ipc;
 use profile_traits::time::TimerMetadataFrameType;
 use regex::bytes::Regex;
+use script_bindings::codegen::GenericBindings::ElementBinding::ElementMethods;
 use script_bindings::interfaces::DocumentHelpers;
-use script_layout_interface::{PendingRestyle, TrustedNodeAddress};
-use script_traits::{ConstellationInputEvent, DocumentActivity, ProgressiveWebMetricType};
+use script_bindings::script_runtime::JSContext;
+use script_traits::{DocumentActivity, ProgressiveWebMetricType};
 use servo_arc::Arc;
 use servo_config::pref;
 use servo_media::{ClientContextId, ServoMedia};
@@ -87,9 +81,13 @@ use crate::dom::bindings::codegen::Bindings::BeforeUnloadEventBinding::BeforeUnl
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState, DocumentVisibilityState, NamedPropertyValue,
 };
+use crate::dom::bindings::codegen::Bindings::ElementBinding::{
+    ScrollIntoViewContainer, ScrollIntoViewOptions, ScrollLogicalPosition,
+};
 use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFrameElement_Binding::HTMLIFrameElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLInputElementBinding::HTMLInputElementMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
 use crate::dom::bindings::codegen::Bindings::HTMLTextAreaElementBinding::HTMLTextAreaElementMethods;
 use crate::dom::bindings::codegen::Bindings::NavigatorBinding::Navigator_Binding::NavigatorMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
@@ -97,46 +95,49 @@ use crate::dom::bindings::codegen::Bindings::NodeFilterBinding::NodeFilter;
 use crate::dom::bindings::codegen::Bindings::PerformanceBinding::PerformanceMethods;
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::PermissionName;
 use crate::dom::bindings::codegen::Bindings::ShadowRootBinding::ShadowRootMethods;
-use crate::dom::bindings::codegen::Bindings::TouchBinding::TouchMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::{
-    FrameRequestCallback, ScrollBehavior, WindowMethods,
+    FrameRequestCallback, ScrollBehavior, ScrollOptions, WindowMethods,
 };
 use crate::dom::bindings::codegen::Bindings::XPathEvaluatorBinding::XPathEvaluatorMethods;
 use crate::dom::bindings::codegen::Bindings::XPathNSResolverBinding::XPathNSResolver;
 use crate::dom::bindings::codegen::UnionTypes::{
-    NodeOrString, StringOrElementCreationOptions, TrustedHTMLOrString,
+    BooleanOrScrollIntoViewOptions, NodeOrString, StringOrElementCreationOptions,
+    TrustedHTMLOrString,
+};
+use crate::dom::bindings::domname::{
+    self, is_valid_attribute_local_name, is_valid_element_local_name, namespace_from_domstring,
 };
 use crate::dom::bindings::error::{Error, ErrorInfo, ErrorResult, Fallible};
+use crate::dom::bindings::frozenarray::CachedFrozenArray;
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
-use crate::dom::bindings::root::{Dom, DomRoot, DomSlice, LayoutDom, MutNullableDom, ToLayout};
+use crate::dom::bindings::root::{Dom, DomRoot, LayoutDom, MutNullableDom, ToLayout};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::trace::{HashMapTracedValues, NoTrace};
 #[cfg(feature = "webgpu")]
 use crate::dom::bindings::weakref::WeakRef;
-use crate::dom::bindings::xmlname::{
-    matches_name_production, namespace_from_domstring, validate_and_extract,
-};
+use crate::dom::bindings::xmlname::matches_name_production;
 use crate::dom::canvasrenderingcontext2d::CanvasRenderingContext2D;
 use crate::dom::cdatasection::CDATASection;
-use crate::dom::clipboardevent::{ClipboardEvent, ClipboardEventType};
 use crate::dom::comment::Comment;
 use crate::dom::compositionevent::CompositionEvent;
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::customelementregistry::CustomElementDefinition;
 use crate::dom::customevent::CustomEvent;
-use crate::dom::datatransfer::DataTransfer;
+use crate::dom::document_event_handler::DocumentEventHandler;
 use crate::dom::documentfragment::DocumentFragment;
-use crate::dom::documentorshadowroot::{DocumentOrShadowRoot, StyleSheetInDocument};
+use crate::dom::documentorshadowroot::{
+    DocumentOrShadowRoot, ServoStylesheetInDocument, StylesheetSource,
+};
 use crate::dom::documenttype::DocumentType;
 use crate::dom::domimplementation::DOMImplementation;
 use crate::dom::element::{
     CustomElementCreationMode, Element, ElementCreator, ElementPerformFullscreenEnter,
     ElementPerformFullscreenExit,
 };
-use crate::dom::event::{Event, EventBubbles, EventCancelable, EventDefault, EventStatus};
+use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::focusevent::FocusEvent;
 use crate::dom::fontfaceset::FontFaceSet;
@@ -145,7 +146,6 @@ use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::htmlanchorelement::HTMLAnchorElement;
 use crate::dom::htmlareaelement::HTMLAreaElement;
 use crate::dom::htmlbaseelement::HTMLBaseElement;
-use crate::dom::htmlbodyelement::HTMLBodyElement;
 use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlembedelement::HTMLEmbedElement;
@@ -164,14 +164,13 @@ use crate::dom::location::{Location, NavigationType};
 use crate::dom::messageevent::MessageEvent;
 use crate::dom::mouseevent::MouseEvent;
 use crate::dom::node::{
-    self, CloneChildrenFlag, Node, NodeDamage, NodeFlags, NodeTraits, ShadowIncluding,
+    CloneChildrenFlag, Node, NodeDamage, NodeFlags, NodeTraits, ShadowIncluding,
 };
 use crate::dom::nodeiterator::NodeIterator;
 use crate::dom::nodelist::NodeList;
 use crate::dom::pagetransitionevent::PageTransitionEvent;
 use crate::dom::performanceentry::PerformanceEntry;
 use crate::dom::performancepainttiming::PerformancePaintTiming;
-use crate::dom::pointerevent::{PointerEvent, PointerId};
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::promise::Promise;
 use crate::dom::range::Range;
@@ -182,7 +181,6 @@ use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::storageevent::StorageEvent;
 use crate::dom::stylesheetlist::{StyleSheetList, StyleSheetListOwner};
 use crate::dom::text::Text;
-use crate::dom::touch::Touch;
 use crate::dom::touchevent::TouchEvent as DomTouchEvent;
 use crate::dom::touchlist::TouchList;
 use crate::dom::treewalker::TreeWalker;
@@ -190,36 +188,25 @@ use crate::dom::trustedhtml::TrustedHTML;
 use crate::dom::types::VisibilityStateEntry;
 use crate::dom::uievent::UIEvent;
 use crate::dom::virtualmethods::vtable_for;
-use crate::dom::webglrenderingcontext::WebGLRenderingContext;
+use crate::dom::webgl::webglrenderingcontext::WebGLRenderingContext;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::gpucanvascontext::GPUCanvasContext;
-use crate::dom::wheelevent::WheelEvent as DomWheelEvent;
 use crate::dom::window::Window;
 use crate::dom::windowproxy::WindowProxy;
 use crate::dom::xpathevaluator::XPathEvaluator;
-use crate::drag_data_store::{DragDataStore, Kind, Mode};
 use crate::fetch::FetchCanceller;
 use crate::iframe_collection::IFrameCollection;
 use crate::image_animation::ImageAnimationManager;
 use crate::messaging::{CommonScriptMsg, MainThreadScriptMsg};
-use crate::mime::{APPLICATION, CHARSET, MimeExt};
+use crate::mime::{APPLICATION, CHARSET};
 use crate::network_listener::{NetworkListener, PreInvoke};
 use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
 use crate::script_runtime::{CanGc, ScriptThreadEventCategory};
-use crate::script_thread::{ScriptThread, with_script_thread};
+use crate::script_thread::ScriptThread;
 use crate::stylesheet_set::StylesheetSetRef;
-use crate::task::TaskBox;
+use crate::task::NonSendTaskBox;
 use crate::task_source::TaskSourceName;
 use crate::timers::OneshotTimerCallback;
-
-/// The number of times we are allowed to see spurious `requestAnimationFrame()` calls before
-/// falling back to fake ones.
-///
-/// A spurious `requestAnimationFrame()` call is defined as one that does not change the DOM.
-const SPURIOUS_ANIMATION_FRAME_THRESHOLD: u8 = 5;
-
-/// The amount of time between fake `requestAnimationFrame()`s.
-const FAKE_REQUEST_ANIMATION_FRAME_DELAY: u64 = 16;
 
 pub(crate) enum TouchEventResult {
     Processed(bool),
@@ -278,6 +265,8 @@ struct FocusTransaction {
     element: Option<Dom<Element>>,
     /// See [`Document::has_focus`].
     has_focus: bool,
+    /// Focus options for the transaction
+    focus_options: FocusOptions,
 }
 
 /// Information about a declarative refresh
@@ -316,6 +305,8 @@ pub(crate) struct Document {
     #[ignore_malloc_size_of = "defined in selectors"]
     #[no_trace]
     quirks_mode: Cell<QuirksMode>,
+    /// A helper used to process and store data related to input event handling.
+    event_handler: DocumentEventHandler,
     /// Caches for the getElement methods
     id_map: DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>>,
     name_map: DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>>,
@@ -337,7 +328,7 @@ pub(crate) struct Document {
     style_shared_lock: StyleSharedRwLock,
     /// List of stylesheets associated with nodes in this document. |None| if the list needs to be refreshed.
     #[custom_trace]
-    stylesheets: DomRefCell<DocumentStylesheetSet<StyleSheetInDocument>>,
+    stylesheets: DomRefCell<DocumentStylesheetSet<ServoStylesheetInDocument>>,
     stylesheet_list: MutNullableDom<StyleSheetList>,
     ready_state: Cell<DocumentReadyState>,
     /// Whether the DOMContentLoaded event has already been dispatched.
@@ -390,14 +381,12 @@ pub(crate) struct Document {
     appropriate_template_contents_owner_document: MutNullableDom<Document>,
     /// Information on elements needing restyle to ship over to layout when the
     /// time comes.
-    pending_restyles: DomRefCell<HashMap<Dom<Element>, NoTrace<PendingRestyle>>>,
-    /// This flag will be true if the `Document` needs to be painted again
-    /// during the next full layout attempt due to some external change such as
-    /// the web view changing size, or because the previous layout was only for
-    /// layout queries (which do not trigger display).
-    needs_paint: Cell<bool>,
-    /// <http://w3c.github.io/touch-events/#dfn-active-touch-point>
-    active_touch_points: DomRefCell<Vec<Dom<Touch>>>,
+    pending_restyles: DomRefCell<FnvHashMap<Dom<Element>, NoTrace<PendingRestyle>>>,
+    /// A collection of reasons that the [`Document`] needs to be restyled at the next
+    /// opportunity for a reflow. If this is empty, then the [`Document`] does not need to
+    /// be restyled.
+    #[no_trace]
+    needs_restyle: Cell<RestyleReason>,
     /// Navigation Timing properties:
     /// <https://w3c.github.io/navigation-timing/#sec-PerformanceNavigationTiming>
     #[no_trace]
@@ -431,10 +420,6 @@ pub(crate) struct Document {
     /// <https://html.spec.whatwg.org/multipage/#concept-document-policy-container>
     #[no_trace]
     policy_container: DomRefCell<PolicyContainer>,
-    /// <https://w3c.github.io/uievents/#event-type-dblclick>
-    #[ignore_malloc_size_of = "Defined in std"]
-    #[no_trace]
-    last_click_info: DomRefCell<Option<(Instant, Point2D<f32>)>>,
     /// <https://html.spec.whatwg.org/multipage/#ignore-destructive-writes-counter>
     ignore_destructive_writes_counter: Cell<u32>,
     /// <https://html.spec.whatwg.org/multipage/#ignore-opens-during-unload-counter>
@@ -482,7 +467,7 @@ pub(crate) struct Document {
     script_and_layout_blockers: Cell<u32>,
     /// List of tasks to execute as soon as last script/layout blocker is removed.
     #[ignore_malloc_size_of = "Measuring trait objects is hard"]
-    delayed_tasks: DomRefCell<Vec<Box<dyn TaskBox>>>,
+    delayed_tasks: DomRefCell<Vec<Box<dyn NonSendTaskBox>>>,
     /// <https://html.spec.whatwg.org/multipage/#completely-loaded>
     completely_loaded: Cell<bool>,
     /// Set of shadow roots connected to the document tree.
@@ -500,6 +485,8 @@ pub(crate) struct Document {
     /// List of all WebGL context IDs that need flushing.
     dirty_webgl_contexts:
         DomRefCell<HashMapTracedValues<WebGLContextId, Dom<WebGLRenderingContext>>>,
+    /// Whether or not animated images need to have their contents updated.
+    has_pending_animated_image_update: Cell<bool>,
     /// List of all WebGPU contexts.
     #[cfg(feature = "webgpu")]
     #[ignore_malloc_size_of = "Rc are hard"]
@@ -517,12 +504,6 @@ pub(crate) struct Document {
     dirty_root: MutNullableDom<Element>,
     /// <https://html.spec.whatwg.org/multipage/#will-declaratively-refresh>
     declarative_refresh: DomRefCell<Option<DeclarativeRefresh>>,
-    /// Pending input events, to be handled at the next rendering opportunity.
-    #[no_trace]
-    #[ignore_malloc_size_of = "CompositorEvent contains data from outside crates"]
-    pending_input_events: DomRefCell<Vec<ConstellationInputEvent>>,
-    /// The index of the last mouse move event in the pending compositor events queue.
-    mouse_move_event_index: DomRefCell<Option<usize>>,
     /// <https://drafts.csswg.org/resize-observer/#dom-document-resizeobservers-slot>
     ///
     /// Note: we are storing, but never removing, resize observers.
@@ -562,11 +543,19 @@ pub(crate) struct Document {
     /// The lifetime of an intersection observer is specified at
     /// <https://github.com/w3c/IntersectionObserver/issues/525>.
     intersection_observers: DomRefCell<Vec<Dom<IntersectionObserver>>>,
-    /// The active keyboard modifiers for the WebView. This is updated when receiving any input event.
-    #[no_trace]
-    active_keyboard_modifiers: Cell<Modifiers>,
     /// The node that is currently highlighted by the devtools
     highlighted_dom_node: MutNullableDom<Node>,
+    /// The constructed stylesheet that is adopted by this [Document].
+    /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
+    adopted_stylesheets: DomRefCell<Vec<Dom<CSSStyleSheet>>>,
+    /// Cached frozen array of [`Self::adopted_stylesheets`]
+    #[ignore_malloc_size_of = "mozjs"]
+    adopted_stylesheets_frozen_types: CachedFrozenArray,
+    /// <https://drafts.csswg.org/cssom-view/#document-pending-scroll-event-targets>
+    pending_scroll_event_targets: DomRefCell<Vec<Dom<EventTarget>>>,
+    /// When a `ResizeObserver` starts observing a target, this becomes true, which in turn is a
+    /// signal to the [`ScriptThread`] that a rendering update should happen.
+    resize_observer_started_observing_target: Cell<bool>,
 }
 
 #[allow(non_snake_case)]
@@ -669,14 +658,8 @@ impl Document {
             has_dirty_descendants &= *ancestor != *new_dirty_root;
         }
 
-        let maybe_shadow_host = new_dirty_root
-            .downcast::<ShadowRoot>()
-            .map(ShadowRootMethods::Host);
-        let new_dirty_root_element = new_dirty_root
-            .downcast::<Element>()
-            .or(maybe_shadow_host.as_deref());
-
-        self.dirty_root.set(new_dirty_root_element);
+        self.dirty_root
+            .set(Some(new_dirty_root.downcast::<Element>().unwrap()));
     }
 
     pub(crate) fn take_dirty_root(&self) -> Option<DomRoot<Element>> {
@@ -684,12 +667,12 @@ impl Document {
     }
 
     #[inline]
-    pub(crate) fn loader(&self) -> Ref<DocumentLoader> {
+    pub(crate) fn loader(&self) -> Ref<'_, DocumentLoader> {
         self.loader.borrow()
     }
 
     #[inline]
-    pub(crate) fn loader_mut(&self) -> RefMut<DocumentLoader> {
+    pub(crate) fn loader_mut(&self) -> RefMut<'_, DocumentLoader> {
         self.loader.borrow_mut()
     }
 
@@ -849,32 +832,34 @@ impl Document {
         }
     }
 
-    pub(crate) fn set_needs_paint(&self, value: bool) {
-        self.needs_paint.set(value)
+    pub(crate) fn add_restyle_reason(&self, reason: RestyleReason) {
+        self.needs_restyle.set(self.needs_restyle.get() | reason)
     }
 
-    pub(crate) fn needs_reflow(&self) -> Option<ReflowTriggerCondition> {
+    pub(crate) fn clear_restyle_reasons(&self) {
+        self.needs_restyle.set(RestyleReason::empty());
+    }
+
+    pub(crate) fn restyle_reason(&self) -> RestyleReason {
+        let mut condition = self.needs_restyle.get();
+        if self.stylesheets.borrow().has_changed() {
+            condition.insert(RestyleReason::StylesheetsChanged);
+        }
+
         // FIXME: This should check the dirty bit on the document,
         // not the document element. Needs some layout changes to make
         // that workable.
-        if self.stylesheets.borrow().has_changed() {
-            return Some(ReflowTriggerCondition::StylesheetsChanged);
-        }
-
-        let root = self.GetDocumentElement()?;
-        if root.upcast::<Node>().has_dirty_descendants() {
-            return Some(ReflowTriggerCondition::DirtyDescendants);
+        if let Some(root) = self.GetDocumentElement() {
+            if root.upcast::<Node>().has_dirty_descendants() {
+                condition.insert(RestyleReason::DOMChanged);
+            }
         }
 
         if !self.pending_restyles.borrow().is_empty() {
-            return Some(ReflowTriggerCondition::PendingRestyles);
+            condition.insert(RestyleReason::PendingRestyles);
         }
 
-        if self.needs_paint.get() {
-            return Some(ReflowTriggerCondition::PaintPostponed);
-        }
-
-        None
+        condition
     }
 
     /// Returns the first `base` element in the DOM that has an `href` attribute.
@@ -940,7 +925,7 @@ impl Document {
 
         // FIXME(emilio): This is very inefficient, ideally the flag above would
         // be enough and incremental layout could figure out from there.
-        node.dirty(NodeDamage::OtherNodeDamage);
+        node.dirty(NodeDamage::ContentOrHeritage);
     }
 
     /// Remove any existing association between the provided id and any elements in this document.
@@ -1031,7 +1016,7 @@ impl Document {
     /// Scroll to the target element, and when we do not find a target
     /// and the fragment is empty or "top", scroll to the top.
     /// <https://html.spec.whatwg.org/multipage/#scroll-to-the-fragment-identifier>
-    pub(crate) fn check_and_scroll_fragment(&self, fragment: &str, can_gc: CanGc) {
+    pub(crate) fn check_and_scroll_fragment(&self, fragment: &str) {
         let target = self.find_fragment_node(fragment);
 
         // Step 1
@@ -1044,9 +1029,7 @@ impl Document {
                 // inside other scrollable containers. Ideally this should use an implementation of
                 // `scrollIntoView` when that is available:
                 // See https://github.com/servo/servo/issues/24059.
-                let rect = element
-                    .upcast::<Node>()
-                    .bounding_content_box_or_zero(can_gc);
+                let rect = element.upcast::<Node>().border_box().unwrap_or_default();
 
                 // In order to align with element edges, we snap to unscaled pixel boundaries, since
                 // the paint thread currently does the same for drawing elements. This is important
@@ -1070,7 +1053,7 @@ impl Document {
 
         if let Some((x, y)) = point {
             self.window
-                .scroll(x as f64, y as f64, ScrollBehavior::Instant, can_gc)
+                .scroll(x as f64, y as f64, ScrollBehavior::Instant)
         }
     }
 
@@ -1151,13 +1134,18 @@ impl Document {
         self.focus_sequence.get()
     }
 
+    pub(crate) fn has_focus_transaction(&self) -> bool {
+        self.focus_transaction.borrow().is_some()
+    }
+
     /// Initiate a new round of checking for elements requesting focus. The last element to call
     /// `request_focus` before `commit_focus_transaction` is called will receive focus.
-    fn begin_focus_transaction(&self) {
+    pub(crate) fn begin_focus_transaction(&self) {
         // Initialize it with the current state
         *self.focus_transaction.borrow_mut() = Some(FocusTransaction {
             element: self.focused.get().as_deref().map(Dom::from_ref),
             has_focus: self.has_focus.get(),
+            focus_options: FocusOptions::default(),
         });
     }
 
@@ -1187,15 +1175,27 @@ impl Document {
         }
     }
 
+    /// Request that the given element receive focus with default options.
+    /// See [`Self::request_focus_with_options`] for the details.
+    pub(crate) fn request_focus(
+        &self,
+        elem: Option<&Element>,
+        focus_initiator: FocusInitiator,
+        can_gc: CanGc,
+    ) {
+        self.request_focus_with_options(elem, focus_initiator, FocusOptions::default(), can_gc);
+    }
+
     /// Request that the given element receive focus once the current
     /// transaction is complete. `None` specifies to focus the document.
     ///
     /// If there's no ongoing transaction, this method automatically starts and
     /// commits an implicit transaction.
-    pub(crate) fn request_focus(
+    pub(crate) fn request_focus_with_options(
         &self,
         elem: Option<&Element>,
         focus_initiator: FocusInitiator,
+        focus_options: FocusOptions,
         can_gc: CanGc,
     ) {
         // If an element is specified, and it's non-focusable, ignore the
@@ -1215,6 +1215,7 @@ impl Document {
             let focus_transaction = focus_transaction.as_mut().unwrap();
             focus_transaction.element = elem.map(Dom::from_ref);
             focus_transaction.has_focus = true;
+            focus_transaction.focus_options = focus_options;
         }
 
         if implicit_transaction {
@@ -1226,10 +1227,10 @@ impl Document {
     /// document's container is removed from the top-level browsing context's
     /// focus chain (not considering system focus).
     pub(crate) fn handle_container_unfocus(&self, can_gc: CanGc) {
-        assert!(
-            self.window().parent_info().is_some(),
-            "top-level document cannot be unfocused",
-        );
+        if self.window().parent_info().is_none() {
+            warn!("Top-level document cannot be unfocused");
+            return;
+        }
 
         // Since this method is called from an event loop, there mustn't be
         // an in-progress focus transaction
@@ -1253,8 +1254,8 @@ impl Document {
 
     /// Reassign the focus context to the element that last requested focus during this
     /// transaction, or the document if no elements requested it.
-    fn commit_focus_transaction(&self, focus_initiator: FocusInitiator, can_gc: CanGc) {
-        let (mut new_focused, new_focus_state) = {
+    pub(crate) fn commit_focus_transaction(&self, focus_initiator: FocusInitiator, can_gc: CanGc) {
+        let (mut new_focused, new_focus_state, prevent_scroll) = {
             let focus_transaction = self.focus_transaction.borrow();
             let focus_transaction = focus_transaction
                 .as_ref()
@@ -1265,6 +1266,7 @@ impl Document {
                     .as_ref()
                     .map(|e| DomRoot::from_ref(&**e)),
                 focus_transaction.has_focus,
+                focus_transaction.focus_options.preventScroll,
             )
         };
         *self.focus_transaction.borrow_mut() = None;
@@ -1346,7 +1348,7 @@ impl Document {
 
                 // Notify the embedder to display an input method.
                 if let Some(kind) = elem.input_method_type() {
-                    let rect = elem.upcast::<Node>().bounding_content_box_or_zero(can_gc);
+                    let rect = elem.upcast::<Node>().border_box().unwrap_or_default();
                     let rect = Rect::new(
                         Point2D::new(rect.origin.x.to_px(), rect.origin.y.to_px()),
                         Size2D::new(rect.size.width.to_px(), rect.size.height.to_px()),
@@ -1377,6 +1379,21 @@ impl Document {
                         text,
                         multiline,
                         DeviceIntRect::from_untyped(&rect.to_box2d()),
+                    ));
+                }
+                // Scroll operation to happen after element gets focus.
+                // This is needed to ensure that the focused element is visible.
+                // Only scroll if preventScroll was not specified
+                if !prevent_scroll {
+                    elem.ScrollIntoView(BooleanOrScrollIntoViewOptions::ScrollIntoViewOptions(
+                        ScrollIntoViewOptions {
+                            parent: ScrollOptions {
+                                behavior: ScrollBehavior::Smooth,
+                            },
+                            block: ScrollLogicalPosition::Center,
+                            inline: ScrollLogicalPosition::Center,
+                            container: ScrollIntoViewContainer::All,
+                        },
                     ));
                 }
             }
@@ -1516,951 +1533,98 @@ impl Document {
             .upcast::<Node>()
             .traverse_preorder(ShadowIncluding::Yes)
         {
-            node.dirty(NodeDamage::OtherNodeDamage)
+            node.dirty(NodeDamage::Other)
         }
     }
 
-    #[allow(unsafe_code)]
-    pub(crate) fn handle_mouse_button_event(
-        &self,
-        event: MouseButtonEvent,
-        hit_test_result: Option<CompositorHitTestResult>,
-        pressed_mouse_buttons: u16,
-        can_gc: CanGc,
-    ) {
-        // Ignore all incoming events without a hit test.
-        let Some(hit_test_result) = hit_test_result else {
-            return;
-        };
+    /// <https://drafts.csswg.org/cssom-view/#document-run-the-scroll-steps>
+    pub(crate) fn run_the_scroll_steps(&self, can_gc: CanGc) {
+        // Step 1.
+        // > Run the steps to dispatch pending scrollsnapchanging events for doc.
+        // TODO(#7673): Implement scroll snapping
 
-        debug!(
-            "{:?}: at {:?}",
-            event.action, hit_test_result.point_in_viewport
-        );
-
-        let node = unsafe { node::from_untrusted_node_address(hit_test_result.node) };
-        let Some(el) = node
-            .inclusive_ancestors(ShadowIncluding::Yes)
-            .filter_map(DomRoot::downcast::<Element>)
-            .next()
-        else {
-            return;
-        };
-
-        let node = el.upcast::<Node>();
-        debug!("{:?} on {:?}", event.action, node.debug_str());
-        // Prevent click event if form control element is disabled.
-        if let MouseButtonAction::Click = event.action {
-            // The click event is filtered by the disabled state.
-            if el.is_actually_disabled() {
-                return;
-            }
-
-            self.begin_focus_transaction();
-            // Try to focus `el`. If it's not focusable, focus the document
-            // instead.
-            self.request_focus(None, FocusInitiator::Local, can_gc);
-            self.request_focus(Some(&*el), FocusInitiator::Local, can_gc);
-        }
-
-        let dom_event = DomRoot::upcast::<Event>(MouseEvent::for_platform_mouse_event(
-            event,
-            pressed_mouse_buttons,
-            &self.window,
-            &hit_test_result,
-            can_gc,
-        ));
-
-        // https://html.spec.whatwg.org/multipage/#run-authentic-click-activation-steps
-        let activatable = el.as_maybe_activatable();
-        match event.action {
-            MouseButtonAction::Click => {
-                el.set_click_in_progress(true);
-                dom_event.fire(node.upcast(), can_gc);
-                el.set_click_in_progress(false);
-            },
-            MouseButtonAction::Down => {
-                if let Some(a) = activatable {
-                    a.enter_formal_activation_state();
-                }
-
-                let target = node.upcast();
-                dom_event.fire(target, can_gc);
-            },
-            MouseButtonAction::Up => {
-                if let Some(a) = activatable {
-                    a.exit_formal_activation_state();
-                }
-
-                let target = node.upcast();
-                dom_event.fire(target, can_gc);
-            },
-        }
-
-        if let MouseButtonAction::Click = event.action {
-            if self.focus_transaction.borrow().is_some() {
-                self.commit_focus_transaction(FocusInitiator::Local, can_gc);
-            }
-            self.maybe_fire_dblclick(
-                hit_test_result.point_in_viewport,
-                node,
-                pressed_mouse_buttons,
-                can_gc,
-            );
-        }
-
-        // When the contextmenu event is triggered by right mouse button
-        // the contextmenu event MUST be dispatched after the mousedown event.
-        if let (MouseButtonAction::Down, MouseButton::Right) = (event.action, event.button) {
-            self.maybe_show_context_menu(
-                node.upcast(),
-                pressed_mouse_buttons,
-                hit_test_result.point_in_viewport,
-                can_gc,
-            );
-        }
-    }
-
-    /// <https://www.w3.org/TR/uievents/#maybe-show-context-menu>
-    fn maybe_show_context_menu(
-        &self,
-        target: &EventTarget,
-        pressed_mouse_buttons: u16,
-        client_point: Point2D<f32>,
-        can_gc: CanGc,
-    ) {
-        let client_x = client_point.x.to_i32().unwrap_or(0);
-        let client_y = client_point.y.to_i32().unwrap_or(0);
-
-        // <https://w3c.github.io/uievents/#contextmenu>
-        let menu_event = PointerEvent::new(
-            &self.window,                   // window
-            DOMString::from("contextmenu"), // type
-            EventBubbles::Bubbles,          // can_bubble
-            EventCancelable::Cancelable,    // cancelable
-            Some(&self.window),             // view
-            0,                              // detail
-            client_x,                       // screen_x
-            client_y,                       // screen_y
-            client_x,                       // client_x
-            client_y,                       // client_y
-            false,                          // ctrl_key
-            false,                          // alt_key
-            false,                          // shift_key
-            false,                          // meta_key
-            2i16,                           // button, right mouse button
-            pressed_mouse_buttons,          // buttons
-            None,                           // related_target
-            None,                           // point_in_target
-            PointerId::Mouse as i32,        // pointer_id
-            1,                              // width
-            1,                              // height
-            0.5,                            // pressure
-            0.0,                            // tangential_pressure
-            0,                              // tilt_x
-            0,                              // tilt_y
-            0,                              // twist
-            PI / 2.0,                       // altitude_angle
-            0.0,                            // azimuth_angle
-            DOMString::from("mouse"),       // pointer_type
-            true,                           // is_primary
-            vec![],                         // coalesced_events
-            vec![],                         // predicted_events
-            can_gc,
-        );
-        let event = menu_event.upcast::<Event>();
-        event.fire(target, can_gc);
-
-        // if the event was not canceled, notify the embedder to show the context menu
-        if event.status() == EventStatus::NotCanceled {
-            let (sender, receiver) =
-                ipc::channel::<ContextMenuResult>().expect("Failed to create IPC channel.");
-            self.send_to_embedder(EmbedderMsg::ShowContextMenu(
-                self.webview_id(),
-                sender,
-                None,
-                vec![],
-            ));
-            let _ = receiver.recv().unwrap();
-        };
-    }
-
-    fn maybe_fire_dblclick(
-        &self,
-        click_pos: Point2D<f32>,
-        target: &Node,
-        pressed_mouse_buttons: u16,
-        can_gc: CanGc,
-    ) {
-        // https://w3c.github.io/uievents/#event-type-dblclick
-        let now = Instant::now();
-
-        let opt = self.last_click_info.borrow_mut().take();
-
-        if let Some((last_time, last_pos)) = opt {
-            let DBL_CLICK_TIMEOUT =
-                Duration::from_millis(pref!(dom_document_dblclick_timeout) as u64);
-            let DBL_CLICK_DIST_THRESHOLD = pref!(dom_document_dblclick_dist) as u64;
-
-            // Calculate distance between this click and the previous click.
-            let line = click_pos - last_pos;
-            let dist = (line.dot(line) as f64).sqrt();
-
-            if now.duration_since(last_time) < DBL_CLICK_TIMEOUT &&
-                dist < DBL_CLICK_DIST_THRESHOLD as f64
-            {
-                // A double click has occurred if this click is within a certain time and dist. of previous click.
-                let click_count = 2;
-                let client_x = click_pos.x as i32;
-                let client_y = click_pos.y as i32;
-
-                let event = MouseEvent::new(
-                    &self.window,
-                    DOMString::from("dblclick"),
-                    EventBubbles::Bubbles,
-                    EventCancelable::Cancelable,
-                    Some(&self.window),
-                    click_count,
-                    client_x,
-                    client_y,
-                    client_x,
-                    client_y,
-                    false,
-                    false,
-                    false,
-                    false,
-                    0i16,
-                    pressed_mouse_buttons,
-                    None,
-                    None,
-                    can_gc,
-                );
-                event.upcast::<Event>().fire(target.upcast(), can_gc);
-
-                // When a double click occurs, self.last_click_info is left as None so that a
-                // third sequential click will not cause another double click.
-                return;
+        // Step 2
+        // > For each item target in doc’s pending scroll event targets, in the order they
+        // > were added to the list, run these substeps:
+        // Step 3.
+        // > Empty doc’s pending scroll event targets.
+        // Since the scroll event callback could trigger another scroll event, we are taking all of the
+        // current scroll event to avoid borrow checking error.
+        rooted_vec!(let notify_list <- self.pending_scroll_event_targets.take().into_iter());
+        for target in notify_list.iter() {
+            if target.downcast::<Document>().is_some() {
+                // Step 2.1
+                // > If target is a Document, fire an event named scroll that bubbles at target.
+                target.fire_bubbling_event(Atom::from("scroll"), can_gc);
+            } else if target.downcast::<Element>().is_some() {
+                // Step 2.2
+                // > Otherwise, fire an event named scroll at target.
+                target.fire_event(Atom::from("scroll"), can_gc);
             }
         }
 
-        // Update last_click_info with the time and position of the click.
-        *self.last_click_info.borrow_mut() = Some((now, click_pos));
+        // Step 4.
+        // > Run the steps to dispatch pending scrollsnapchange events for doc.
+        // TODO(#7673): Implement scroll snapping
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn fire_mouse_event(
-        &self,
-        client_point: Point2D<f32>,
-        target: &EventTarget,
-        event_name: FireMouseEventType,
-        can_bubble: EventBubbles,
-        cancelable: EventCancelable,
-        pressed_mouse_buttons: u16,
-        can_gc: CanGc,
-    ) {
-        let client_x = client_point.x.to_i32().unwrap_or(0);
-        let client_y = client_point.y.to_i32().unwrap_or(0);
+    /// Whenever a viewport gets scrolled (whether in response to user interaction or by an
+    /// API), the user agent must run these steps:
+    /// <https://drafts.csswg.org/cssom-view/#scrolling-events>
+    pub(crate) fn handle_viewport_scroll_event(&self) {
+        // Step 2.
+        // > If doc is a snap container, run the steps to update scrollsnapchanging targets
+        // > for doc with doc’s eventual snap target in the block axis as newBlockTarget and
+        // > doc’s eventual snap target in the inline axis as newInlineTarget.
+        // TODO(#7673): Implement scroll snapping
 
-        MouseEvent::new(
-            &self.window,
-            DOMString::from(event_name.as_str()),
-            can_bubble,
-            cancelable,
-            Some(&self.window),
-            0i32,
-            client_x,
-            client_y,
-            client_x,
-            client_y,
-            false,
-            false,
-            false,
-            false,
-            0i16,
-            pressed_mouse_buttons,
-            None,
-            None,
-            can_gc,
-        )
-        .upcast::<Event>()
-        .fire(target, can_gc);
-    }
-
-    pub(crate) fn handle_editing_action(&self, action: EditingActionEvent, can_gc: CanGc) -> bool {
-        let clipboard_event = match action {
-            EditingActionEvent::Copy => ClipboardEventType::Copy,
-            EditingActionEvent::Cut => ClipboardEventType::Cut,
-            EditingActionEvent::Paste => ClipboardEventType::Paste,
-        };
-        self.handle_clipboard_action(clipboard_event, can_gc)
-    }
-
-    /// <https://www.w3.org/TR/clipboard-apis/#clipboard-actions>
-    fn handle_clipboard_action(&self, action: ClipboardEventType, can_gc: CanGc) -> bool {
-        // The script_triggered flag is set if the action runs because of a script, e.g. document.execCommand()
-        let script_triggered = false;
-
-        // The script_may_access_clipboard flag is set
-        // if action is paste and the script thread is allowed to read from clipboard or
-        // if action is copy or cut and the script thread is allowed to modify the clipboard
-        let script_may_access_clipboard = false;
-
-        // Step 1 If the script-triggered flag is set and the script-may-access-clipboard flag is unset
-        if script_triggered && !script_may_access_clipboard {
-            return false;
-        }
-
-        // Step 2 Fire a clipboard event
-        let event = ClipboardEvent::new(
-            &self.window,
-            None,
-            DOMString::from(action.as_str()),
-            EventBubbles::Bubbles,
-            EventCancelable::Cancelable,
-            None,
-            can_gc,
-        );
-        self.fire_clipboard_event(&event, action, can_gc);
-
-        // Step 3 If a script doesn't call preventDefault()
-        // the event will be handled inside target's VirtualMethods::handle_event
-
-        let e = event.upcast::<Event>();
-
-        if !e.IsTrusted() {
-            return false;
-        }
-
-        // Step 4 If the event was canceled, then
-        if e.DefaultPrevented() {
-            match e.Type().str() {
-                "copy" => {
-                    // Step 4.1 Call the write content to the clipboard algorithm,
-                    // passing on the DataTransferItemList items, a clear-was-called flag and a types-to-clear list.
-                    if let Some(clipboard_data) = event.get_clipboard_data() {
-                        let drag_data_store =
-                            clipboard_data.data_store().expect("This shouldn't fail");
-                        self.write_content_to_the_clipboard(&drag_data_store);
-                    }
-                },
-                "cut" => {
-                    // Step 4.1 Call the write content to the clipboard algorithm,
-                    // passing on the DataTransferItemList items, a clear-was-called flag and a types-to-clear list.
-                    if let Some(clipboard_data) = event.get_clipboard_data() {
-                        let drag_data_store =
-                            clipboard_data.data_store().expect("This shouldn't fail");
-                        self.write_content_to_the_clipboard(&drag_data_store);
-                    }
-
-                    // Step 4.2 Fire a clipboard event named clipboardchange
-                    self.fire_clipboardchange_event(can_gc);
-                },
-                "paste" => return false,
-                _ => (),
-            }
-        }
-        //Step 5
-        true
-    }
-
-    /// <https://www.w3.org/TR/clipboard-apis/#fire-a-clipboard-event>
-    fn fire_clipboard_event(
-        &self,
-        event: &ClipboardEvent,
-        action: ClipboardEventType,
-        can_gc: CanGc,
-    ) {
-        // Step 1 Let clear_was_called be false
-        // Step 2 Let types_to_clear an empty list
-        let mut drag_data_store = DragDataStore::new();
-
-        // Step 4 let clipboard-entry be the sequence number of clipboard content, null if the OS doesn't support it.
-
-        // Step 5 let trusted be true if the event is generated by the user agent, false otherwise
-        let trusted = true;
-
-        // Step 6 if the context is editable:
-        let focused = self.get_focused_element();
-        let body = self.GetBody();
-
-        let target = match (&focused, &body) {
-            (Some(focused), _) => focused.upcast(),
-            (&None, Some(body)) => body.upcast(),
-            (&None, &None) => self.window.upcast(),
-        };
-        // Step 6.2 else TODO require Selection see https://github.com/w3c/clipboard-apis/issues/70
-
-        // Step 7
-        match action {
-            ClipboardEventType::Copy | ClipboardEventType::Cut => {
-                // Step 7.2.1
-                drag_data_store.set_mode(Mode::ReadWrite);
-            },
-            ClipboardEventType::Paste => {
-                let (sender, receiver) = ipc::channel().unwrap();
-                self.window
-                    .send_to_constellation(ScriptToConstellationMessage::ForwardToEmbedder(
-                        EmbedderMsg::GetClipboardText(self.window.webview_id(), sender),
-                    ));
-                let text_contents = receiver
-                    .recv()
-                    .map(Result::unwrap_or_default)
-                    .unwrap_or_default();
-
-                // Step 7.1.1
-                drag_data_store.set_mode(Mode::ReadOnly);
-                // Step 7.1.2 If trusted or the implementation gives script-generated events access to the clipboard
-                if trusted {
-                    // Step 7.1.2.1 For each clipboard-part on the OS clipboard:
-
-                    // Step 7.1.2.1.1 If clipboard-part contains plain text, then
-                    let data = DOMString::from(text_contents.to_string());
-                    let type_ = DOMString::from("text/plain");
-                    let _ = drag_data_store.add(Kind::Text { data, type_ });
-
-                    // Step 7.1.2.1.2 TODO If clipboard-part represents file references, then for each file reference
-                    // Step 7.1.2.1.3 TODO If clipboard-part contains HTML- or XHTML-formatted text then
-
-                    // Step 7.1.3 Update clipboard-event-data’s files to match clipboard-event-data’s items
-                    // Step 7.1.4 Update clipboard-event-data’s types to match clipboard-event-data’s items
-                }
-            },
-            ClipboardEventType::Change => (),
-        }
-
-        // Step 3
-        let clipboard_event_data = DataTransfer::new(
-            &self.window,
-            Rc::new(RefCell::new(Some(drag_data_store))),
-            can_gc,
-        );
-
-        // Step 8
-        event.set_clipboard_data(Some(&clipboard_event_data));
-        let event = event.upcast::<Event>();
-        // Step 9
-        event.set_trusted(trusted);
-        // Step 10 Set event’s composed to true.
-        event.set_composed(true);
-        // Step 11
-        event.dispatch(target, false, can_gc);
-    }
-
-    pub(crate) fn fire_clipboardchange_event(&self, can_gc: CanGc) {
-        let clipboardchange_event = ClipboardEvent::new(
-            &self.window,
-            None,
-            DOMString::from("clipboardchange"),
-            EventBubbles::Bubbles,
-            EventCancelable::Cancelable,
-            None,
-            can_gc,
-        );
-        self.fire_clipboard_event(&clipboardchange_event, ClipboardEventType::Change, can_gc);
-    }
-
-    /// <https://www.w3.org/TR/clipboard-apis/#write-content-to-the-clipboard>
-    fn write_content_to_the_clipboard(&self, drag_data_store: &DragDataStore) {
-        // Step 1
-        if drag_data_store.list_len() > 0 {
-            // Step 1.1 Clear the clipboard.
-            self.send_to_embedder(EmbedderMsg::ClearClipboard(self.webview_id()));
-            // Step 1.2
-            for item in drag_data_store.iter_item_list() {
-                match item {
-                    Kind::Text { data, .. } => {
-                        // Step 1.2.1.1 Ensure encoding is correct per OS and locale conventions
-                        // Step 1.2.1.2 Normalize line endings according to platform conventions
-                        // Step 1.2.1.3
-                        self.send_to_embedder(EmbedderMsg::SetClipboardText(
-                            self.webview_id(),
-                            data.to_string(),
-                        ));
-                    },
-                    Kind::File { .. } => {
-                        // Step 1.2.2 If data is of a type listed in the mandatory data types list, then
-                        // Step 1.2.2.1 Place part on clipboard with the appropriate OS clipboard format description
-                        // Step 1.2.3 Else this is left to the implementation
-                    },
-                }
-            }
-        } else {
-            // Step 2.1
-            if drag_data_store.clear_was_called {
-                // Step 2.1.1 If types-to-clear list is empty, clear the clipboard
-                self.send_to_embedder(EmbedderMsg::ClearClipboard(self.webview_id()));
-                // Step 2.1.2 Else remove the types in the list from the clipboard
-                // As of now this can't be done with Arboard, and it's possible that will be removed from the spec
-            }
-        }
-    }
-
-    #[allow(unsafe_code)]
-    pub(crate) unsafe fn handle_mouse_move_event(
-        &self,
-        hit_test_result: Option<CompositorHitTestResult>,
-        pressed_mouse_buttons: u16,
-        prev_mouse_over_target: &MutNullableDom<Element>,
-        can_gc: CanGc,
-    ) {
-        // Ignore all incoming events without a hit test.
-        let Some(hit_test_result) = hit_test_result else {
-            return;
-        };
-
-        let node = unsafe { node::from_untrusted_node_address(hit_test_result.node) };
-        let Some(new_target) = node
-            .inclusive_ancestors(ShadowIncluding::No)
-            .filter_map(DomRoot::downcast::<Element>)
-            .next()
-        else {
-            return;
-        };
-
-        let target_has_changed = prev_mouse_over_target
-            .get()
-            .as_ref()
-            .is_none_or(|old_target| old_target != &new_target);
-
-        // Here we know the target has changed, so we must update the state,
-        // dispatch mouseout to the previous one, mouseover to the new one.
-        if target_has_changed {
-            // Dispatch mouseout and mouseleave to previous target.
-            if let Some(old_target) = prev_mouse_over_target.get() {
-                let old_target_is_ancestor_of_new_target = old_target
-                    .upcast::<Node>()
-                    .is_ancestor_of(new_target.upcast::<Node>());
-
-                // If the old target is an ancestor of the new target, this can be skipped
-                // completely, since the node's hover state will be reset below.
-                if !old_target_is_ancestor_of_new_target {
-                    for element in old_target
-                        .upcast::<Node>()
-                        .inclusive_ancestors(ShadowIncluding::No)
-                        .filter_map(DomRoot::downcast::<Element>)
-                    {
-                        element.set_hover_state(false);
-                        element.set_active_state(false);
-                    }
-                }
-
-                self.fire_mouse_event(
-                    hit_test_result.point_in_viewport,
-                    old_target.upcast(),
-                    FireMouseEventType::Out,
-                    EventBubbles::Bubbles,
-                    EventCancelable::Cancelable,
-                    pressed_mouse_buttons,
-                    can_gc,
-                );
-
-                if !old_target_is_ancestor_of_new_target {
-                    let event_target = DomRoot::from_ref(old_target.upcast::<Node>());
-                    let moving_into = Some(DomRoot::from_ref(new_target.upcast::<Node>()));
-                    self.handle_mouse_enter_leave_event(
-                        hit_test_result.point_in_viewport,
-                        FireMouseEventType::Leave,
-                        moving_into,
-                        event_target,
-                        pressed_mouse_buttons,
-                        can_gc,
-                    );
-                }
-            }
-
-            // Dispatch mouseover and mouseenter to new target.
-            for element in new_target
-                .upcast::<Node>()
-                .inclusive_ancestors(ShadowIncluding::No)
-                .filter_map(DomRoot::downcast::<Element>)
-            {
-                if element.hover_state() {
-                    break;
-                }
-                element.set_hover_state(true);
-            }
-
-            self.fire_mouse_event(
-                hit_test_result.point_in_viewport,
-                new_target.upcast(),
-                FireMouseEventType::Over,
-                EventBubbles::Bubbles,
-                EventCancelable::Cancelable,
-                pressed_mouse_buttons,
-                can_gc,
-            );
-
-            let moving_from = prev_mouse_over_target
-                .get()
-                .map(|old_target| DomRoot::from_ref(old_target.upcast::<Node>()));
-            let event_target = DomRoot::from_ref(new_target.upcast::<Node>());
-            self.handle_mouse_enter_leave_event(
-                hit_test_result.point_in_viewport,
-                FireMouseEventType::Enter,
-                moving_from,
-                event_target,
-                pressed_mouse_buttons,
-                can_gc,
-            );
-        }
-
-        // Send mousemove event to topmost target, unless it's an iframe, in which case the
-        // compositor should have also sent an event to the inner document.
-        self.fire_mouse_event(
-            hit_test_result.point_in_viewport,
-            new_target.upcast(),
-            FireMouseEventType::Move,
-            EventBubbles::Bubbles,
-            EventCancelable::Cancelable,
-            pressed_mouse_buttons,
-            can_gc,
-        );
-
-        // If the target has changed then store the current mouse over target for next frame.
-        if target_has_changed {
-            prev_mouse_over_target.set(Some(&new_target));
-        }
-    }
-
-    fn handle_mouse_enter_leave_event(
-        &self,
-        client_point: Point2D<f32>,
-        event_type: FireMouseEventType,
-        related_target: Option<DomRoot<Node>>,
-        event_target: DomRoot<Node>,
-        pressed_mouse_buttons: u16,
-        can_gc: CanGc,
-    ) {
-        assert!(matches!(
-            event_type,
-            FireMouseEventType::Enter | FireMouseEventType::Leave
-        ));
-
-        let common_ancestor = match related_target.as_ref() {
-            Some(related_target) => event_target
-                .common_ancestor(related_target, ShadowIncluding::No)
-                .unwrap_or_else(|| DomRoot::from_ref(&*event_target)),
-            None => DomRoot::from_ref(&*event_target),
-        };
-
-        // We need to create a target chain in case the event target shares
-        // its boundaries with its ancestors.
-        let mut targets = vec![];
-        let mut current = Some(event_target);
-        while let Some(node) = current {
-            if node == common_ancestor {
-                break;
-            }
-            current = node.GetParentNode();
-            targets.push(node);
-        }
-
-        // The order for dispatching mouseenter events starts from the topmost
-        // common ancestor of the event target and the related target.
-        if event_type == FireMouseEventType::Enter {
-            targets = targets.into_iter().rev().collect();
-        }
-
-        for target in targets {
-            self.fire_mouse_event(
-                client_point,
-                target.upcast(),
-                event_type,
-                EventBubbles::DoesNotBubble,
-                EventCancelable::NotCancelable,
-                pressed_mouse_buttons,
-                can_gc,
-            );
-        }
-    }
-
-    #[allow(unsafe_code)]
-    pub(crate) fn handle_wheel_event(
-        &self,
-        event: WheelEvent,
-        hit_test_result: Option<CompositorHitTestResult>,
-        can_gc: CanGc,
-    ) {
-        // Ignore all incoming events without a hit test.
-        let Some(hit_test_result) = hit_test_result else {
-            return;
-        };
-
-        let node = unsafe { node::from_untrusted_node_address(hit_test_result.node) };
-        let Some(el) = node
-            .inclusive_ancestors(ShadowIncluding::No)
-            .filter_map(DomRoot::downcast::<Element>)
-            .next()
-        else {
-            return;
-        };
-
-        let node = el.upcast::<Node>();
-        let wheel_event_type_string = "wheel".to_owned();
-        debug!(
-            "{}: on {:?} at {:?}",
-            wheel_event_type_string,
-            node.debug_str(),
-            hit_test_result.point_in_viewport
-        );
-
-        // https://w3c.github.io/uievents/#event-wheelevents
-        let dom_event = DomWheelEvent::new(
-            &self.window,
-            DOMString::from(wheel_event_type_string),
-            EventBubbles::Bubbles,
-            EventCancelable::Cancelable,
-            Some(&self.window),
-            0i32,
-            Finite::wrap(event.delta.x),
-            Finite::wrap(event.delta.y),
-            Finite::wrap(event.delta.z),
-            event.delta.mode as u32,
-            can_gc,
-        );
-
-        let dom_event = dom_event.upcast::<Event>();
-        dom_event.set_trusted(true);
-
-        let target = node.upcast();
-        dom_event.fire(target, can_gc);
-    }
-
-    #[allow(unsafe_code)]
-    pub(crate) fn handle_touch_event(
-        &self,
-        event: TouchEvent,
-        hit_test_result: Option<CompositorHitTestResult>,
-        can_gc: CanGc,
-    ) -> TouchEventResult {
-        // Ignore all incoming events without a hit test.
-        let Some(hit_test_result) = hit_test_result else {
-            return TouchEventResult::Forwarded;
-        };
-
-        let TouchId(identifier) = event.id;
-        let event_name = match event.event_type {
-            TouchEventType::Down => "touchstart",
-            TouchEventType::Move => "touchmove",
-            TouchEventType::Up => "touchend",
-            TouchEventType::Cancel => "touchcancel",
-        };
-
-        let node = unsafe { node::from_untrusted_node_address(hit_test_result.node) };
-        let Some(el) = node
-            .inclusive_ancestors(ShadowIncluding::No)
-            .filter_map(DomRoot::downcast::<Element>)
-            .next()
-        else {
-            return TouchEventResult::Forwarded;
-        };
-
-        let target = DomRoot::upcast::<EventTarget>(el);
-        let window = &*self.window;
-
-        let client_x = Finite::wrap(hit_test_result.point_in_viewport.x as f64);
-        let client_y = Finite::wrap(hit_test_result.point_in_viewport.y as f64);
-        let page_x =
-            Finite::wrap(hit_test_result.point_in_viewport.x as f64 + window.PageXOffset() as f64);
-        let page_y =
-            Finite::wrap(hit_test_result.point_in_viewport.y as f64 + window.PageYOffset() as f64);
-
-        let touch = Touch::new(
-            window, identifier, &target, client_x,
-            client_y, // TODO: Get real screen coordinates?
-            client_x, client_y, page_x, page_y, can_gc,
-        );
-
-        match event.event_type {
-            TouchEventType::Down => {
-                // Add a new touch point
-                self.active_touch_points
-                    .borrow_mut()
-                    .push(Dom::from_ref(&*touch));
-            },
-            TouchEventType::Move => {
-                // Replace an existing touch point
-                let mut active_touch_points = self.active_touch_points.borrow_mut();
-                match active_touch_points
-                    .iter_mut()
-                    .find(|t| t.Identifier() == identifier)
-                {
-                    Some(t) => *t = Dom::from_ref(&*touch),
-                    None => warn!("Got a touchmove event for a non-active touch point"),
-                }
-            },
-            TouchEventType::Up | TouchEventType::Cancel => {
-                // Remove an existing touch point
-                let mut active_touch_points = self.active_touch_points.borrow_mut();
-                match active_touch_points
-                    .iter()
-                    .position(|t| t.Identifier() == identifier)
-                {
-                    Some(i) => {
-                        active_touch_points.swap_remove(i);
-                    },
-                    None => warn!("Got a touchend event for a non-active touch point"),
-                }
-            },
-        }
-
-        rooted_vec!(let mut target_touches);
-        let touches = {
-            let touches = self.active_touch_points.borrow();
-            target_touches.extend(touches.iter().filter(|t| t.Target() == target).cloned());
-            TouchList::new(window, touches.r(), can_gc)
-        };
-
-        let event = DomTouchEvent::new(
-            window,
-            DOMString::from(event_name),
-            EventBubbles::Bubbles,
-            EventCancelable::from(event.is_cancelable()),
-            Some(window),
-            0i32,
-            &touches,
-            &TouchList::new(window, from_ref(&&*touch), can_gc),
-            &TouchList::new(window, target_touches.r(), can_gc),
-            // FIXME: modifier keys
-            false,
-            false,
-            false,
-            false,
-            can_gc,
-        );
-        let event = event.upcast::<Event>();
-        let result = event.fire(&target, can_gc);
-
-        match result {
-            EventStatus::Canceled => TouchEventResult::Processed(false),
-            EventStatus::NotCanceled => TouchEventResult::Processed(true),
-        }
-    }
-
-    /// The entry point for all key processing for web content
-    pub(crate) fn dispatch_key_event(
-        &self,
-        keyboard_event: ::keyboard_types::KeyboardEvent,
-        can_gc: CanGc,
-    ) {
-        let focused = self.get_focused_element();
-        let body = self.GetBody();
-
-        let target = match (&focused, &body) {
-            (Some(focused), _) => focused.upcast(),
-            (&None, Some(body)) => body.upcast(),
-            (&None, &None) => self.window.upcast(),
-        };
-
-        let keyevent = KeyboardEvent::new(
-            &self.window,
-            DOMString::from(keyboard_event.state.to_string()),
-            true,
-            true,
-            Some(&self.window),
-            0,
-            keyboard_event.key.clone(),
-            DOMString::from(keyboard_event.code.to_string()),
-            keyboard_event.location as u32,
-            keyboard_event.repeat,
-            keyboard_event.is_composing,
-            keyboard_event.modifiers,
-            0,
-            keyboard_event.key.legacy_keycode(),
-            can_gc,
-        );
-        let event = keyevent.upcast::<Event>();
-        event.fire(target, can_gc);
-        let mut cancel_state = event.get_cancel_state();
-
-        // https://w3c.github.io/uievents/#keys-cancelable-keys
-        if keyboard_event.state == KeyState::Down &&
-            is_character_value_key(&(keyboard_event.key)) &&
-            !keyboard_event.is_composing &&
-            cancel_state != EventDefault::Prevented
+        // Step 3.
+        // > If doc is already in doc’s pending scroll event targets, abort these steps.
+        let target = self.upcast::<EventTarget>();
+        if self
+            .pending_scroll_event_targets
+            .borrow()
+            .iter()
+            .any(|other_target| *other_target == target)
         {
-            // https://w3c.github.io/uievents/#keypress-event-order
-            let event = KeyboardEvent::new(
-                &self.window,
-                DOMString::from("keypress"),
-                true,
-                true,
-                Some(&self.window),
-                0,
-                keyboard_event.key.clone(),
-                DOMString::from(keyboard_event.code.to_string()),
-                keyboard_event.location as u32,
-                keyboard_event.repeat,
-                keyboard_event.is_composing,
-                keyboard_event.modifiers,
-                keyboard_event.key.legacy_charcode(),
-                0,
-                can_gc,
-            );
-            let ev = event.upcast::<Event>();
-            ev.fire(target, can_gc);
-            cancel_state = ev.get_cancel_state();
+            return;
         }
 
-        if cancel_state == EventDefault::Allowed {
-            let msg = EmbedderMsg::Keyboard(self.webview_id(), keyboard_event.clone());
-            self.send_to_embedder(msg);
-
-            // This behavior is unspecced
-            // We are supposed to dispatch synthetic click activation for Space and/or Return,
-            // however *when* we do it is up to us.
-            // Here, we're dispatching it after the key event so the script has a chance to cancel it
-            // https://www.w3.org/Bugs/Public/show_bug.cgi?id=27337
-            if (keyboard_event.key == Key::Enter || keyboard_event.code == Code::Space) &&
-                keyboard_event.state == KeyState::Up
-            {
-                if let Some(elem) = target.downcast::<Element>() {
-                    elem.upcast::<Node>()
-                        .fire_synthetic_pointer_event_not_trusted(DOMString::from("click"), can_gc);
-                }
-            }
-        }
+        // Step 4.
+        // > Append doc to doc’s pending scroll event targets.
+        self.pending_scroll_event_targets
+            .borrow_mut()
+            .push(Dom::from_ref(target));
     }
 
-    pub(crate) fn dispatch_ime_event(&self, event: ImeEvent, can_gc: CanGc) {
-        let composition_event = match event {
-            ImeEvent::Dismissed => {
-                self.request_focus(
-                    self.GetBody().as_ref().map(|e| e.upcast()),
-                    FocusInitiator::Local,
-                    can_gc,
-                );
-                return;
-            },
-            ImeEvent::Composition(composition_event) => composition_event,
-        };
+    /// Whenever an element gets scrolled (whether in response to user interaction or by an
+    /// API), the user agent must run these steps:
+    /// <https://drafts.csswg.org/cssom-view/#scrolling-events>
+    pub(crate) fn handle_element_scroll_event(&self, element: &Element) {
+        // Step 2.
+        // > If the element is a snap container, run the steps to update scrollsnapchanging
+        // > targets for the element with the element’s eventual snap target in the block
+        // > axis as newBlockTarget and the element’s eventual snap target in the inline axis
+        // > as newInlineTarget.
+        // TODO(#7673): Implement scroll snapping
 
-        // spec: https://w3c.github.io/uievents/#compositionstart
-        // spec: https://w3c.github.io/uievents/#compositionupdate
-        // spec: https://w3c.github.io/uievents/#compositionend
-        // > Event.target : focused element processing the composition
-        let focused = self.get_focused_element();
-        let target = if let Some(elem) = &focused {
-            elem.upcast()
-        } else {
-            // Event is only dispatched if there is a focused element.
+        // Step 3.
+        // > If the element is already in doc’s pending scroll event targets, abort these steps.
+        let target = element.upcast::<EventTarget>();
+        if self
+            .pending_scroll_event_targets
+            .borrow()
+            .iter()
+            .any(|other_target| *other_target == target)
+        {
             return;
-        };
+        }
 
-        let cancelable = composition_event.state == keyboard_types::CompositionState::Start;
-
-        let compositionevent = CompositionEvent::new(
-            &self.window,
-            DOMString::from(composition_event.state.to_string()),
-            true,
-            cancelable,
-            Some(&self.window),
-            0,
-            DOMString::from(composition_event.data),
-            can_gc,
-        );
-        let event = compositionevent.upcast::<Event>();
-        event.fire(target, can_gc);
+        // Step 4.
+        // > Append the element to doc’s pending scroll event targets.
+        self.pending_scroll_event_targets
+            .borrow_mut()
+            .push(Dom::from_ref(target));
     }
 
     // https://dom.spec.whatwg.org/#converting-nodes-into-a-node
@@ -2496,12 +1660,11 @@ impl Document {
     }
 
     pub(crate) fn get_body_attribute(&self, local_name: &LocalName) -> DOMString {
-        match self
-            .GetBody()
-            .and_then(DomRoot::downcast::<HTMLBodyElement>)
-        {
-            Some(ref body) => body.upcast::<Element>().get_string_attribute(local_name),
-            None => DOMString::new(),
+        match self.GetBody() {
+            Some(ref body) if body.is_body_element() => {
+                body.upcast::<Element>().get_string_attribute(local_name)
+            },
+            _ => DOMString::new(),
         }
     }
 
@@ -2511,10 +1674,7 @@ impl Document {
         value: DOMString,
         can_gc: CanGc,
     ) {
-        if let Some(ref body) = self
-            .GetBody()
-            .and_then(DomRoot::downcast::<HTMLBodyElement>)
-        {
+        if let Some(ref body) = self.GetBody().filter(|elem| elem.is_body_element()) {
             let body = body.upcast::<Element>();
             let value = body.parse_attribute(&ns!(), local_name, value);
             body.set_attribute(local_name, value, can_gc);
@@ -2547,7 +1707,7 @@ impl Document {
         //
         // FIXME(emilio): Use the DocumentStylesheetSet invalidation stuff.
         if let Some(element) = self.GetDocumentElement() {
-            element.upcast::<Node>().dirty(NodeDamage::NodeStyleDamaged);
+            element.upcast::<Node>().dirty(NodeDamage::Style);
         }
     }
 
@@ -2560,27 +1720,26 @@ impl Document {
     /// <https://html.spec.whatwg.org/multipage/#dom-window-requestanimationframe>
     pub(crate) fn request_animation_frame(&self, callback: AnimationFrameCallback) -> u32 {
         let ident = self.animation_frame_ident.get() + 1;
-
         self.animation_frame_ident.set(ident);
-        self.animation_frame_list
-            .borrow_mut()
-            .push_back((ident, Some(callback)));
 
-        // If we are running 'fake' animation frames, we unconditionally
-        // set up a one-shot timer for script to execute the rAF callbacks.
-        if self.is_faking_animation_frames() && !self.window().throttled() {
-            self.schedule_fake_animation_frame();
-        } else if !self.running_animation_callbacks.get() {
-            // No need to send a `ChangeRunningAnimationsState` if we're running animation callbacks:
-            // we're guaranteed to already be in the "animation callbacks present" state.
-            //
-            // This reduces CPU usage by avoiding needless thread wakeups in the common case of
-            // repeated rAF.
+        let had_animation_frame_callbacks;
+        {
+            let mut animation_frame_list = self.animation_frame_list.borrow_mut();
+            had_animation_frame_callbacks = !animation_frame_list.is_empty();
+            animation_frame_list.push_back((ident, Some(callback)));
+        }
 
-            let event = ScriptToConstellationMessage::ChangeRunningAnimationsState(
-                AnimationState::AnimationCallbacksPresent,
+        // No need to send a `ChangeRunningAnimationsState` if we're running animation callbacks:
+        // we're guaranteed to already be in the "animation callbacks present" state.
+        //
+        // This reduces CPU usage by avoiding needless thread wakeups in the common case of
+        // repeated rAF.
+        if !self.running_animation_callbacks.get() && !had_animation_frame_callbacks {
+            self.window().send_to_constellation(
+                ScriptToConstellationMessage::ChangeRunningAnimationsState(
+                    AnimationState::AnimationCallbacksPresent,
+                ),
             );
-            self.window().send_to_constellation(event);
         }
 
         ident
@@ -2594,23 +1753,11 @@ impl Document {
         }
     }
 
-    fn schedule_fake_animation_frame(&self) {
-        warn!("Scheduling fake animation frame. Animation frames tick too fast.");
-        let callback = FakeRequestAnimationFrameCallback {
-            document: Trusted::new(self),
-        };
-        self.global().schedule_callback(
-            OneshotTimerCallback::FakeRequestAnimationFrame(callback),
-            Duration::from_millis(FAKE_REQUEST_ANIMATION_FRAME_DELAY),
-        );
-    }
-
     /// <https://html.spec.whatwg.org/multipage/#run-the-animation-frame-callbacks>
     pub(crate) fn run_the_animation_frame_callbacks(&self, can_gc: CanGc) {
         let _realm = enter_realm(self);
 
         self.running_animation_callbacks.set(true);
-        let was_faking_animation_frames = self.is_faking_animation_frames();
         let timing = self.global().performance().Now();
 
         let num_callbacks = self.animation_frame_list.borrow().len();
@@ -2620,74 +1767,18 @@ impl Document {
                 callback.call(self, *timing, can_gc);
             }
         }
-
         self.running_animation_callbacks.set(false);
-        let callbacks_did_not_trigger_reflow = self.needs_reflow().is_none();
-        let is_empty = self.animation_frame_list.borrow().is_empty();
 
-        if !is_empty && callbacks_did_not_trigger_reflow && !was_faking_animation_frames {
-            // If the rAF callbacks did not mutate the DOM, then the impending
-            // reflow call as part of *update the rendering* will not do anything
-            // and therefore no new frame will be sent to the compositor.
-            // If this happens, the compositor will not tick the animation
-            // and the next rAF will never be called! When this happens
-            // for several frames, then the spurious rAF detection below
-            // will kick in and use a timer to tick the callbacks. However,
-            // for the interim frames where we are deciding whether this rAF
-            // is considered spurious, we need to ensure that the layout
-            // and compositor *do* tick the animation.
-            self.set_needs_paint(true);
-        }
-
-        // Update the counter of spurious animation frames.
-        let spurious_frames = self.spurious_animation_frames.get();
-        if callbacks_did_not_trigger_reflow {
-            if spurious_frames < SPURIOUS_ANIMATION_FRAME_THRESHOLD {
-                self.spurious_animation_frames.set(spurious_frames + 1);
-            }
-        } else {
-            self.spurious_animation_frames.set(0);
-        }
-
-        // Only send the animation change state message after running any callbacks.
-        // This means that if the animation callback adds a new callback for
-        // the next frame (which is the common case), we won't send a NoAnimationCallbacksPresent
-        // message quickly followed by an AnimationCallbacksPresent message.
-        //
-        // If this frame was spurious and we've seen too many spurious frames in a row, tell the
-        // constellation to stop giving us video refresh callbacks, to save energy. (A spurious
-        // animation frame is one in which the callback did not mutate the DOM—that is, an
-        // animation frame that wasn't actually used for animation.)
-        let just_crossed_spurious_animation_threshold =
-            !was_faking_animation_frames && self.is_faking_animation_frames();
-        if is_empty || just_crossed_spurious_animation_threshold {
-            if !is_empty {
-                // We just realized that we need to stop requesting compositor's animation ticks
-                // due to spurious animation frames, but we still have rAF callbacks queued. Since
-                // `is_faking_animation_frames` would not have been true at the point where these
-                // new callbacks were registered, the one-shot timer will not have been setup in
-                // `request_animation_frame()`. Since we stop the compositor ticks below, we need
-                // to expliclty trigger a OneshotTimerCallback for these queued callbacks.
-                self.schedule_fake_animation_frame();
-            }
-            let event = ScriptToConstellationMessage::ChangeRunningAnimationsState(
-                AnimationState::NoAnimationCallbacksPresent,
-            );
-            self.window().send_to_constellation(event);
-        }
-
-        // If we were previously faking animation frames, we need to re-enable video refresh
-        // callbacks when we stop seeing spurious animation frames.
-        if was_faking_animation_frames && !self.is_faking_animation_frames() && !is_empty {
+        if self.animation_frame_list.borrow().is_empty() {
             self.window().send_to_constellation(
                 ScriptToConstellationMessage::ChangeRunningAnimationsState(
-                    AnimationState::AnimationCallbacksPresent,
+                    AnimationState::NoAnimationCallbacksPresent,
                 ),
             );
         }
     }
 
-    pub(crate) fn policy_container(&self) -> Ref<PolicyContainer> {
+    pub(crate) fn policy_container(&self) -> Ref<'_, PolicyContainer> {
         self.policy_container.borrow()
     }
 
@@ -2762,7 +1853,7 @@ impl Document {
                 // We finished loading the page, so if the `Window` is still waiting for
                 // the first layout, allow it.
                 if self.has_browsing_context && self.is_fully_active() {
-                    self.window().allow_layout_if_necessary(can_gc);
+                    self.window().allow_layout_if_necessary();
                 }
 
                 // Deferred scripts have to wait for page to finish loading,
@@ -2800,7 +1891,7 @@ impl Document {
         // TODO: Step 1, increase the event loop's termination nesting level by 1.
         // Step 2
         self.incr_ignore_opens_during_unload_counter();
-        //Step 3-5.
+        // Step 3-5.
         let beforeunload_event = BeforeUnloadEvent::new(
             &self.window,
             atom!("beforeunload"),
@@ -2876,8 +1967,7 @@ impl Document {
             );
             let event = event.upcast::<Event>();
             event.set_trusted(true);
-            let _ = self
-                .window
+            self.window
                 .dispatch_event_with_target_override(event, can_gc);
             // Step 6 Update the visibility state of oldDocument to "hidden".
             self.update_visibility_state(DocumentVisibilityState::Hidden, can_gc);
@@ -2894,8 +1984,7 @@ impl Document {
             event.set_trusted(true);
             let event_target = self.window.upcast::<EventTarget>();
             let has_listeners = event_target.has_listeners_for(&atom!("unload"));
-            let _ = self
-                .window
+            self.window
                 .dispatch_event_with_target_override(&event, can_gc);
             self.fired_unload.set(true);
             // Step 9
@@ -3000,7 +2089,7 @@ impl Document {
                 update_with_current_instant(&document.load_event_end);
 
                 if let Some(fragment) = document.url().fragment() {
-                    document.check_and_scroll_fragment(fragment, CanGc::note());
+                    document.check_and_scroll_fragment(fragment);
                 }
             }));
 
@@ -3319,16 +2408,20 @@ impl Document {
 
     /// A reference to the [`IFrameCollection`] of this [`Document`], holding information about
     /// `<iframe>`s found within it.
-    pub(crate) fn iframes(&self) -> Ref<IFrameCollection> {
+    pub(crate) fn iframes(&self) -> Ref<'_, IFrameCollection> {
         self.iframes.borrow_mut().validate(self);
         self.iframes.borrow()
     }
 
     /// A mutable reference to the [`IFrameCollection`] of this [`Document`], holding information about
     /// `<iframe>`s found within it.
-    pub(crate) fn iframes_mut(&self) -> RefMut<IFrameCollection> {
+    pub(crate) fn iframes_mut(&self) -> RefMut<'_, IFrameCollection> {
         self.iframes.borrow_mut().validate(self);
         self.iframes.borrow_mut()
+    }
+
+    pub(crate) fn invalidate_iframes_collection(&self) {
+        self.iframes.borrow_mut().invalidate();
     }
 
     pub(crate) fn get_dom_interactive(&self) -> Option<CrossProcessInstant> {
@@ -3341,7 +2434,7 @@ impl Document {
             .set_navigation_start(navigation_start);
     }
 
-    pub(crate) fn get_interactive_metrics(&self) -> Ref<ProgressiveWebMetrics> {
+    pub(crate) fn get_interactive_metrics(&self) -> Ref<'_, ProgressiveWebMetrics> {
         self.interactive_time.borrow()
     }
 
@@ -3518,30 +2611,6 @@ impl Document {
             .or_insert_with(|| Dom::from_ref(context));
     }
 
-    pub(crate) fn flush_dirty_webgl_canvases(&self) {
-        let dirty_context_ids: Vec<_> = self
-            .dirty_webgl_contexts
-            .borrow_mut()
-            .drain()
-            .filter(|(_, context)| context.onscreen())
-            .map(|(id, _)| id)
-            .collect();
-
-        if dirty_context_ids.is_empty() {
-            return;
-        }
-
-        #[allow(unused)]
-        let mut time = 0;
-        let (sender, receiver) = webgl::webgl_channel().unwrap();
-        self.window
-            .webgl_chan()
-            .expect("Where's the WebGL channel?")
-            .send(WebGLMsg::SwapBuffers(dirty_context_ids, sender, time))
-            .unwrap();
-        receiver.recv().unwrap();
-    }
-
     pub(crate) fn add_dirty_2d_canvas(&self, context: &CanvasRenderingContext2D) {
         self.dirty_2d_contexts
             .borrow_mut()
@@ -3549,35 +2618,128 @@ impl Document {
             .or_insert_with(|| Dom::from_ref(context));
     }
 
-    pub(crate) fn flush_dirty_2d_canvases(&self) {
-        self.dirty_2d_contexts
-            .borrow_mut()
-            .drain()
-            .filter(|(_, context)| context.onscreen())
-            .for_each(|(_, context)| context.update_rendering());
-    }
-
     #[cfg(feature = "webgpu")]
     pub(crate) fn webgpu_contexts(&self) -> WebGPUContextsMap {
         self.webgpu_contexts.clone()
     }
 
-    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    #[cfg(feature = "webgpu")]
-    pub(crate) fn update_rendering_of_webgpu_canvases(&self) {
+    /// Whether or not this [`Document`] needs a rendering update, due to changed
+    /// contents or pending events. This is used to decide whether or not to schedule
+    /// a call to the "update the rendering" algorithm.
+    pub(crate) fn needs_rendering_update(&self) -> bool {
+        if !self.is_fully_active() {
+            return false;
+        }
+        if !self.window().layout_blocked() &&
+            (!self.restyle_reason().is_empty() ||
+                self.window().layout().needs_new_display_list())
+        {
+            return true;
+        }
+        if self.resize_observer_started_observing_target.get() {
+            return true;
+        }
+        if self.event_handler.has_pending_input_events() {
+            return true;
+        }
+        if self.has_pending_scroll_events() {
+            return true;
+        }
+        if self.window().has_unhandled_resize_event() {
+            return true;
+        }
+        if self.has_pending_animated_image_update.get() {
+            return true;
+        }
+
+        false
+    }
+
+    /// An implementation of step 22 from
+    /// <https://html.spec.whatwg.org/multipage/#update-the-rendering>:
+    ///
+    // > Step 22: For each doc of docs, update the rendering or user interface of
+    // > doc and its node navigable to reflect the current state.
+    //
+    // Returns the set of reflow phases run as a [`ReflowPhasesRun`].
+    pub(crate) fn update_the_rendering(&self) -> ReflowPhasesRun {
+        if self.has_pending_animated_image_update.get() {
+            self.image_animation_manager
+                .borrow()
+                .update_active_frames(&self.window, self.current_animation_timeline_value());
+            self.has_pending_animated_image_update.set(false);
+        }
+
+        // All dirty canvases are flushed before updating the rendering.
+        #[cfg(feature = "webgpu")]
         self.webgpu_contexts
             .borrow_mut()
             .iter()
             .filter_map(|(_, context)| context.root())
             .filter(|context| context.onscreen())
             .for_each(|context| context.update_rendering());
+
+        self.dirty_2d_contexts
+            .borrow_mut()
+            .drain()
+            .filter(|(_, context)| context.onscreen())
+            .for_each(|(_, context)| context.update_rendering());
+
+        let dirty_webgl_context_ids: Vec<_> = self
+            .dirty_webgl_contexts
+            .borrow_mut()
+            .drain()
+            .filter(|(_, context)| context.onscreen())
+            .map(|(id, _)| id)
+            .collect();
+        if !dirty_webgl_context_ids.is_empty() {
+            let (sender, receiver) = webgl::webgl_channel().unwrap();
+            self.window
+                .webgl_chan()
+                .expect("Where's the WebGL channel?")
+                .send(WebGLMsg::SwapBuffers(dirty_webgl_context_ids, sender, 0))
+                .unwrap();
+            receiver.recv().unwrap();
+        }
+
+        self.window().reflow(ReflowGoal::UpdateTheRendering)
     }
 
-    pub(crate) fn id_map(&self) -> Ref<HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
+    /// From <https://drafts.csswg.org/css-font-loading/#fontfaceset-pending-on-the-environment>:
+    ///
+    /// > A FontFaceSet is pending on the environment if any of the following are true:
+    /// >  - the document is still loading
+    /// >  - the document has pending stylesheet requests
+    /// >  - the document has pending layout operations which might cause the user agent to request
+    /// >    a font, or which depend on recently-loaded fonts
+    ///
+    /// Returns true if the promise was fulfilled.
+    pub(crate) fn maybe_fulfill_font_ready_promise(&self, can_gc: CanGc) -> bool {
+        if !self.is_fully_active() {
+            return false;
+        }
+
+        let fonts = self.Fonts(can_gc);
+        if !fonts.waiting_to_fullfill_promise() {
+            return false;
+        }
+        if self.window().font_context().web_fonts_still_loading() != 0 {
+            return false;
+        }
+        if self.ReadyState() != DocumentReadyState::Complete {
+            return false;
+        }
+        if !self.restyle_reason().is_empty() {
+            return false;
+        }
+        fonts.fulfill_ready_promise_if_needed(can_gc)
+    }
+
+    pub(crate) fn id_map(&self) -> Ref<'_, HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
         self.id_map.borrow()
     }
 
-    pub(crate) fn name_map(&self) -> Ref<HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
+    pub(crate) fn name_map(&self) -> Ref<'_, HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
         self.name_map.borrow()
     }
 
@@ -3588,19 +2750,22 @@ impl Document {
             .push(Dom::from_ref(resize_observer));
     }
 
+    /// Whether or not this [`Document`] has any active [`ResizeObserver`].
+    pub(crate) fn has_resize_observers(&self) -> bool {
+        !self.resize_observers.borrow().is_empty()
+    }
+
     /// <https://drafts.csswg.org/resize-observer/#gather-active-observations-h>
     /// <https://drafts.csswg.org/resize-observer/#has-active-resize-observations>
     pub(crate) fn gather_active_resize_observations_at_depth(
         &self,
         depth: &ResizeObservationDepth,
-        can_gc: CanGc,
     ) -> bool {
         let mut has_active_resize_observations = false;
         for observer in self.resize_observers.borrow_mut().iter_mut() {
             observer.gather_active_resize_observations_at_depth(
                 depth,
                 &mut has_active_resize_observations,
-                can_gc,
             );
         }
         has_active_resize_observations
@@ -3670,7 +2835,9 @@ impl Document {
         // Step 5. Return the result of applying the URL parser to url, with baseURL and encoding.
         url::Url::options()
             .base_url(Some(base_url.as_url()))
-            .encoding_override(Some(&|s| encoding.encode(s).0))
+            .encoding_override(Some(&|input| {
+                servo_url::encoding::encode_as_url_query_string(input, encoding)
+            }))
             .parse(url)
             .map(ServoUrl::from)
     }
@@ -3860,10 +3027,11 @@ impl Document {
             string = TrustedHTML::get_trusted_script_compliant_string(
                 &self.global(),
                 TrustedHTMLOrString::String(string.into()),
-                containing_class,
-                field,
+                &format!("{} {}", containing_class, field),
                 can_gc,
-            )?;
+            )?
+            .as_ref()
+            .to_owned();
         }
         // Step 5: If lineFeed is true, append U+000A LINE FEED to string.
         if line_feed {
@@ -3907,10 +3075,6 @@ impl Document {
 
         Ok(())
     }
-}
-
-fn is_character_value_key(key: &Key) -> bool {
-    matches!(key, Key::Character(_) | Key::Enter)
 }
 
 #[derive(MallocSizeOf, PartialEq)]
@@ -4105,6 +3269,7 @@ impl Document {
             url: DomRefCell::new(url),
             // https://dom.spec.whatwg.org/#concept-document-quirks
             quirks_mode: Cell::new(QuirksMode::NoQuirks),
+            event_handler: DocumentEventHandler::new(window),
             id_map: DomRefCell::new(HashMapTracedValues::new()),
             name_map: DomRefCell::new(HashMapTracedValues::new()),
             // https://dom.spec.whatwg.org/#concept-document-encoding
@@ -4121,7 +3286,7 @@ impl Document {
             scripts: Default::default(),
             anchors: Default::default(),
             applets: Default::default(),
-            iframes: Default::default(),
+            iframes: RefCell::new(IFrameCollection::new()),
             style_shared_lock: {
                 /// Per-process shared lock for author-origin stylesheets
                 ///
@@ -4133,7 +3298,7 @@ impl Document {
                     LazyLock::new(StyleSharedRwLock::new);
 
                 PER_PROCESS_AUTHOR_SHARED_LOCK.clone()
-                //StyleSharedRwLock::new()
+                // StyleSharedRwLock::new()
             },
             stylesheets: DomRefCell::new(DocumentStylesheetSet::new()),
             stylesheet_list: MutNullableDom::new(None),
@@ -4157,9 +3322,8 @@ impl Document {
             current_parser: Default::default(),
             base_element: Default::default(),
             appropriate_template_contents_owner_document: Default::default(),
-            pending_restyles: DomRefCell::new(HashMap::new()),
-            needs_paint: Cell::new(false),
-            active_touch_points: DomRefCell::new(Vec::new()),
+            pending_restyles: DomRefCell::new(FnvHashMap::default()),
+            needs_restyle: Cell::new(RestyleReason::DOMChanged),
             dom_interactive: Cell::new(Default::default()),
             dom_content_loaded_event_start: Cell::new(Default::default()),
             dom_content_loaded_event_end: Cell::new(Default::default()),
@@ -4174,7 +3338,6 @@ impl Document {
             referrer,
             target_element: MutNullableDom::new(None),
             policy_container: DomRefCell::new(PolicyContainer::default()),
-            last_click_info: DomRefCell::new(None),
             ignore_destructive_writes_counter: Default::default(),
             ignore_opens_during_unload_counter: Default::default(),
             spurious_animation_frames: Cell::new(0),
@@ -4199,6 +3362,7 @@ impl Document {
             media_controls: DomRefCell::new(HashMap::new()),
             dirty_2d_contexts: DomRefCell::new(HashMapTracedValues::new()),
             dirty_webgl_contexts: DomRefCell::new(HashMapTracedValues::new()),
+            has_pending_animated_image_update: Cell::new(false),
             #[cfg(feature = "webgpu")]
             webgpu_contexts: Rc::new(RefCell::new(HashMapTracedValues::new())),
             selection: MutNullableDom::new(None),
@@ -4208,11 +3372,9 @@ impl Document {
                 DomRefCell::new(AnimationTimeline::new())
             },
             animations: DomRefCell::new(Animations::new()),
-            image_animation_manager: DomRefCell::new(ImageAnimationManager::new()),
+            image_animation_manager: DomRefCell::new(ImageAnimationManager::default()),
             dirty_root: Default::default(),
             declarative_refresh: Default::default(),
-            pending_input_events: Default::default(),
-            mouse_move_event_index: Default::default(),
             resize_observers: Default::default(),
             fonts: Default::default(),
             visibility_state: Cell::new(DocumentVisibilityState::Hidden),
@@ -4223,8 +3385,11 @@ impl Document {
             has_trustworthy_ancestor_origin: Cell::new(has_trustworthy_ancestor_origin),
             intersection_observer_task_queued: Cell::new(false),
             intersection_observers: Default::default(),
-            active_keyboard_modifiers: Cell::new(Modifiers::empty()),
             highlighted_dom_node: Default::default(),
+            adopted_stylesheets: Default::default(),
+            adopted_stylesheets_frozen_types: CachedFrozenArray::new(),
+            pending_scroll_event_targets: Default::default(),
+            resize_observer_started_observing_target: Cell::new(false),
         }
     }
 
@@ -4245,51 +3410,19 @@ impl Document {
             .unwrap_or(InsecureRequestsPolicy::DoNotUpgrade)
     }
 
-    /// Update the active keyboard modifiers for this [`Document`] while handling events.
-    pub(crate) fn update_active_keyboard_modifiers(&self, modifiers: Modifiers) {
-        self.active_keyboard_modifiers.set(modifiers);
+    /// Get the [`Document`]'s [`DocumentEventHandler`].
+    pub(crate) fn event_handler(&self) -> &DocumentEventHandler {
+        &self.event_handler
     }
 
-    pub(crate) fn alternate_action_keyboard_modifier_active(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        {
-            self.active_keyboard_modifiers
-                .get()
-                .contains(Modifiers::META)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.active_keyboard_modifiers
-                .get()
-                .contains(Modifiers::CONTROL)
-        }
+    /// Whether or not this [`Document`] has any pending scroll events to be processed during
+    /// "update the rendering."
+    fn has_pending_scroll_events(&self) -> bool {
+        !self.pending_scroll_event_targets.borrow().is_empty()
     }
 
-    /// Note a pending compositor event, to be processed at the next `update_the_rendering` task.
-    pub(crate) fn note_pending_input_event(&self, event: ConstellationInputEvent) {
-        let mut pending_compositor_events = self.pending_input_events.borrow_mut();
-        if matches!(event.event, InputEvent::MouseMove(..)) {
-            // First try to replace any existing mouse move event.
-            if let Some(mouse_move_event) = self
-                .mouse_move_event_index
-                .borrow()
-                .and_then(|index| pending_compositor_events.get_mut(index))
-            {
-                *mouse_move_event = event;
-                return;
-            }
-
-            *self.mouse_move_event_index.borrow_mut() = Some(pending_compositor_events.len());
-        }
-
-        pending_compositor_events.push(event);
-    }
-
-    /// Get pending compositor events, for processing within an `update_the_rendering` task.
-    pub(crate) fn take_pending_input_events(&self) -> Vec<ConstellationInputEvent> {
-        // Reset the mouse event index.
-        *self.mouse_move_event_index.borrow_mut() = None;
-        mem::take(&mut *self.pending_input_events.borrow_mut())
+    pub(crate) fn set_resize_observer_started_observing_target(&self, value: bool) {
+        self.resize_observer_started_observing_target.set(value);
     }
 
     pub(crate) fn set_csp_list(&self, csp_list: Option<CspList>) {
@@ -4298,30 +3431,6 @@ impl Document {
 
     pub(crate) fn get_csp_list(&self) -> Option<CspList> {
         self.policy_container.borrow().csp_list.clone()
-    }
-
-    /// <https://www.w3.org/TR/CSP/#should-block-inline>
-    pub(crate) fn should_elements_inline_type_behavior_be_blocked(
-        &self,
-        el: &Element,
-        type_: csp::InlineCheckType,
-        source: &str,
-    ) -> csp::CheckResult {
-        let (result, violations) = match self.get_csp_list() {
-            None => {
-                return csp::CheckResult::Allowed;
-            },
-            Some(csp_list) => {
-                let element = csp::Element {
-                    nonce: el.nonce_value_if_nonceable().map(Cow::Owned),
-                };
-                csp_list.should_elements_inline_type_behavior_be_blocked(&element, type_, source)
-            },
-        };
-
-        self.global().report_csp_violations(violations, Some(el));
-
-        result
     }
 
     /// Prevent any JS or layout from running until the corresponding call to
@@ -4350,7 +3459,7 @@ impl Document {
     }
 
     /// Enqueue a task to run as soon as any JS and layout blockers are removed.
-    pub(crate) fn add_delayed_task<T: 'static + TaskBox>(&self, task: T) {
+    pub(crate) fn add_delayed_task<T: 'static + NonSendTaskBox>(&self, task: T) {
         self.delayed_tasks.borrow_mut().push(Box::new(task));
     }
 
@@ -4599,7 +3708,7 @@ impl Document {
             .map(|elements| DomRoot::from_ref(&*elements[0]))
     }
 
-    pub(crate) fn ensure_pending_restyle(&self, el: &Element) -> RefMut<PendingRestyle> {
+    pub(crate) fn ensure_pending_restyle(&self, el: &Element) -> RefMut<'_, PendingRestyle> {
         let map = self.pending_restyles.borrow_mut();
         RefMut::map(map, |m| {
             &mut m
@@ -4609,14 +3718,14 @@ impl Document {
         })
     }
 
-    pub(crate) fn element_state_will_change(&self, el: &Element) {
-        let mut entry = self.ensure_pending_restyle(el);
+    pub(crate) fn element_state_will_change(&self, element: &Element) {
+        let mut entry = self.ensure_pending_restyle(element);
         if entry.snapshot.is_none() {
             entry.snapshot = Some(Snapshot::new());
         }
         let snapshot = entry.snapshot.as_mut().unwrap();
         if snapshot.state.is_none() {
-            snapshot.state = Some(el.state());
+            snapshot.state = Some(element.state());
         }
     }
 
@@ -4710,12 +3819,6 @@ impl Document {
     fn decr_ignore_opens_during_unload_counter(&self) {
         self.ignore_opens_during_unload_counter
             .set(self.ignore_opens_during_unload_counter.get() - 1);
-    }
-
-    /// Whether we've seen so many spurious animation frames (i.e. animation frames that didn't
-    /// mutate the DOM) that we've decided to fall back to fake ones.
-    fn is_faking_animation_frames(&self) -> bool {
-        self.spurious_animation_frames.get() >= SPURIOUS_ANIMATION_FRAME_THRESHOLD
     }
 
     // https://fullscreen.spec.whatwg.org/#dom-element-requestfullscreen
@@ -4897,21 +4000,31 @@ impl Document {
 
         stylesheets
             .get(Origin::Author, index)
-            .and_then(|s| s.owner.upcast::<Node>().get_cssom_stylesheet())
+            .and_then(|s| s.owner.get_cssom_object())
     }
 
-    /// Add a stylesheet owned by `owner` to the list of document sheets, in the
-    /// correct tree position.
+    /// Add a stylesheet owned by `owner_node` to the list of document sheets, in the
+    /// correct tree position. Additionally, ensure that the owned stylesheet is inserted
+    /// before any constructed stylesheet.
+    ///
+    /// <https://drafts.csswg.org/cssom/#documentorshadowroot-final-css-style-sheets>
     #[cfg_attr(crown, allow(crown::unrooted_must_root))] // Owner needs to be rooted already necessarily.
-    pub(crate) fn add_stylesheet(&self, owner: &Element, sheet: Arc<Stylesheet>) {
+    pub(crate) fn add_owned_stylesheet(&self, owner_node: &Element, sheet: Arc<Stylesheet>) {
         let stylesheets = &mut *self.stylesheets.borrow_mut();
+
+        // FIXME(stevennovaryo): This is almost identical with the one in ShadowRoot::add_stylesheet.
         let insertion_point = stylesheets
             .iter()
             .map(|(sheet, _origin)| sheet)
             .find(|sheet_in_doc| {
-                owner
-                    .upcast::<Node>()
-                    .is_before(sheet_in_doc.owner.upcast())
+                match &sheet_in_doc.owner {
+                    StylesheetSource::Element(other_node) => {
+                        owner_node.upcast::<Node>().is_before(other_node.upcast())
+                    },
+                    // Non-constructed stylesheet should be ordered before the
+                    // constructed ones.
+                    StylesheetSource::Constructed(_) => true,
+                }
             })
             .cloned();
 
@@ -4923,7 +4036,40 @@ impl Document {
         }
 
         DocumentOrShadowRoot::add_stylesheet(
-            owner,
+            StylesheetSource::Element(Dom::from_ref(owner_node)),
+            StylesheetSetRef::Document(stylesheets),
+            sheet,
+            insertion_point,
+            self.style_shared_lock(),
+        );
+    }
+
+    /// Append a constructed stylesheet to the back of document stylesheet set. Because
+    /// it would be the last element, we therefore would not mess with the ordering.
+    ///
+    /// <https://drafts.csswg.org/cssom/#documentorshadowroot-final-css-style-sheets>
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn append_constructed_stylesheet(&self, cssom_stylesheet: &CSSStyleSheet) {
+        debug_assert!(cssom_stylesheet.is_constructed());
+
+        let stylesheets = &mut *self.stylesheets.borrow_mut();
+        let sheet = cssom_stylesheet.style_stylesheet().clone();
+
+        let insertion_point = stylesheets
+            .iter()
+            .last()
+            .map(|(sheet, _origin)| sheet)
+            .cloned();
+
+        if self.has_browsing_context() {
+            self.window.layout_mut().add_stylesheet(
+                sheet.clone(),
+                insertion_point.as_ref().map(|s| s.sheet.clone()),
+            );
+        }
+
+        DocumentOrShadowRoot::add_stylesheet(
+            StylesheetSource::Constructed(Dom::from_ref(cssom_stylesheet)),
             StylesheetSetRef::Document(stylesheets),
             sheet,
             insertion_point,
@@ -4940,7 +4086,7 @@ impl Document {
 
     /// Remove a stylesheet owned by `owner` from the list of document sheets.
     #[cfg_attr(crown, allow(crown::unrooted_must_root))] // Owner needs to be rooted already necessarily.
-    pub(crate) fn remove_stylesheet(&self, owner: &Element, stylesheet: &Arc<Stylesheet>) {
+    pub(crate) fn remove_stylesheet(&self, owner: StylesheetSource, stylesheet: &Arc<Stylesheet>) {
         if self.has_browsing_context() {
             self.window
                 .layout_mut()
@@ -4954,13 +4100,13 @@ impl Document {
         )
     }
 
-    pub(crate) fn get_elements_with_id(&self, id: &Atom) -> Ref<[Dom<Element>]> {
+    pub(crate) fn get_elements_with_id(&self, id: &Atom) -> Ref<'_, [Dom<Element>]> {
         Ref::map(self.id_map.borrow(), |map| {
             map.get(id).map(|vec| &**vec).unwrap_or_default()
         })
     }
 
-    pub(crate) fn get_elements_with_name(&self, name: &Atom) -> Ref<[Dom<Element>]> {
+    pub(crate) fn get_elements_with_name(&self, name: &Atom) -> Ref<'_, [Dom<Element>]> {
         Ref::map(self.name_map.borrow(), |map| {
             map.get(name).map(|vec| &**vec).unwrap_or_default()
         })
@@ -5001,7 +4147,7 @@ impl Document {
         self.animation_timeline.borrow().current_value()
     }
 
-    pub(crate) fn animations(&self) -> Ref<Animations> {
+    pub(crate) fn animations(&self) -> Ref<'_, Animations> {
         self.animations.borrow()
     }
 
@@ -5009,6 +4155,9 @@ impl Document {
         self.animations
             .borrow()
             .do_post_reflow_update(&self.window, self.current_animation_timeline_value());
+        self.image_animation_manager
+            .borrow()
+            .update_rooted_dom_nodes(&self.window, self.current_animation_timeline_value());
     }
 
     pub(crate) fn cancel_animations_for_node(&self, node: &Node) {
@@ -5044,40 +4193,12 @@ impl Document {
         self.animations().send_pending_events(self.window(), can_gc);
     }
 
-    pub(crate) fn image_animation_manager(&self) -> Ref<ImageAnimationManager> {
+    pub(crate) fn image_animation_manager(&self) -> Ref<'_, ImageAnimationManager> {
         self.image_animation_manager.borrow()
     }
-    pub(crate) fn image_animation_manager_mut(&self) -> RefMut<ImageAnimationManager> {
-        self.image_animation_manager.borrow_mut()
-    }
 
-    pub(crate) fn update_animating_images(&self) {
-        let mut image_animation_manager = self.image_animation_manager.borrow_mut();
-        if !image_animation_manager.image_animations_present() {
-            return;
-        }
-        image_animation_manager
-            .update_active_frames(&self.window, self.current_animation_timeline_value());
-
-        if !self.animations().animations_present() {
-            let next_scheduled_time =
-                image_animation_manager.next_schedule_time(self.current_animation_timeline_value());
-            // TODO: Once we have refresh signal from the compositor,
-            // we should get rid of timer for animated image update.
-            if let Some(next_scheduled_time) = next_scheduled_time {
-                self.schedule_image_animation_update(next_scheduled_time);
-            }
-        }
-    }
-
-    fn schedule_image_animation_update(&self, next_scheduled_time: f64) {
-        let callback = ImageAnimationUpdateCallback {
-            document: Trusted::new(self),
-        };
-        self.global().schedule_callback(
-            OneshotTimerCallback::ImageAnimationUpdate(callback),
-            Duration::from_secs_f64(next_scheduled_time),
-        );
+    pub(crate) fn set_has_pending_animated_image_update(&self) {
+        self.has_pending_animated_image_update.set(true);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#shared-declarative-refresh-steps>
@@ -5227,25 +4348,22 @@ impl Document {
     }
 
     /// <https://dom.spec.whatwg.org/#document-allow-declarative-shadow-roots>
-    pub fn allow_declarative_shadow_roots(&self) -> bool {
+    pub(crate) fn allow_declarative_shadow_roots(&self) -> bool {
         self.allow_declarative_shadow_roots.get()
     }
 
-    pub fn set_allow_declarative_shadow_roots(&self, value: bool) {
-        self.allow_declarative_shadow_roots.set(value)
-    }
-
-    pub fn has_trustworthy_ancestor_origin(&self) -> bool {
+    pub(crate) fn has_trustworthy_ancestor_origin(&self) -> bool {
         self.has_trustworthy_ancestor_origin.get()
     }
 
-    pub fn has_trustworthy_ancestor_or_current_origin(&self) -> bool {
+    pub(crate) fn has_trustworthy_ancestor_or_current_origin(&self) -> bool {
         self.has_trustworthy_ancestor_origin.get() ||
             self.origin().immutable().is_potentially_trustworthy()
     }
+
     pub(crate) fn highlight_dom_node(&self, node: Option<&Node>) {
         self.highlighted_dom_node.set(node);
-        self.set_needs_paint(true);
+        self.add_restyle_reason(RestyleReason::HighlightedDOMNodeChanged);
     }
 
     pub(crate) fn highlighted_dom_node(&self) -> Option<DomRoot<Node>> {
@@ -5527,8 +4645,9 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
         options: StringOrElementCreationOptions,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<Element>> {
-        // Step 1. If localName does not match the Name production, then throw an "InvalidCharacterError" DOMException.
-        if !matches_name_production(&local_name) {
+        // Step 1. If localName is not a valid element local name,
+        //      then throw an "InvalidCharacterError" DOMException.
+        if !is_valid_element_local_name(&local_name) {
             debug!("Not a valid element name");
             return Err(Error::InvalidCharacter);
         }
@@ -5569,9 +4688,11 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
         options: StringOrElementCreationOptions,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<Element>> {
-        // Step 1. Let namespace, prefix, and localName be the result of passing namespace and qualifiedName
-        // to validate and extract.
-        let (namespace, prefix, local_name) = validate_and_extract(namespace, &qualified_name)?;
+        // Step 1. Let (namespace, prefix, localName) be the result of
+        //      validating and extracting namespace and qualifiedName given "element".
+        let context = domname::Context::Element;
+        let (namespace, prefix, local_name) =
+            domname::validate_and_extract(namespace, &qualified_name, context)?;
 
         // Step 2. Let is be null.
         // Step 3. If options is a dictionary and options["is"] exists, then set is to it.
@@ -5597,10 +4718,10 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
 
     /// <https://dom.spec.whatwg.org/#dom-document-createattribute>
     fn CreateAttribute(&self, mut local_name: DOMString, can_gc: CanGc) -> Fallible<DomRoot<Attr>> {
-        // Step 1. If localName does not match the Name production in XML,
-        // then throw an "InvalidCharacterError" DOMException.
-        if !matches_name_production(&local_name) {
-            debug!("Not a valid element name");
+        // Step 1. If localName is not a valid attribute local name,
+        //      then throw an "InvalidCharacterError" DOMException
+        if !is_valid_attribute_local_name(&local_name) {
+            debug!("Not a valid attribute name");
             return Err(Error::InvalidCharacter);
         }
         if self.is_html_document {
@@ -5628,7 +4749,11 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
         qualified_name: DOMString,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<Attr>> {
-        let (namespace, prefix, local_name) = validate_and_extract(namespace, &qualified_name)?;
+        // Step 1. Let (namespace, prefix, localName) be the result of validating and
+        //      extracting namespace and qualifiedName given "attribute".
+        let context = domname::Context::Attribute;
+        let (namespace, prefix, local_name) =
+            domname::validate_and_extract(namespace, &qualified_name, context)?;
         let value = AttrValue::String("".to_owned());
         let qualified_name = LocalName::from(qualified_name);
         Ok(Attr::new(
@@ -5845,7 +4970,7 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             None => return,
         };
 
-        let elem = if root.namespace() == &ns!(svg) && root.local_name() == &local_name!("svg") {
+        let node = if root.namespace() == &ns!(svg) && root.local_name() == &local_name!("svg") {
             let elem = root.upcast::<Node>().child_elements().find(|node| {
                 node.namespace() == &ns!(svg) && node.local_name() == &local_name!("title")
             });
@@ -5899,7 +5024,7 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             return;
         };
 
-        elem.SetTextContent(Some(title), can_gc);
+        node.set_text_content_for_element(Some(title), can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-document-head
@@ -6210,15 +5335,15 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
         self.set_body_attribute(&local_name!("text"), value, can_gc)
     }
 
-    #[allow(unsafe_code)]
     /// <https://html.spec.whatwg.org/multipage/#dom-tree-accessors:dom-document-nameditem-filter>
-    fn NamedGetter(&self, name: DOMString) -> Option<NamedPropertyValue> {
+    fn NamedGetter(&self, name: DOMString, can_gc: CanGc) -> Option<NamedPropertyValue> {
         if name.is_empty() {
             return None;
         }
         let name = Atom::from(name);
 
-        // Step 1.
+        // Step 1. Let elements be the list of named elements with the name name that are in a document tree
+        // with the Document as their root.
         let elements_with_name = self.get_elements_with_name(&name);
         let name_iter = elements_with_name
             .iter()
@@ -6229,10 +5354,14 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             .filter(|elem| is_named_element_with_id_attribute(elem));
         let mut elements = name_iter.chain(id_iter);
 
-        let first = elements.next()?;
+        // Step 2. If elements has only one element, and that element is an iframe element,
+        // and that iframe element's content navigable is not null, then return the active
+        // WindowProxy of the element's content navigable.
 
-        if elements.next().is_none() {
-            // Step 2.
+        // NOTE: We have to check if all remaining elements are equal to the first, since
+        // the same element may appear in both lists.
+        let first = elements.next()?;
+        if elements.all(|other| first == other) {
             if let Some(nested_window_proxy) = first
                 .downcast::<HTMLIFrameElement>()
                 .and_then(|iframe| iframe.GetContentWindow())
@@ -6240,11 +5369,12 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
                 return Some(NamedPropertyValue::WindowProxy(nested_window_proxy));
             }
 
-            // Step 3.
+            // Step 3. Otherwise, if elements has only one element, return that element.
             return Some(NamedPropertyValue::Element(DomRoot::from_ref(first)));
         }
 
-        // Step 4.
+        // Step 4. Otherwise, return an HTMLCollection rooted at the Document node,
+        // whose filter matches only named elements with the name name.
         #[derive(JSTraceable, MallocSizeOf)]
         struct DocumentNamedGetter {
             #[no_trace]
@@ -6275,7 +5405,7 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             self.window(),
             self.upcast(),
             Box::new(DocumentNamedGetter { name }),
-            CanGc::note(),
+            can_gc,
         );
         Some(NamedPropertyValue::HTMLCollection(collection))
     }
@@ -6365,39 +5495,27 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
     );
 
     // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
-    fn ElementFromPoint(
-        &self,
-        x: Finite<f64>,
-        y: Finite<f64>,
-        can_gc: CanGc,
-    ) -> Option<DomRoot<Element>> {
+    fn ElementFromPoint(&self, x: Finite<f64>, y: Finite<f64>) -> Option<DomRoot<Element>> {
         self.document_or_shadow_root.element_from_point(
             x,
             y,
             self.GetDocumentElement(),
             self.has_browsing_context,
-            can_gc,
         )
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint
-    fn ElementsFromPoint(
-        &self,
-        x: Finite<f64>,
-        y: Finite<f64>,
-        can_gc: CanGc,
-    ) -> Vec<DomRoot<Element>> {
+    fn ElementsFromPoint(&self, x: Finite<f64>, y: Finite<f64>) -> Vec<DomRoot<Element>> {
         self.document_or_shadow_root.elements_from_point(
             x,
             y,
             self.GetDocumentElement(),
             self.has_browsing_context,
-            can_gc,
         )
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-document-scrollingelement>
-    fn GetScrollingElement(&self, can_gc: CanGc) -> Option<DomRoot<Element>> {
+    fn GetScrollingElement(&self) -> Option<DomRoot<Element>> {
         // Step 1. If the Document is in quirks mode, follow these steps:
         if self.quirks_mode() == QuirksMode::Quirks {
             // Step 1.1. If the body element exists,
@@ -6406,7 +5524,7 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
                 // and it is not potentially scrollable, return the body element and abort these steps.
                 // For this purpose, a value of overflow:clip on the the body element’s parent element
                 // must be treated as overflow:hidden.
-                if !e.is_potentially_scrollable_body_for_scrolling_element(can_gc) {
+                if !e.is_potentially_scrollable_body_for_scrolling_element() {
                     return Some(DomRoot::from_ref(e));
                 }
             }
@@ -6708,6 +5826,40 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             can_gc,
         )
     }
+
+    /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
+    fn AdoptedStyleSheets(&self, context: JSContext, can_gc: CanGc, retval: MutableHandleValue) {
+        self.adopted_stylesheets_frozen_types.get_or_init(
+            || {
+                self.adopted_stylesheets
+                    .borrow()
+                    .clone()
+                    .iter()
+                    .map(|sheet| sheet.as_rooted())
+                    .collect()
+            },
+            context,
+            retval,
+            can_gc,
+        );
+    }
+
+    /// <https://drafts.csswg.org/cssom/#dom-documentorshadowroot-adoptedstylesheets>
+    fn SetAdoptedStyleSheets(&self, context: JSContext, val: HandleValue) -> ErrorResult {
+        let result = DocumentOrShadowRoot::set_adopted_stylesheet_from_jsval(
+            context,
+            self.adopted_stylesheets.borrow_mut().as_mut(),
+            val,
+            &StyleSheetListOwner::Document(Dom::from_ref(self)),
+        );
+
+        // If update is successful, clear the FrozenArray cache.
+        if result.is_ok() {
+            self.adopted_stylesheets_frozen_types.clear()
+        }
+
+        result
+    }
 }
 
 fn update_with_current_instant(marker: &Cell<Option<CrossProcessInstant>>) {
@@ -6753,42 +5905,6 @@ pub enum FocusInitiator {
 pub(crate) enum FocusEventType {
     Focus, // Element gained focus. Doesn't bubble.
     Blur,  // Element lost focus. Doesn't bubble.
-}
-
-/// A fake `requestAnimationFrame()` callback—"fake" because it is not triggered by the video
-/// refresh but rather a simple timer.
-///
-/// If the page is observed to be using `requestAnimationFrame()` for non-animation purposes (i.e.
-/// without mutating the DOM), then we fall back to simple timeouts to save energy over video
-/// refresh.
-#[derive(JSTraceable, MallocSizeOf)]
-pub(crate) struct FakeRequestAnimationFrameCallback {
-    /// The document.
-    #[ignore_malloc_size_of = "non-owning"]
-    document: Trusted<Document>,
-}
-
-impl FakeRequestAnimationFrameCallback {
-    pub(crate) fn invoke(self, can_gc: CanGc) {
-        // TODO: Once there is a more generic mechanism to trigger `update_the_rendering` when
-        // not driven by the compositor, it should be used here.
-        with_script_thread(|script_thread| script_thread.update_the_rendering(true, can_gc))
-    }
-}
-
-/// This is a temporary workaround to update animated images,
-/// we should get rid of this after we have refresh driver #3406
-#[derive(JSTraceable, MallocSizeOf)]
-pub(crate) struct ImageAnimationUpdateCallback {
-    /// The document.
-    #[ignore_malloc_size_of = "non-owning"]
-    document: Trusted<Document>,
-}
-
-impl ImageAnimationUpdateCallback {
-    pub(crate) fn invoke(self, can_gc: CanGc) {
-        with_script_thread(|script_thread| script_thread.update_the_rendering(true, can_gc))
-    }
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -6890,14 +6006,6 @@ impl PendingScript {
             .take()
             .map(|result| (DomRoot::from_ref(&*self.element), result))
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum ReflowTriggerCondition {
-    StylesheetsChanged,
-    DirtyDescendants,
-    PendingRestyles,
-    PaintPostponed,
 }
 
 fn is_named_element_with_name_attribute(elem: &Element) -> bool {

@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use constellation_traits::BlobImpl;
-use content_security_policy as csp;
 use data_url::mime::Mime;
 use dom_struct::dom_struct;
 use encoding_rs::{Encoding, UTF_8};
@@ -33,6 +32,7 @@ use net_traits::{
     FetchMetadata, FetchResponseListener, FilteredMetadata, NetworkError, ReferrerPolicy,
     ResourceFetchTiming, ResourceTimingType, trim_http_whitespace,
 };
+use script_bindings::conversions::SafeToJSValConvertible;
 use script_bindings::num::Finite;
 use script_traits::DocumentActivity;
 use servo_url::ServoUrl;
@@ -48,7 +48,6 @@ use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::{
     XMLHttpRequestMethods, XMLHttpRequestResponseType,
 };
 use crate::dom::bindings::codegen::UnionTypes::DocumentOrBlobOrArrayBufferViewOrArrayBufferOrFormDataOrStringOrURLSearchParams as DocumentOrXMLHttpRequestBodyInit;
-use crate::dom::bindings::conversions::ToJSValConvertible;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
@@ -56,6 +55,7 @@ use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{ByteString, DOMString, USVString, is_token};
 use crate::dom::blob::{Blob, normalize_type_string};
+use crate::dom::csp::{GlobalCspReporting, Violation};
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
@@ -147,9 +147,9 @@ impl FetchResponseListener for XHRContext {
         network_listener::submit_timing(self, CanGc::note())
     }
 
-    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<csp::Violation>) {
+    fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
         let global = &self.resource_timing_global();
-        global.report_csp_violations(violations, None);
+        global.report_csp_violations(violations, None, None);
     }
 }
 
@@ -344,7 +344,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         }
 
         // Step 5
-        //FIXME(seanmonstar): use a Trie instead?
+        // FIXME(seanmonstar): use a Trie instead?
         let maybe_method = method.as_str().and_then(|s| {
             // Note: hyper tests against the uppercase versions
             // Since we want to pass methods not belonging to the short list above
@@ -662,7 +662,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         }
 
         // Step 6
-        //TODO - set referrer_policy/referrer_url in request
+        // TODO - set referrer_policy/referrer_url in request
         let credentials_mode = if self.with_credentials.get() {
             CredentialsMode::Include
         } else {
@@ -739,7 +739,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                                     .collect();
 
                                 let new_mime = format!(
-                                    "{}/{}; charset={}{}{}",
+                                    "{}/{};charset={}{}{}",
                                     mime.type_,
                                     mime.subtype,
                                     encoding,
@@ -750,9 +750,11 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                                         .collect::<Vec<String>>()
                                         .join("; ")
                                 );
-                                request
-                                    .headers
-                                    .typed_insert(ContentType::from_str(&new_mime).unwrap())
+
+                                request.headers.insert(
+                                    header::CONTENT_TYPE,
+                                    HeaderValue::from_str(&new_mime).unwrap(),
+                                );
                             }
                         }
                     }
@@ -797,6 +799,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         if self.ready_state.get() == XMLHttpRequestState::Done {
             self.change_ready_state(XMLHttpRequestState::Unsent, can_gc);
             self.response_status.set(Err(()));
+            *self.status.borrow_mut() = HttpStatus::new_error();
             self.response.borrow_mut().clear();
             self.response_headers.borrow_mut().clear();
         }
@@ -918,20 +921,19 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         }
     }
 
-    #[allow(unsafe_code)]
     /// <https://xhr.spec.whatwg.org/#the-response-attribute>
     fn Response(&self, cx: JSContext, can_gc: CanGc, mut rval: MutableHandleValue) {
         match self.response_type.get() {
-            XMLHttpRequestResponseType::_empty | XMLHttpRequestResponseType::Text => unsafe {
+            XMLHttpRequestResponseType::_empty | XMLHttpRequestResponseType::Text => {
                 let ready_state = self.ready_state.get();
                 // Step 2
                 if ready_state == XMLHttpRequestState::Done ||
                     ready_state == XMLHttpRequestState::Loading
                 {
-                    self.text_response().to_jsval(*cx, rval);
+                    self.text_response().safe_to_jsval(cx, rval);
                 } else {
                     // Step 1
-                    "".to_jsval(*cx, rval);
+                    "".safe_to_jsval(cx, rval);
                 }
             },
             // Step 1
@@ -939,16 +941,14 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 rval.set(NullValue());
             },
             // Step 2
-            XMLHttpRequestResponseType::Document => unsafe {
-                self.document_response(can_gc).to_jsval(*cx, rval);
+            XMLHttpRequestResponseType::Document => {
+                self.document_response(can_gc).safe_to_jsval(cx, rval)
             },
             XMLHttpRequestResponseType::Json => self.json_response(cx, rval),
-            XMLHttpRequestResponseType::Blob => unsafe {
-                self.blob_response(can_gc).to_jsval(*cx, rval);
-            },
+            XMLHttpRequestResponseType::Blob => self.blob_response(can_gc).safe_to_jsval(cx, rval),
             XMLHttpRequestResponseType::Arraybuffer => {
                 match self.arraybuffer_response(cx, can_gc) {
-                    Some(array_buffer) => unsafe { array_buffer.to_jsval(*cx, rval) },
+                    Some(array_buffer) => array_buffer.safe_to_jsval(cx, rval),
                     None => rval.set(NullValue()),
                 }
             },
@@ -1188,6 +1188,8 @@ impl XMLHttpRequest {
 
                 self.discard_subsequent_responses();
                 self.send_flag.set(false);
+                *self.status.borrow_mut() = HttpStatus::new_error();
+                self.response_headers.borrow_mut().clear();
                 // XXXManishearth set response to NetworkError
                 self.change_ready_state(XMLHttpRequestState::Done, can_gc);
                 return_if_fetch_was_terminated!();
@@ -1449,7 +1451,7 @@ impl XMLHttpRequest {
         // Step 2
         let bytes = self.response.borrow();
         // Step 3
-        if bytes.len() == 0 {
+        if bytes.is_empty() {
             return rval.set(NullValue());
         }
         // Step 4
@@ -1513,10 +1515,7 @@ impl XMLHttpRequest {
         let doc = win.Document();
         let docloader = DocumentLoader::new(&doc.loader());
         let base = wr.get_url();
-        let parsed_url = match base.join(&self.ResponseURL().0) {
-            Ok(parsed) => Some(parsed),
-            Err(_) => None, // Step 7
-        };
+        let parsed_url = base.join(&self.ResponseURL().0).ok();
         let content_type = Some(self.final_mime_type());
         Document::new(
             win,
@@ -1582,7 +1581,8 @@ impl XMLHttpRequest {
             )
         };
 
-        *self.canceller.borrow_mut() = FetchCanceller::new(request_builder.id);
+        *self.canceller.borrow_mut() =
+            FetchCanceller::new(request_builder.id, global.core_resource_thread());
         global.fetch(request_builder, context.clone(), task_source);
 
         if let Some(script_port) = script_port {

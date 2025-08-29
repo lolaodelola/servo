@@ -12,6 +12,7 @@ import string
 import traceback
 from collections import OrderedDict, defaultdict
 from itertools import chain
+from typing import Any
 
 from ply import lex, yacc
 
@@ -2106,6 +2107,7 @@ class IDLInterface(IDLInterfaceOrNamespace):
                 or identifier == "Serializable"
                 or identifier == "Abstract"
                 or identifier == "Inline"
+                or identifier == "Transferable"
             ):
                 # Known extended attributes that do not take values
                 if not attr.noArguments():
@@ -2521,7 +2523,7 @@ class IDLEnum(IDLObjectWithIdentifier):
 
 
 class IDLType(IDLObject):
-    Tags = enum(
+    Tags: Any = enum(
         # The integer types
         "int8",
         "uint8",

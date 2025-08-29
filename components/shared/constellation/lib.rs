@@ -19,19 +19,20 @@ use base::Epoch;
 use base::cross_process_instant::CrossProcessInstant;
 use base::id::{MessagePortId, PipelineId, WebViewId};
 use embedder_traits::{
-    CompositorHitTestResult, Cursor, InputEvent, JavaScriptEvaluationId, MediaSessionActionType,
-    Theme, ViewportDetails, WebDriverCommandMsg,
+    CompositorHitTestResult, FocusId, InputEvent, JavaScriptEvaluationId, MediaSessionActionType,
+    Theme, TraversalId, ViewportDetails, WebDriverCommandMsg, WebDriverCommandResponse,
 };
-use euclid::Vector2D;
 pub use from_script_message::*;
 use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
+use profile_traits::mem::MemoryReportResult;
 use serde::{Deserialize, Serialize};
+use servo_config::prefs::PrefValue;
 use servo_url::{ImmutableOrigin, ServoUrl};
 pub use structured_data::*;
 use strum_macros::IntoStaticStr;
-use webrender_api::ExternalScrollId;
-use webrender_api::units::LayoutPixel;
+use webrender_api::units::LayoutVector2D;
+use webrender_api::{ExternalScrollId, ImageKey};
 
 /// Messages to the Constellation from the embedding layer, whether from `ServoRenderer` or
 /// from `libservo` itself.
@@ -39,9 +40,6 @@ use webrender_api::units::LayoutPixel;
 pub enum EmbedderToConstellationMessage {
     /// Exit the constellation.
     Exit,
-    /// Request that the constellation send the current focused top-level browsing context id,
-    /// over a provided channel.
-    GetFocusTopLevelBrowsingContext(IpcSender<Option<WebViewId>>),
     /// Query the constellation to see if the current compositor output is stable
     IsReadyToSaveImage(HashMap<PipelineId, Epoch>),
     /// Whether to allow script to navigate.
@@ -51,11 +49,11 @@ pub enum EmbedderToConstellationMessage {
     /// Clear the network cache.
     ClearCache,
     /// Request to traverse the joint session history of the provided browsing context.
-    TraverseHistory(WebViewId, TraversalDirection),
+    TraverseHistory(WebViewId, TraversalDirection, TraversalId),
     /// Inform the Constellation that a `WebView`'s [`ViewportDetails`] have changed.
     ChangeViewportDetails(WebViewId, ViewportDetails, WindowSizeType),
     /// Inform the constellation of a theme change.
-    ThemeChange(Theme),
+    ThemeChange(WebViewId, Theme),
     /// Requests that the constellation instruct script/layout to try to layout again and tick
     /// animations.
     TickAnimation(Vec<WebViewId>),
@@ -71,14 +69,17 @@ pub enum EmbedderToConstellationMessage {
     CloseWebView(WebViewId),
     /// Panic a top level browsing context.
     SendError(Option<WebViewId>, String),
-    /// Make a webview focused.
-    FocusWebView(WebViewId),
+    /// Make a webview focused. [EmbedderMsg::WebViewFocused] will be sent with
+    /// the result of this operation.
+    FocusWebView(WebViewId, FocusId),
     /// Make none of the webviews focused.
     BlurWebView,
     /// Forward an input event to an appropriate ScriptTask.
     ForwardInputEvent(WebViewId, InputEvent, Option<CompositorHitTestResult>),
-    /// Requesting a change to the onscreen cursor.
-    SetCursor(WebViewId, Cursor),
+    /// Request that the given pipeline refresh the cursor by doing a hit test at the most
+    /// recently hovered cursor position and resetting the cursor. This happens after a
+    /// display list update is rendered.
+    RefreshCursor(PipelineId),
     /// Enable the sampling profiler, with a given sampling rate and max total sampling duration.
     ToggleProfiler(Duration, Duration),
     /// Request to exit from fullscreen mode
@@ -89,12 +90,20 @@ pub enum EmbedderToConstellationMessage {
     SetWebViewThrottled(WebViewId, bool),
     /// The Servo renderer scrolled and is updating the scroll states of the nodes in the
     /// given pipeline via the constellation.
-    SetScrollStates(PipelineId, Vec<ScrollState>),
+    SetScrollStates(PipelineId, HashMap<ExternalScrollId, LayoutVector2D>),
     /// Notify the constellation that a particular paint metric event has happened for the given pipeline.
     PaintMetric(PipelineId, PaintMetricEvent),
     /// Evaluate a JavaScript string in the context of a `WebView`. When execution is complete or an
     /// error is encountered, a correpsonding message will be sent to the embedding layer.
     EvaluateJavaScript(WebViewId, JavaScriptEvaluationId, String),
+    /// Create a memory report and return it via the ipc sender
+    CreateMemoryReport(IpcSender<MemoryReportResult>),
+    /// Sends the generated image key to the image cache associated with this pipeline.
+    SendImageKeysForPipeline(PipelineId, Vec<ImageKey>),
+    /// Set WebDriver input event handled sender.
+    SetWebDriverResponseSender(IpcSender<WebDriverCommandResponse>),
+    /// A set of preferences were updated with the given new values.
+    PreferencesUpdated(Vec<(&'static str, PrefValue)>),
 }
 
 /// A description of a paint metric that is sent from the Servo renderer to the
@@ -131,15 +140,6 @@ pub enum WindowSizeType {
     Initial,
     /// Window resize.
     Resize,
-}
-
-/// The scroll state of a stacking context.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub struct ScrollState {
-    /// The ID of the scroll root.
-    pub scroll_id: ExternalScrollId,
-    /// The scrolling offset of this stacking context.
-    pub scroll_offset: Vector2D<f32, LayoutPixel>,
 }
 
 /// The direction of a history traversal

@@ -49,9 +49,11 @@ impl<T> DomRefCell<T> {
     #[allow(unsafe_code)]
     pub(crate) unsafe fn borrow_for_layout(&self) -> &T {
         assert_in_layout();
-        self.value
-            .try_borrow_unguarded()
-            .expect("cell is mutably borrowed")
+        unsafe {
+            self.value
+                .try_borrow_unguarded()
+                .expect("cell is mutably borrowed")
+        }
     }
 
     /// Borrow the contents for the purpose of script deallocation.
@@ -68,7 +70,7 @@ impl<T> DomRefCell<T> {
     #[allow(unsafe_code, clippy::mut_from_ref)]
     pub(crate) unsafe fn borrow_for_script_deallocation(&self) -> &mut T {
         assert_in_script();
-        &mut *self.value.as_ptr()
+        unsafe { &mut *self.value.as_ptr() }
     }
 
     /// Mutably borrow a cell for layout. Ideally this would use
@@ -86,7 +88,7 @@ impl<T> DomRefCell<T> {
     #[allow(unsafe_code, clippy::mut_from_ref)]
     pub(crate) unsafe fn borrow_mut_for_layout(&self) -> &mut T {
         assert_in_layout();
-        &mut *self.value.as_ptr()
+        unsafe { &mut *self.value.as_ptr() }
     }
 }
 
@@ -109,7 +111,7 @@ impl<T> DomRefCell<T> {
     ///
     /// Panics if the value is currently mutably borrowed.
     #[track_caller]
-    pub(crate) fn borrow(&self) -> Ref<T> {
+    pub(crate) fn borrow(&self) -> Ref<'_, T> {
         self.value.borrow()
     }
 
@@ -122,7 +124,7 @@ impl<T> DomRefCell<T> {
     ///
     /// Panics if the value is currently borrowed.
     #[track_caller]
-    pub(crate) fn borrow_mut(&self) -> RefMut<T> {
+    pub(crate) fn borrow_mut(&self) -> RefMut<'_, T> {
         self.value.borrow_mut()
     }
 
@@ -136,7 +138,7 @@ impl<T> DomRefCell<T> {
     /// # Panics
     ///
     /// Panics if this is called off the script thread.
-    pub(crate) fn try_borrow(&self) -> Result<Ref<T>, BorrowError> {
+    pub(crate) fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
         assert_in_script();
         self.value.try_borrow()
     }
@@ -151,7 +153,7 @@ impl<T> DomRefCell<T> {
     /// # Panics
     ///
     /// Panics if this is called off the script thread.
-    pub(crate) fn try_borrow_mut(&self) -> Result<RefMut<T>, BorrowMutError> {
+    pub(crate) fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
         assert_in_script();
         self.value.try_borrow_mut()
     }

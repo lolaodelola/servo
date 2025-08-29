@@ -37,15 +37,14 @@ jobs:
         uses: baptiste0928/cargo-install@v3
         with:
           crate: cargo-deny
-          version: 0.18
+          version: 0.18.3
           locked: true
       - name: Bootstrap dependencies
         run: |
           sudo apt update
           ./mach bootstrap
-      # TODO: Do GitHub anotaions
       - name: Clippy
         run: |
-          ./mach clippy --use-crown --locked -- -- --deny warnings
+          ./mach clippy --use-crown --locked --github-annotations -- -- --deny warnings
       - name: Tidy
-        run: ./mach test-tidy --no-progress --all
+        run: ./mach test-tidy --no-progress --all --github-annotations

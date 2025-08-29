@@ -13,13 +13,11 @@
 
 use std::borrow::ToOwned;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::io::Read;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use actors::source::SourceData;
 use base::id::{BrowsingContextId, PipelineId, WebViewId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use devtools_traits::{
@@ -29,8 +27,8 @@ use devtools_traits::{
 };
 use embedder_traits::{AllowOrDeny, EmbedderMsg, EmbedderProxy};
 use ipc_channel::ipc::{self, IpcSender};
-use log::trace;
-use resource::ResourceAvailable;
+use log::{trace, warn};
+use resource::{ResourceArrayType, ResourceAvailable};
 use serde::Serialize;
 use servo_rand::RngCore;
 
@@ -44,7 +42,9 @@ use crate::actors::performance::PerformanceActor;
 use crate::actors::preference::PreferenceActor;
 use crate::actors::process::ProcessActor;
 use crate::actors::root::RootActor;
+use crate::actors::source::SourceActor;
 use crate::actors::thread::ThreadActor;
+use crate::actors::watcher::WatcherActor;
 use crate::actors::worker::{WorkerActor, WorkerType};
 use crate::id::IdMap;
 use crate::network_handler::handle_network_event;
@@ -53,11 +53,13 @@ use crate::protocol::JsonPacketStream;
 mod actor;
 /// <https://searchfox.org/mozilla-central/source/devtools/server/actors>
 mod actors {
+    pub mod breakpoint;
     pub mod browsing_context;
     pub mod console;
     pub mod device;
     pub mod framerate;
     pub mod inspector;
+    pub mod long_string;
     pub mod memory;
     pub mod network_event;
     pub mod object;
@@ -119,6 +121,7 @@ struct DevtoolsInstance {
     actor_workers: HashMap<WorkerId, String>,
     actor_requests: HashMap<String, String>,
     connections: HashMap<StreamId, TcpStream>,
+    next_resource_id: u64,
 }
 
 impl DevtoolsInstance {
@@ -181,6 +184,7 @@ impl DevtoolsInstance {
             actor_requests: HashMap::new(),
             actor_workers: HashMap::new(),
             connections: HashMap::new(),
+            next_resource_id: 1,
         };
 
         thread::Builder::new()
@@ -251,10 +255,14 @@ impl DevtoolsInstance {
                     console_message,
                     worker_id,
                 )) => self.handle_console_message(pipeline_id, worker_id, console_message),
-                DevtoolsControlMsg::FromScript(ScriptToDevtoolsControlMsg::ScriptSourceLoaded(
+                DevtoolsControlMsg::FromScript(ScriptToDevtoolsControlMsg::CreateSourceActor(
+                    script_sender,
                     pipeline_id,
                     source_info,
-                )) => self.handle_script_source_info(pipeline_id, source_info),
+                )) => self.handle_create_source_actor(script_sender, pipeline_id, source_info),
+                DevtoolsControlMsg::FromScript(
+                    ScriptToDevtoolsControlMsg::UpdateSourceContent(pipeline_id, source_content),
+                ) => self.handle_update_source_content(pipeline_id, source_content),
                 DevtoolsControlMsg::FromScript(ScriptToDevtoolsControlMsg::ReportPageError(
                     pipeline_id,
                     page_error,
@@ -283,11 +291,7 @@ impl DevtoolsInstance {
                         connections.push(stream.try_clone().unwrap());
                     }
 
-                    let pipeline_id = match network_event {
-                        NetworkEvent::HttpResponse(ref response) => response.pipeline_id,
-                        NetworkEvent::HttpRequest(ref request) => request.pipeline_id,
-                    };
-                    self.handle_network_event(connections, pipeline_id, request_id, network_event);
+                    self.handle_network_event(connections, request_id, network_event);
                 },
                 DevtoolsControlMsg::FromChrome(ChromeToDevtoolsControlMsg::ServerExitMsg) => break,
             }
@@ -307,11 +311,23 @@ impl DevtoolsInstance {
 
     fn handle_navigate(&self, browsing_context_id: BrowsingContextId, state: NavigationState) {
         let actor_name = self.browsing_contexts.get(&browsing_context_id).unwrap();
-        self.actors
-            .lock()
-            .unwrap()
-            .find::<BrowsingContextActor>(actor_name)
-            .navigate(state, &mut self.id_map.lock().expect("Mutex poisoned"));
+        let actors = self.actors.lock().unwrap();
+        let actor = actors.find::<BrowsingContextActor>(actor_name);
+        let mut id_map = self.id_map.lock().expect("Mutex poisoned");
+        if let NavigationState::Start(url) = &state {
+            let mut connections = Vec::<TcpStream>::new();
+            for stream in self.connections.values() {
+                connections.push(stream.try_clone().unwrap());
+            }
+            let watcher_actor = actors.find::<WatcherActor>(&actor.watcher);
+            watcher_actor.emit_will_navigate(
+                browsing_context_id,
+                url.clone(),
+                &mut connections,
+                &mut id_map,
+            );
+        };
+        actor.navigate(state, &mut id_map);
     }
 
     // We need separate actor representations for each script global that exists;
@@ -473,46 +489,78 @@ impl DevtoolsInstance {
     fn handle_network_event(
         &mut self,
         connections: Vec<TcpStream>,
-        pipeline_id: PipelineId,
         request_id: String,
         network_event: NetworkEvent,
     ) {
-        let console_actor_name = match self.find_console_actor(pipeline_id, None) {
-            Some(name) => name,
-            None => return,
+        let browsing_context_id = match &network_event {
+            NetworkEvent::HttpRequest(req) => req.browsing_context_id,
+            NetworkEvent::HttpRequestUpdate(req) => req.browsing_context_id,
+            NetworkEvent::HttpResponse(resp) => resp.browsing_context_id,
         };
-        let netevent_actor_name = self.find_network_event_actor(request_id);
+
+        let Some(browsing_context_actor_name) = self.browsing_contexts.get(&browsing_context_id)
+        else {
+            return;
+        };
+        let watcher_name = self
+            .actors
+            .lock()
+            .unwrap()
+            .find::<BrowsingContextActor>(browsing_context_actor_name)
+            .watcher
+            .clone();
+
+        let netevent_actor_name = match self.actor_requests.get(&request_id) {
+            Some(name) => name.clone(),
+            None => self.create_network_event_actor(request_id, watcher_name),
+        };
 
         handle_network_event(
             Arc::clone(&self.actors),
-            console_actor_name,
             netevent_actor_name,
             connections,
             network_event,
         )
     }
 
-    // Find the name of NetworkEventActor corresponding to request_id
-    // Create a new one if it does not exist, add it to the actor_requests hashmap
-    fn find_network_event_actor(&mut self, request_id: String) -> String {
+    /// Create a new NetworkEventActor for a given request ID and watcher name.
+    fn create_network_event_actor(&mut self, request_id: String, watcher_name: String) -> String {
         let mut actors = self.actors.lock().unwrap();
-        match self.actor_requests.entry(request_id) {
-            Occupied(name) => {
-                //TODO: Delete from map like Firefox does?
-                name.into_mut().clone()
-            },
-            Vacant(entry) => {
-                let actor_name = actors.new_name("netevent");
-                let actor = NetworkEventActor::new(actor_name.clone());
-                entry.insert(actor_name.clone());
-                actors.register(Box::new(actor));
-                actor_name
-            },
-        }
+        let resource_id = self.next_resource_id;
+        self.next_resource_id += 1;
+
+        let actor_name = actors.new_name("netevent");
+        let actor = NetworkEventActor::new(actor_name.clone(), resource_id, watcher_name);
+
+        self.actor_requests.insert(request_id, actor_name.clone());
+        actors.register(Box::new(actor));
+
+        actor_name
     }
 
-    fn handle_script_source_info(&mut self, pipeline_id: PipelineId, source_info: SourceInfo) {
+    fn handle_create_source_actor(
+        &mut self,
+        script_sender: IpcSender<DevtoolScriptControlMsg>,
+        pipeline_id: PipelineId,
+        source_info: SourceInfo,
+    ) {
         let mut actors = self.actors.lock().unwrap();
+
+        let source_content = source_info
+            .content
+            .or_else(|| actors.inline_source_content(pipeline_id));
+        let source_actor = SourceActor::new_registered(
+            &mut actors,
+            pipeline_id,
+            source_info.url,
+            source_content,
+            source_info.content_type,
+            source_info.spidermonkey_id,
+            source_info.introduction_type,
+            script_sender,
+        );
+        let source_actor_name = source_actor.name.clone();
+        let source_form = source_actor.source_form();
 
         if let Some(worker_id) = source_info.worker_id {
             let Some(worker_actor_name) = self.actor_workers.get(&worker_id) else {
@@ -520,22 +568,19 @@ impl DevtoolsInstance {
             };
 
             let thread_actor_name = actors.find::<WorkerActor>(worker_actor_name).thread.clone();
-
             let thread_actor = actors.find_mut::<ThreadActor>(&thread_actor_name);
-            thread_actor
-                .source_manager
-                .add_source(source_info.url.clone());
 
-            let source = SourceData {
-                actor: thread_actor_name.clone(),
-                url: source_info.url.to_string(),
-                is_black_boxed: false,
-            };
+            thread_actor.source_manager.add_source(&source_actor_name);
 
             let worker_actor = actors.find::<WorkerActor>(worker_actor_name);
 
             for stream in self.connections.values_mut() {
-                worker_actor.resource_available(&source, "source".into(), stream);
+                worker_actor.resource_array(
+                    &source_form,
+                    "source".into(),
+                    ResourceArrayType::Available,
+                    stream,
+                );
             }
         } else {
             let Some(browsing_context_id) = self.pipelines.get(&pipeline_id) else {
@@ -545,29 +590,42 @@ impl DevtoolsInstance {
                 return;
             };
 
-            let thread_actor_name = actors
-                .find::<BrowsingContextActor>(actor_name)
-                .thread
-                .clone();
+            let thread_actor_name = {
+                let browsing_context = actors.find::<BrowsingContextActor>(actor_name);
+                browsing_context.thread.clone()
+            };
 
             let thread_actor = actors.find_mut::<ThreadActor>(&thread_actor_name);
-            thread_actor
-                .source_manager
-                .add_source(source_info.url.clone());
 
-            let source = SourceData {
-                actor: thread_actor_name.clone(),
-                url: source_info.url.to_string(),
-                is_black_boxed: false,
-            };
+            thread_actor.source_manager.add_source(&source_actor_name);
 
             // Notify browsing context about the new source
             let browsing_context = actors.find::<BrowsingContextActor>(actor_name);
 
             for stream in self.connections.values_mut() {
-                browsing_context.resource_available(&source, "source".into(), stream);
+                browsing_context.resource_array(
+                    &source_form,
+                    "source".into(),
+                    ResourceArrayType::Available,
+                    stream,
+                );
             }
         }
+    }
+
+    fn handle_update_source_content(&mut self, pipeline_id: PipelineId, source_content: String) {
+        let mut actors = self.actors.lock().unwrap();
+
+        for actor_name in actors.source_actor_names_for_pipeline(pipeline_id) {
+            let source_actor: &mut SourceActor = actors.find_mut(&actor_name);
+            if source_actor.content.is_none() {
+                source_actor.content = Some(source_content.clone());
+            }
+        }
+
+        // Store the source content separately for any future source actors that get created *after* we finish parsing
+        // the HTML. For example, adding an `import` to an inline module script can delay it until after parsing.
+        actors.set_inline_source_content(pipeline_id, source_content);
     }
 }
 
@@ -602,8 +660,8 @@ fn allow_devtools_client(stream: &mut TcpStream, embedder: &EmbedderProxy, token
 fn handle_client(actors: Arc<Mutex<ActorRegistry>>, mut stream: TcpStream, stream_id: StreamId) {
     log::info!("Connection established to {}", stream.peer_addr().unwrap());
     let msg = actors.lock().unwrap().find::<RootActor>("root").encodable();
-    if let Err(e) = stream.write_json_packet(&msg) {
-        log::warn!("Error writing response: {:?}", e);
+    if let Err(error) = stream.write_json_packet(&msg) {
+        warn!("Failed to send initial packet from root actor: {error:?}");
         return;
     }
 

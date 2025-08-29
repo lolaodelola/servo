@@ -6,9 +6,13 @@ use std::f32;
 
 use app_units::{Au, MAX_AU, MIN_AU};
 use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect, Size2D as UntypedSize2D};
-use euclid::{Box2D, Length, Point2D, SideOffsets2D, Size2D, Vector2D};
+use euclid::{Box2D, Length, Point2D, Scale, SideOffsets2D, Size2D, Vector2D};
 use malloc_size_of_derive::MallocSizeOf;
-use webrender_api::units::{FramebufferPixel, LayoutPoint, LayoutRect, LayoutSize};
+use webrender::FastTransform;
+use webrender_api::units::{
+    DeviceIntRect, DeviceIntSize, DevicePixel, FramebufferPixel, LayoutPixel, LayoutPoint,
+    LayoutRect, LayoutSize,
+};
 
 // Units for use with euclid::length and euclid::scale_factor.
 
@@ -43,12 +47,30 @@ pub type DeviceIndependentPoint = Point2D<f32, DeviceIndependentPixel>;
 pub type DeviceIndependentVector2D = Vector2D<f32, DeviceIndependentPixel>;
 pub type DeviceIndependentSize = Size2D<f32, DeviceIndependentPixel>;
 
+pub type FastLayoutTransform = FastTransform<LayoutPixel, LayoutPixel>;
+
 // An Au is an "App Unit" and represents 1/60th of a CSS pixel.  It was
 // originally proposed in 2002 as a standard unit of measure in Gecko.
 // See https://bugzilla.mozilla.org/show_bug.cgi?id=177805 for more info.
 
 pub trait MaxRect {
     fn max_rect() -> Self;
+}
+
+/// A helper function to convert a Device rect to CSS pixels.
+pub fn convert_rect_to_css_pixel(
+    rect: DeviceIntRect,
+    scale: Scale<f32, DeviceIndependentPixel, DevicePixel>,
+) -> DeviceIndependentIntRect {
+    (rect.to_f32() / scale).round().to_i32()
+}
+
+/// A helper function to convert a Device size to CSS pixels.
+pub fn convert_size_to_css_pixel(
+    size: DeviceIntSize,
+    scale: Scale<f32, DeviceIndependentPixel, DevicePixel>,
+) -> DeviceIndependentIntSize {
+    (size.to_f32() / scale).round().to_i32()
 }
 
 impl MaxRect for UntypedRect<Au> {

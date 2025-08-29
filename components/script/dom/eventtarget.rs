@@ -11,16 +11,13 @@ use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
-use content_security_policy as csp;
 use deny_public_fields::DenyPublicFields;
 use dom_struct::dom_struct;
 use fnv::FnvHasher;
-use js::jsapi::JS_GetFunctionObject;
+use js::jsapi::JS::CompileFunction;
+use js::jsapi::{JS_GetFunctionObject, SupportUnscopables};
 use js::jsval::JSVal;
-use js::rust::wrappers::CompileFunction;
-use js::rust::{
-    CompileOptionsWrapper, HandleObject, RootedObjectVectorWrapper, transform_u16_to_source_text,
-};
+use js::rust::{CompileOptionsWrapper, HandleObject, transform_u16_to_source_text};
 use libc::c_char;
 use servo_url::ServoUrl;
 use style::str::HTML_SPACE_CHARACTERS;
@@ -56,10 +53,11 @@ use crate::dom::bindings::reflector::{
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::HashMapTracedValues;
+use crate::dom::csp::{CspReporting, InlineCheckType};
 use crate::dom::document::Document;
 use crate::dom::element::Element;
 use crate::dom::errorevent::ErrorEvent;
-use crate::dom::event::{Event, EventBubbles, EventCancelable, EventStatus};
+use crate::dom::event::{Event, EventBubbles, EventCancelable, EventComposed};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlformelement::FormControlElementHelpers;
 use crate::dom::node::{Node, NodeTraits};
@@ -70,14 +68,136 @@ use crate::dom::workerglobalscope::WorkerGlobalScope;
 use crate::realms::{InRealm, enter_realm};
 use crate::script_runtime::CanGc;
 
+/// <https://html.spec.whatwg.org/multipage/#event-handler-content-attributes>
+/// containing the values from
+/// <https://html.spec.whatwg.org/multipage/#globaleventhandlers> and
+/// <https://html.spec.whatwg.org/multipage/#windoweventhandlers> as well as
+/// specific attributes for elements
+static CONTENT_EVENT_HANDLER_NAMES: [&str; 108] = [
+    "onabort",
+    "onauxclick",
+    "onbeforeinput",
+    "onbeforematch",
+    "onbeforetoggle",
+    "onblur",
+    "oncancel",
+    "oncanplay",
+    "oncanplaythrough",
+    "onchange",
+    "onclick",
+    "onclose",
+    "oncommand",
+    "oncontextlost",
+    "oncontextmenu",
+    "oncontextrestored",
+    "oncopy",
+    "oncuechange",
+    "oncut",
+    "ondblclick",
+    "ondrag",
+    "ondragend",
+    "ondragenter",
+    "ondragleave",
+    "ondragover",
+    "ondragstart",
+    "ondrop",
+    "ondurationchange",
+    "onemptied",
+    "onended",
+    "onerror",
+    "onfocus",
+    "onformdata",
+    "oninput",
+    "oninvalid",
+    "onkeydown",
+    "onkeypress",
+    "onkeyup",
+    "onload",
+    "onloadeddata",
+    "onloadedmetadata",
+    "onloadstart",
+    "onmousedown",
+    "onmouseenter",
+    "onmouseleave",
+    "onmousemove",
+    "onmouseout",
+    "onmouseover",
+    "onmouseup",
+    "onpaste",
+    "onpause",
+    "onplay",
+    "onplaying",
+    "onprogress",
+    "onratechange",
+    "onreset",
+    "onresize",
+    "onscroll",
+    "onscrollend",
+    "onsecuritypolicyviolation",
+    "onseeked",
+    "onseeking",
+    "onselect",
+    "onslotchange",
+    "onstalled",
+    "onsubmit",
+    "onsuspend",
+    "ontimeupdate",
+    "ontoggle",
+    "onvolumechange",
+    "onwaiting",
+    "onwebkitanimationend",
+    "onwebkitanimationiteration",
+    "onwebkitanimationstart",
+    "onwebkittransitionend",
+    "onwheel",
+    // https://drafts.csswg.org/css-animations/#interface-globaleventhandlers-idl
+    "onanimationstart",
+    "onanimationiteration",
+    "onanimationend",
+    "onanimationcancel",
+    // https://drafts.csswg.org/css-transitions/#interface-globaleventhandlers-idl
+    "ontransitionrun",
+    "ontransitionend",
+    "ontransitioncancel",
+    // https://w3c.github.io/selection-api/#extensions-to-globaleventhandlers-interface
+    "onselectstart",
+    "onselectionchange",
+    // https://html.spec.whatwg.org/multipage/#windoweventhandlers
+    "onafterprint",
+    "onbeforeprint",
+    "onbeforeunload",
+    "onhashchange",
+    "onlanguagechange",
+    "onmessage",
+    "onmessageerror",
+    "onoffline",
+    "ononline",
+    "onpagehide",
+    "onpagereveal",
+    "onpageshow",
+    "onpageswap",
+    "onpopstate",
+    "onrejectionhandled",
+    "onstorage",
+    "onunhandledrejection",
+    "onunload",
+    // https://w3c.github.io/encrypted-media/#attributes-3
+    "onencrypted",
+    "onwaitingforkey",
+    // https://svgwg.org/svg2-draft/interact.html#AnimationEvents
+    "onbegin",
+    "onend",
+    "onrepeat",
+];
+
 #[derive(Clone, JSTraceable, MallocSizeOf, PartialEq)]
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum CommonEventHandler {
-    EventHandler(#[ignore_malloc_size_of = "Rc"] Rc<EventHandlerNonNull>),
+    EventHandler(#[conditional_malloc_size_of] Rc<EventHandlerNonNull>),
 
-    ErrorEventHandler(#[ignore_malloc_size_of = "Rc"] Rc<OnErrorEventHandlerNonNull>),
+    ErrorEventHandler(#[conditional_malloc_size_of] Rc<OnErrorEventHandlerNonNull>),
 
-    BeforeUnloadEventHandler(#[ignore_malloc_size_of = "Rc"] Rc<OnBeforeUnloadEventHandlerNonNull>),
+    BeforeUnloadEventHandler(#[conditional_malloc_size_of] Rc<OnBeforeUnloadEventHandlerNonNull>),
 }
 
 impl CommonEventHandler {
@@ -141,7 +261,7 @@ fn get_compiled_handler(
 
 #[derive(Clone, JSTraceable, MallocSizeOf, PartialEq)]
 enum EventListenerType {
-    Additive(#[ignore_malloc_size_of = "Rc"] Rc<EventListener>),
+    Additive(#[conditional_malloc_size_of] Rc<EventListener>),
     Inline(RefCell<InlineEventListener>),
 }
 
@@ -287,7 +407,7 @@ impl CompiledEventListener {
                         ) {
                             let value = rooted_return_value.handle();
 
-                            //Step 5
+                            // Step 5
                             let should_cancel = value.is_boolean() && !value.to_boolean();
 
                             if should_cancel {
@@ -349,7 +469,7 @@ impl std::cmp::PartialEq for EventListenerEntry {
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 /// A mix of potentially uncompiled and compiled event listeners of the same type.
 pub(crate) struct EventListeners(
-    #[ignore_malloc_size_of = "Rc"] Vec<Rc<RefCell<EventListenerEntry>>>,
+    #[conditional_malloc_size_of] Vec<Rc<RefCell<EventListenerEntry>>>,
 );
 
 impl Deref for EventListeners {
@@ -432,7 +552,7 @@ impl EventTarget {
             .map_or(EventListeners(vec![]), |listeners| listeners.clone())
     }
 
-    pub(crate) fn dispatch_event(&self, event: &Event, can_gc: CanGc) -> EventStatus {
+    pub(crate) fn dispatch_event(&self, event: &Event, can_gc: CanGc) -> bool {
         event.dispatch(self, false, can_gc)
     }
 
@@ -556,11 +676,15 @@ impl EventTarget {
     ) {
         if let Some(element) = self.downcast::<Element>() {
             let doc = element.owner_document();
-            if doc.should_elements_inline_type_behavior_be_blocked(
-                element.upcast(),
-                csp::InlineCheckType::ScriptAttribute,
-                source,
-            ) == csp::CheckResult::Blocked
+            let global = &doc.global();
+            if global
+                .get_csp_list()
+                .should_elements_inline_type_behavior_be_blocked(
+                    global,
+                    element.upcast(),
+                    InlineCheckType::ScriptAttribute,
+                    source,
+                )
             {
                 return;
             }
@@ -642,7 +766,7 @@ impl EventTarget {
         };
 
         // Step 3.9, subsection Scope steps 1-6
-        let scopechain = RootedObjectVectorWrapper::new(*cx);
+        let scopechain = js::rust::EnvironmentChain::new(*cx, SupportUnscopables::Yes);
 
         if let Some(element) = element {
             scopechain.append(document.reflector().get_jsobject().get());
@@ -655,7 +779,7 @@ impl EventTarget {
         rooted!(in(*cx) let mut handler = unsafe {
             CompileFunction(
                 *cx,
-                scopechain.handle(),
+                scopechain.get(),
                 options.ptr,
                 name.as_ptr(),
                 args.len() as u32,
@@ -767,6 +891,7 @@ impl EventTarget {
             name,
             EventBubbles::DoesNotBubble,
             EventCancelable::NotCancelable,
+            EventComposed::NotComposed,
             can_gc,
         )
     }
@@ -777,6 +902,7 @@ impl EventTarget {
             name,
             EventBubbles::Bubbles,
             EventCancelable::NotCancelable,
+            EventComposed::NotComposed,
             can_gc,
         )
     }
@@ -787,6 +913,7 @@ impl EventTarget {
             name,
             EventBubbles::DoesNotBubble,
             EventCancelable::Cancelable,
+            EventComposed::NotComposed,
             can_gc,
         )
     }
@@ -801,19 +928,22 @@ impl EventTarget {
             name,
             EventBubbles::Bubbles,
             EventCancelable::Cancelable,
+            EventComposed::NotComposed,
             can_gc,
         )
     }
 
-    // https://dom.spec.whatwg.org/#concept-event-fire
+    /// <https://dom.spec.whatwg.org/#concept-event-fire>
     pub(crate) fn fire_event_with_params(
         &self,
         name: Atom,
         bubbles: EventBubbles,
         cancelable: EventCancelable,
+        composed: EventComposed,
         can_gc: CanGc,
     ) -> DomRoot<Event> {
         let event = Event::new(&self.global(), name, bubbles, cancelable, can_gc);
+        event.set_composed(composed.into());
         event.fire(self, can_gc);
         event
     }
@@ -948,6 +1078,11 @@ impl EventTarget {
             );
         }
     }
+
+    /// <https://html.spec.whatwg.org/multipage/#event-handler-content-attributes>
+    pub(crate) fn is_content_event_handler(name: &str) -> bool {
+        CONTENT_EVENT_HANDLER_NAMES.contains(&name)
+    }
 }
 
 impl EventTargetMethods<crate::DomTypeHolder> for EventTarget {
@@ -986,10 +1121,7 @@ impl EventTargetMethods<crate::DomTypeHolder> for EventTarget {
             return Err(Error::InvalidState);
         }
         event.set_trusted(false);
-        Ok(match self.dispatch_event(event, can_gc) {
-            EventStatus::Canceled => false,
-            EventStatus::NotCanceled => true,
-        })
+        Ok(self.dispatch_event(event, can_gc))
     }
 }
 

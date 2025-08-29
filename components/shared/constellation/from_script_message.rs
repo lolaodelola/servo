@@ -8,25 +8,28 @@ use std::collections::HashMap;
 use std::fmt;
 
 use base::Epoch;
+use base::generic_channel::{GenericSender, SendResult};
 use base::id::{
     BroadcastChannelRouterId, BrowsingContextId, HistoryStateId, MessagePortId,
     MessagePortRouterId, PipelineId, ServiceWorkerId, ServiceWorkerRegistrationId, WebViewId,
 };
 use canvas_traits::canvas::{CanvasId, CanvasMsg};
+use compositing_traits::CrossProcessCompositorApi;
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, WorkerId};
 use embedder_traits::{
     AnimationState, EmbedderMsg, FocusSequenceNumber, JSValue, JavaScriptEvaluationError,
-    JavaScriptEvaluationId, MediaSessionEvent, TouchEventResult, ViewportDetails,
+    JavaScriptEvaluationId, MediaSessionEvent, Theme, TouchEventResult, ViewportDetails,
     WebDriverMessageId,
 };
 use euclid::default::Size2D as UntypedSize2D;
+use fonts_traits::SystemFontServiceProxySender;
 use http::{HeaderMap, Method};
-use ipc_channel::Error as IpcError;
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
+use malloc_size_of_derive::MallocSizeOf;
 use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{Destination, InsecureRequestsPolicy, Referrer, RequestBody};
 use net_traits::storage_thread::StorageType;
-use net_traits::{CoreResourceMsg, ReferrerPolicy, ResourceThreads};
+use net_traits::{ReferrerPolicy, ResourceThreads};
 use profile_traits::mem::MemoryReportResult;
 use profile_traits::{mem, time as profile_time};
 use serde::{Deserialize, Serialize};
@@ -36,23 +39,23 @@ use strum_macros::IntoStaticStr;
 use webgpu_traits::{WebGPU, WebGPUAdapterResponse};
 use webrender_api::ImageKey;
 
-use crate::structured_data::{BroadcastMsg, StructuredSerializedData};
+use crate::structured_data::{BroadcastChannelMsg, StructuredSerializedData};
 use crate::{
     LogEntry, MessagePortMsg, PortMessageTask, PortTransferInfo, TraversalDirection, WindowSizeType,
 };
 
 /// A Script to Constellation channel.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ScriptToConstellationChan {
     /// Sender for communicating with constellation thread.
-    pub sender: IpcSender<(PipelineId, ScriptToConstellationMessage)>,
+    pub sender: GenericSender<(PipelineId, ScriptToConstellationMessage)>,
     /// Used to identify the origin of the message.
     pub pipeline_id: PipelineId,
 }
 
 impl ScriptToConstellationChan {
     /// Send ScriptMsg and attach the pipeline_id to the message.
-    pub fn send(&self, msg: ScriptToConstellationMessage) -> Result<(), IpcError> {
+    pub fn send(&self, msg: ScriptToConstellationMessage) -> SendResult {
         self.sender.send((self.pipeline_id, msg))
     }
 }
@@ -204,8 +207,12 @@ pub struct DOMMessage {
 pub struct SWManagerSenders {
     /// Sender of messages to the constellation.
     pub swmanager_sender: IpcSender<SWManagerMsg>,
-    /// Sender for communicating with resource thread.
-    pub resource_sender: IpcSender<CoreResourceMsg>,
+    /// [`ResourceThreads`] for initating fetches or using i/o.
+    pub resource_threads: ResourceThreads,
+    /// [`CrossProcessCompositorApi`] for communicating with the compositor.
+    pub compositor_api: CrossProcessCompositorApi,
+    /// The [`SystemFontServiceProxy`] used to communicate with the `SystemFontService`.
+    pub system_font_service_sender: SystemFontServiceProxySender,
     /// Sender of messages to the manager.
     pub own_sender: IpcSender<ServiceWorkerMsg>,
     /// Receiver of messages from the constellation.
@@ -214,6 +221,7 @@ pub struct SWManagerSenders {
 
 /// Messages sent to Service Worker Manager thread
 #[derive(Debug, Deserialize, Serialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ServiceWorkerMsg {
     /// Timeout message sent by active service workers
     Timeout(ServoUrl),
@@ -417,6 +425,8 @@ pub struct IFrameLoadInfoWithData {
     pub sandbox: IFrameSandboxState,
     /// The initial viewport size for this iframe.
     pub viewport_details: ViewportDetails,
+    /// The [`Theme`] to use within this iframe.
+    pub theme: Theme,
 }
 
 /// Resources required by workerglobalscopes
@@ -441,7 +451,7 @@ pub struct WorkerGlobalScopeInit {
     /// The origin
     pub origin: ImmutableOrigin,
     /// The creation URL
-    pub creation_url: Option<ServoUrl>,
+    pub creation_url: ServoUrl,
     /// True if secure context
     pub inherited_secure_context: Option<bool>,
 }
@@ -503,7 +513,7 @@ pub enum ScriptToConstellationMessage {
     /// A global has started managing broadcast-channels.
     NewBroadcastChannelRouter(
         BroadcastChannelRouterId,
-        IpcSender<BroadcastMsg>,
+        IpcSender<BroadcastChannelMsg>,
         ImmutableOrigin,
     ),
     /// A global has stopped managing broadcast-channels.
@@ -514,7 +524,7 @@ pub enum ScriptToConstellationMessage {
     RemoveBroadcastChannelNameInRouter(BroadcastChannelRouterId, String, ImmutableOrigin),
     /// Broadcast a message to all same-origin broadcast channels,
     /// excluding the source of the broadcast.
-    ScheduleBroadcast(BroadcastChannelRouterId, BroadcastMsg),
+    ScheduleBroadcast(BroadcastChannelRouterId, BroadcastChannelMsg),
     /// Forward a message to the embedder.
     ForwardToEmbedder(EmbedderMsg),
     /// Broadcast a storage event to every same-origin pipeline.
@@ -532,7 +542,7 @@ pub enum ScriptToConstellationMessage {
     /// 2D canvases may use the GPU and we don't want to give untrusted content access to the GPU.)
     CreateCanvasPaintThread(
         UntypedSize2D<u64>,
-        IpcSender<(IpcSender<CanvasMsg>, CanvasId, ImageKey)>,
+        IpcSender<Option<(IpcSender<CanvasMsg>, CanvasId, ImageKey)>>,
     ),
     /// Notifies the constellation that this pipeline is requesting focus.
     ///

@@ -90,8 +90,7 @@ use line::{
 use line_breaker::LineBreaker;
 use malloc_size_of_derive::MallocSizeOf;
 use range::Range;
-use script::layout_dom::ServoLayoutNode;
-use script_layout_interface::wrapper_traits::{LayoutNode, ThreadSafeLayoutNode};
+use script::layout_dom::ServoThreadSafeLayoutNode;
 use servo_arc::Arc;
 use style::Zero;
 use style::computed_values::text_wrap_mode::T as TextWrapMode;
@@ -114,23 +113,19 @@ use webrender_api::FontInstanceKey;
 use xi_unicode::linebreak_property;
 
 use super::float::{Clear, PlacementAmongFloats};
-use super::{
-    CacheableLayoutResult, IndependentFloatOrAtomicLayoutResult,
-    IndependentFormattingContextContents,
-};
+use super::{CacheableLayoutResult, IndependentFloatOrAtomicLayoutResult};
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
 use crate::dom_traversal::NodeAndStyleInfo;
 use crate::flow::CollapsibleWithParentStartMargin;
 use crate::flow::float::{FloatBox, SequentialLayoutState};
-use crate::formatting_contexts::{
-    Baselines, IndependentFormattingContext, IndependentNonReplacedContents,
-};
+use crate::formatting_contexts::{Baselines, IndependentFormattingContext};
 use crate::fragment_tree::{
     BoxFragment, CollapsedBlockMargins, CollapsedMargin, Fragment, FragmentFlags,
     PositioningFragment,
 };
 use crate::geom::{LogicalRect, LogicalVec2, ToLogical};
+use crate::layout_box_base::LayoutBoxBase;
 use crate::positioned::{AbsolutelyPositionedBox, PositioningContext};
 use crate::sizing::{ComputeInlineContentSizes, ContentSizes, InlineContentSizesResult};
 use crate::style_ext::{ComputedValuesExt, PaddingBorderMargin};
@@ -170,7 +165,8 @@ pub(crate) struct InlineFormattingContext {
     /// Whether or not this [`InlineFormattingContext`] contains floats.
     pub(super) contains_floats: bool,
 
-    /// Whether or not this is an [`InlineFormattingContext`] for a single line text input.
+    /// Whether or not this is an [`InlineFormattingContext`] for a single line text input's inner
+    /// text container.
     pub(super) is_single_line_text_input: bool,
 
     /// Whether or not this is an [`InlineFormattingContext`] has right-to-left content, which
@@ -192,7 +188,7 @@ impl From<&NodeAndStyleInfo<'_>> for SharedInlineStyles {
     fn from(info: &NodeAndStyleInfo) -> Self {
         Self {
             style: SharedStyle::new(info.style.clone()),
-            selected: SharedStyle::new(info.get_selected_style()),
+            selected: SharedStyle::new(info.node.selected_style()),
         }
     }
 }
@@ -226,7 +222,7 @@ impl InlineItem {
     pub(crate) fn repair_style(
         &self,
         context: &SharedStyleContext,
-        node: &ServoLayoutNode,
+        node: &ServoThreadSafeLayoutNode,
         new_style: &Arc<ComputedValues>,
     ) {
         match self {
@@ -251,10 +247,10 @@ impl InlineItem {
         }
     }
 
-    pub(crate) fn invalidate_cached_fragment(&self) {
+    pub(crate) fn clear_fragment_layout_cache(&self) {
         match self {
             InlineItem::StartInlineBox(inline_box) => {
-                inline_box.borrow().base.invalidate_cached_fragment()
+                inline_box.borrow().base.clear_fragment_layout_cache()
             },
             InlineItem::EndInlineBox | InlineItem::TextRun(..) => {},
             InlineItem::OutOfFlowAbsolutelyPositionedBox(positioned_box, ..) => {
@@ -262,36 +258,54 @@ impl InlineItem {
                     .borrow()
                     .context
                     .base
-                    .invalidate_cached_fragment();
+                    .clear_fragment_layout_cache();
             },
             InlineItem::OutOfFlowFloatBox(float_box) => float_box
                 .borrow()
                 .contents
                 .base
-                .invalidate_cached_fragment(),
+                .clear_fragment_layout_cache(),
             InlineItem::Atomic(independent_formatting_context, ..) => {
                 independent_formatting_context
                     .borrow()
                     .base
-                    .invalidate_cached_fragment();
+                    .clear_fragment_layout_cache()
             },
         }
     }
 
-    pub(crate) fn fragments(&self) -> Vec<Fragment> {
+    pub(crate) fn with_base<T>(&self, callback: impl Fn(&LayoutBoxBase) -> T) -> T {
         match self {
-            InlineItem::StartInlineBox(inline_box) => inline_box.borrow().base.fragments(),
+            InlineItem::StartInlineBox(inline_box) => callback(&inline_box.borrow().base),
             InlineItem::EndInlineBox | InlineItem::TextRun(..) => {
                 unreachable!("Should never have these kind of fragments attached to a DOM node")
             },
             InlineItem::OutOfFlowAbsolutelyPositionedBox(positioned_box, ..) => {
-                positioned_box.borrow().context.base.fragments()
+                callback(&positioned_box.borrow().context.base)
+            },
+            InlineItem::OutOfFlowFloatBox(float_box) => callback(&float_box.borrow().contents.base),
+            InlineItem::Atomic(independent_formatting_context, ..) => {
+                callback(&independent_formatting_context.borrow().base)
+            },
+        }
+    }
+
+    pub(crate) fn with_base_mut(&mut self, callback: impl Fn(&mut LayoutBoxBase)) {
+        match self {
+            InlineItem::StartInlineBox(inline_box) => {
+                callback(&mut inline_box.borrow_mut().base);
+            },
+            InlineItem::EndInlineBox | InlineItem::TextRun(..) => {
+                unreachable!("Should never have these kind of fragments attached to a DOM node")
+            },
+            InlineItem::OutOfFlowAbsolutelyPositionedBox(positioned_box, ..) => {
+                callback(&mut positioned_box.borrow_mut().context.base)
             },
             InlineItem::OutOfFlowFloatBox(float_box) => {
-                float_box.borrow().contents.base.fragments()
+                callback(&mut float_box.borrow_mut().contents.base)
             },
             InlineItem::Atomic(independent_formatting_context, ..) => {
-                independent_formatting_context.borrow().base.fragments()
+                callback(&mut independent_formatting_context.borrow_mut().base)
             },
         }
     }
@@ -1634,15 +1648,7 @@ impl From<&InheritedText> for SegmentContentFlags {
 }
 
 impl InlineFormattingContext {
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            name = "InlineFormattingContext::new_with_builder",
-            skip_all,
-            fields(servo_profiling = true),
-            level = "trace",
-        )
-    )]
+    #[servo_tracing::instrument(name = "InlineFormattingContext::new_with_builder", skip_all)]
     pub(super) fn new_with_builder(
         builder: InlineFormattingContextBuilder,
         layout_context: &LayoutContext,
@@ -1708,9 +1714,13 @@ impl InlineFormattingContext {
         }
     }
 
-    pub(crate) fn repair_style(&self, node: &ServoLayoutNode, new_style: &Arc<ComputedValues>) {
+    pub(crate) fn repair_style(
+        &self,
+        node: &ServoThreadSafeLayoutNode,
+        new_style: &Arc<ComputedValues>,
+    ) {
         *self.shared_inline_styles.style.borrow_mut() = new_style.clone();
-        *self.shared_inline_styles.selected.borrow_mut() = node.to_threadsafe().selected_style();
+        *self.shared_inline_styles.selected.borrow_mut() = node.selected_style();
     }
 
     pub(super) fn layout(
@@ -2084,11 +2094,8 @@ impl IndependentFormattingContext {
             .content_rect
             .translate(pbm_physical_offset.to_vector());
 
-        // Apply baselines if necessary.
-        let mut fragment = match baselines {
-            Some(baselines) => fragment.with_baselines(baselines),
-            None => fragment,
-        };
+        // Apply baselines.
+        fragment = fragment.with_baselines(baselines);
 
         // Lay out absolutely positioned children if this new atomic establishes a containing block
         // for absolutes.
@@ -2163,12 +2170,8 @@ impl IndependentFormattingContext {
         match self.style().clone_baseline_source() {
             BaselineSource::First => baselines.first,
             BaselineSource::Last => baselines.last,
-            BaselineSource::Auto => match &self.contents {
-                IndependentFormattingContextContents::NonReplaced(
-                    IndependentNonReplacedContents::Flow(_),
-                ) => baselines.last,
-                _ => baselines.first,
-            },
+            BaselineSource::Auto if self.is_block_container() => baselines.last,
+            BaselineSource::Auto => baselines.first,
         }
     }
 
@@ -2252,8 +2255,9 @@ fn line_height(
         LineHeight::Length(length) => length.0.into(),
     };
 
-    // Single line text inputs line height is clamped to the size of `normal`. See
-    // <https://github.com/whatwg/html/pull/5462>.
+    // The line height of a single-line text input's inner text container is clamped to
+    // the size of `normal`.
+    // <https://html.spec.whatwg.org/multipage/#the-input-element-as-a-text-entry-widget>
     if is_single_line_text_input {
         line_height.max_assign(font_metrics.line_gap);
     }

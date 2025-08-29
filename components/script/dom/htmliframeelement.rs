@@ -42,7 +42,7 @@ use crate::dom::element::{
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::{Node, NodeDamage, NodeTraits, UnbindContext};
+use crate::dom::node::{BindContext, Node, NodeDamage, NodeTraits, UnbindContext};
 use crate::dom::trustedhtml::TrustedHTML;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::windowproxy::WindowProxy;
@@ -166,16 +166,14 @@ impl HTMLIFrameElement {
         if load_data.url.scheme() == "javascript" {
             let window_proxy = self.GetContentWindow();
             if let Some(window_proxy) = window_proxy {
-                if document
-                    .global()
-                    .should_navigation_request_be_blocked(&load_data)
-                {
+                if !ScriptThread::navigate_to_javascript_url(
+                    &document.global(),
+                    &window_proxy.global(),
+                    &mut load_data,
+                    Some(self.upcast()),
+                    can_gc,
+                ) {
                     return;
-                }
-                // Important re security. See https://github.com/servo/servo/issues/23373
-                if ScriptThread::check_load_origin(&load_data.load_origin, &document.url().origin())
-                {
-                    ScriptThread::eval_js_url(&window_proxy.global(), &mut load_data, can_gc);
                 }
             }
         }
@@ -207,7 +205,7 @@ impl HTMLIFrameElement {
         };
 
         let viewport_details = window
-            .get_iframe_viewport_details_if_known(browsing_context_id, can_gc)
+            .get_iframe_viewport_details_if_known(browsing_context_id)
             .unwrap_or_else(|| ViewportDetails {
                 hidpi_scale_factor: window.device_pixel_ratio(),
                 ..Default::default()
@@ -223,6 +221,7 @@ impl HTMLIFrameElement {
                     old_pipeline_id,
                     sandbox: sandboxed,
                     viewport_details,
+                    theme: window.theme(),
                 };
                 window
                     .as_global_scope()
@@ -238,6 +237,7 @@ impl HTMLIFrameElement {
                     opener: None,
                     load_data,
                     viewport_details,
+                    theme: window.theme(),
                 };
 
                 self.pipeline_id.set(Some(new_pipeline_id));
@@ -250,6 +250,7 @@ impl HTMLIFrameElement {
                     old_pipeline_id,
                     sandbox: sandboxed,
                     viewport_details,
+                    theme: window.theme(),
                 };
                 window
                     .as_global_scope()
@@ -470,7 +471,7 @@ impl HTMLIFrameElement {
             LoadBlocker::terminate(blocker, can_gc);
         }
 
-        self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+        self.upcast::<Node>().dirty(NodeDamage::Other);
     }
 
     fn new_inherited(
@@ -610,16 +611,18 @@ impl HTMLIFrameElementMethods<crate::DomTypeHolder> for HTMLIFrameElement {
         // Get Trusted Type compliant string algorithm with TrustedHTML,
         // this's relevant global object, the given value, "HTMLIFrameElement srcdoc", and "script".
         let element = self.upcast::<Element>();
-        let local_name = &local_name!("srcdoc");
         let value = TrustedHTML::get_trusted_script_compliant_string(
             &element.owner_global(),
             value,
-            "HTMLIFrameElement",
-            local_name,
+            "HTMLIFrameElement srcdoc",
             can_gc,
         )?;
         // Step 2: Set an attribute value given this, srcdoc's local name, and compliantString.
-        element.set_attribute(local_name, AttrValue::String(value), can_gc);
+        element.set_attribute(
+            &local_name!("srcdoc"),
+            AttrValue::String(value.as_ref().to_owned()),
+            can_gc,
+        );
         Ok(())
     }
 
@@ -803,6 +806,13 @@ impl VirtualMethods for HTMLIFrameElement {
         }
     }
 
+    fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
+        if let Some(s) = self.super_type() {
+            s.bind_to_tree(context, can_gc);
+        }
+        self.owner_document().invalidate_iframes_collection();
+    }
+
     fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
         self.super_type().unwrap().unbind_from_tree(context, can_gc);
 
@@ -855,5 +865,7 @@ impl VirtualMethods for HTMLIFrameElement {
         // a new iframe. Without this, the constellation gets very
         // confused.
         self.destroy_nested_browsing_context();
+
+        self.owner_document().invalidate_iframes_collection();
     }
 }

@@ -8,6 +8,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::{slice, thread};
 
+use base::generic_channel::RoutedReceiver;
 use bitflags::bitflags;
 use byteorder::{ByteOrder, NativeEndian, WriteBytesExt};
 use canvas_traits::webgl;
@@ -22,7 +23,10 @@ use canvas_traits::webgl::{
     WebGLSLVersion, WebGLSamplerId, WebGLSender, WebGLShaderId, WebGLSyncId, WebGLTextureId,
     WebGLVersion, WebGLVertexArrayId, YAxisTreatment,
 };
-use compositing_traits::{WebrenderExternalImageRegistry, WebrenderImageHandlerType};
+use compositing_traits::{
+    CrossProcessCompositorApi, SerializableImageData, WebrenderExternalImageRegistry,
+    WebrenderImageHandlerType,
+};
 use euclid::default::Size2D;
 use fnv::FnvHashMap;
 use glow::{
@@ -34,17 +38,17 @@ use half::f16;
 use ipc_channel::ipc::IpcSharedMemory;
 use itertools::Itertools;
 use log::{debug, error, trace, warn};
-use pixels::{self, PixelFormat, unmultiply_inplace};
+use pixels::{self, PixelFormat, SnapshotAlphaMode, unmultiply_inplace};
 use surfman::chains::{PreserveBuffer, SwapChains, SwapChainsAPI};
 use surfman::{
     self, Adapter, Connection, Context, ContextAttributeFlags, ContextAttributes, Device,
     GLVersion, SurfaceAccess, SurfaceInfo, SurfaceType,
 };
-use webrender::{RenderApi, RenderApiSender, Transaction};
+use webrender::{RenderApi, RenderApiSender};
 use webrender_api::units::DeviceIntSize;
 use webrender_api::{
-    DirtyRect, DocumentId, ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind,
-    ImageData, ImageDescriptor, ImageDescriptorFlags, ImageFormat, ImageKey,
+    ExternalImageData, ExternalImageId, ExternalImageType, ImageBufferKind, ImageDescriptor,
+    ImageDescriptorFlags, ImageFormat, ImageKey,
 };
 
 use crate::webgl_limits::GLLimitsDetect;
@@ -202,8 +206,8 @@ pub(crate) struct WebGLThread {
     /// The GPU device.
     device: Device,
     /// Channel used to generate/update or delete `ImageKey`s.
+    compositor_api: CrossProcessCompositorApi,
     webrender_api: RenderApi,
-    webrender_doc: DocumentId,
     /// Map of live WebGLContexts.
     contexts: FnvHashMap<WebGLContextId, GLContextData>,
     /// Cached information for WebGLContexts.
@@ -214,7 +218,7 @@ pub(crate) struct WebGLThread {
     /// We use it to get an unique ID for new WebGLContexts.
     external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
     /// The receiver that will be used for processing WebGL messages.
-    receiver: crossbeam_channel::Receiver<WebGLMsg>,
+    receiver: RoutedReceiver<WebGLMsg>,
     /// The receiver that should be used to send WebGL messages for processing.
     sender: WebGLSender<WebGLMsg>,
     /// The swap chains used by webrender
@@ -228,8 +232,8 @@ pub(crate) struct WebGLThread {
 
 /// The data required to initialize an instance of the WebGLThread type.
 pub(crate) struct WebGLThreadInit {
+    pub compositor_api: CrossProcessCompositorApi,
     pub webrender_api_sender: RenderApiSender,
-    pub webrender_doc: DocumentId,
     pub external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
     pub sender: WebGLSender<WebGLMsg>,
     pub receiver: WebGLReceiver<WebGLMsg>,
@@ -248,8 +252,8 @@ impl WebGLThread {
     /// Create a new instance of WebGLThread.
     pub(crate) fn new(
         WebGLThreadInit {
+            compositor_api,
             webrender_api_sender,
-            webrender_doc,
             external_images,
             sender,
             receiver,
@@ -265,14 +269,14 @@ impl WebGLThread {
             device: connection
                 .create_device(&adapter)
                 .expect("Couldn't open WebGL device!"),
+            compositor_api,
             webrender_api: webrender_api_sender.create_api(),
-            webrender_doc,
             contexts: Default::default(),
             cached_context_info: Default::default(),
             bound_context_id: None,
             external_images,
             sender,
-            receiver: receiver.into_inner(),
+            receiver: receiver.route_preserving_errors(),
             webrender_swap_chains,
             api_type,
             #[cfg(feature = "webxr")]
@@ -294,7 +298,7 @@ impl WebGLThread {
 
     fn process(&mut self) {
         let webgl_chan = WebGLChan(self.sender.clone());
-        while let Ok(msg) = self.receiver.recv() {
+        while let Ok(Ok(msg)) = self.receiver.recv() {
             let exit = self.handle_msg(msg, &webgl_chan);
             if exit {
                 break;
@@ -648,8 +652,7 @@ impl WebGLThread {
         );
 
         let image_key = Self::create_wr_external_image(
-            &mut self.webrender_api,
-            self.webrender_doc,
+            &self.compositor_api,
             size.to_i32(),
             has_alpha,
             id,
@@ -717,9 +720,7 @@ impl WebGLThread {
     fn remove_webgl_context(&mut self, context_id: WebGLContextId) {
         // Release webrender image keys.
         if let Some(info) = self.cached_context_info.remove(&context_id) {
-            let mut txn = Transaction::new();
-            txn.delete_image(info.image_key);
-            self.webrender_api.send_transaction(self.webrender_doc, txn)
+            self.compositor_api.delete_image(info.image_key);
         }
 
         // We need to make the context current so its resources can be disposed of.
@@ -898,8 +899,7 @@ impl WebGLThread {
 
     /// Creates a `webrender_api::ImageKey` that uses shared textures.
     fn create_wr_external_image(
-        webrender_api: &mut RenderApi,
-        webrender_doc: DocumentId,
+        compositor_api: &CrossProcessCompositorApi,
         size: Size2D<i32>,
         alpha: bool,
         context_id: WebGLContextId,
@@ -908,10 +908,8 @@ impl WebGLThread {
         let descriptor = Self::image_descriptor(size, alpha);
         let data = Self::external_image_data(context_id, image_buffer_kind);
 
-        let image_key = webrender_api.generate_image_key();
-        let mut txn = Transaction::new();
-        txn.add_image(image_key, descriptor, data, None);
-        webrender_api.send_transaction(webrender_doc, txn);
+        let image_key = compositor_api.generate_image_key_blocking().unwrap();
+        compositor_api.add_image(image_key, descriptor, data);
 
         image_key
     }
@@ -930,9 +928,8 @@ impl WebGLThread {
         let descriptor = Self::image_descriptor(size, has_alpha);
         let image_data = Self::external_image_data(context_id, image_buffer_kind);
 
-        let mut txn = Transaction::new();
-        txn.update_image(info.image_key, descriptor, image_data, &DirtyRect::All);
-        self.webrender_api.send_transaction(self.webrender_doc, txn);
+        self.compositor_api
+            .update_image(info.image_key, descriptor, image_data);
     }
 
     /// Helper function to create a `ImageDescriptor`.
@@ -952,14 +949,14 @@ impl WebGLThread {
     fn external_image_data(
         context_id: WebGLContextId,
         image_buffer_kind: ImageBufferKind,
-    ) -> ImageData {
+    ) -> SerializableImageData {
         let data = ExternalImageData {
             id: ExternalImageId(context_id.0),
             channel_index: 0,
             image_type: ExternalImageType::TextureHandle(image_buffer_kind),
             normalized_uvs: false,
         };
-        ImageData::External(data)
+        SerializableImageData::External(data)
     }
 
     /// Gets the GLSL Version supported by a GLContext.
@@ -1215,8 +1212,8 @@ impl WebGLImpl {
                     )
                 };
                 let alpha_mode = match (attributes.alpha, attributes.premultiplied_alpha) {
-                    (true, premultiplied) => snapshot::AlphaMode::Transparent { premultiplied },
-                    (false, _) => snapshot::AlphaMode::Opaque,
+                    (true, premultiplied) => SnapshotAlphaMode::Transparent { premultiplied },
+                    (false, _) => SnapshotAlphaMode::Opaque,
                 };
                 sender
                     .send((IpcSharedMemory::from_bytes(&pixels), alpha_mode))
@@ -1585,6 +1582,48 @@ impl WebGLImpl {
             },
             WebGLCommand::SetViewport(x, y, width, height) => unsafe {
                 gl.viewport(x, y, width, height)
+            },
+            WebGLCommand::TexImage3D {
+                target,
+                level,
+                internal_format,
+                size,
+                depth,
+                format,
+                data_type,
+                effective_data_type,
+                unpacking_alignment,
+                alpha_treatment,
+                y_axis_treatment,
+                pixel_format,
+                ref data,
+            } => {
+                let pixels = prepare_pixels(
+                    internal_format,
+                    data_type,
+                    size,
+                    unpacking_alignment,
+                    alpha_treatment,
+                    y_axis_treatment,
+                    pixel_format,
+                    Cow::Borrowed(data),
+                );
+
+                unsafe {
+                    gl.pixel_store_i32(gl::UNPACK_ALIGNMENT, unpacking_alignment as i32);
+                    gl.tex_image_3d(
+                        target,
+                        level as i32,
+                        internal_format.as_gl_constant() as i32,
+                        size.width as i32,
+                        size.height as i32,
+                        depth as i32,
+                        0,
+                        format.as_gl_constant(),
+                        effective_data_type,
+                        PixelUnpackData::Slice(Some(&pixels)),
+                    );
+                }
             },
             WebGLCommand::TexImage2D {
                 target,

@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use arrayvec::ArrayVec;
 use dom_struct::dom_struct;
 use ipc_channel::ipc::{self};
-use snapshot::Snapshot;
+use pixels::Snapshot;
 use webgpu_traits::{
     ContextConfiguration, PRESENTATION_BUFFER_COUNT, WebGPU, WebGPUContextId, WebGPURequest,
     WebGPUTexture,
@@ -167,8 +167,8 @@ impl GPUCanvasContext {
             // causes FAIL on webgpu:web_platform,canvas,configure:usage:*
             usage: configuration.usage | GPUTextureUsageConstants::COPY_SRC,
             size: GPUExtent3D::GPUExtent3DDict(GPUExtent3DDict {
-                width: size.width as u32,
-                height: size.height as u32,
+                width: size.width,
+                height: size.height,
                 depthOrArrayLayers: 1,
             }),
             viewFormats: configuration.viewFormats.clone(),
@@ -276,6 +276,10 @@ impl CanvasContext for GPUCanvasContext {
         }
     }
 
+    fn reset_bitmap(&self) {
+        warn!("The GPUCanvasContext 'reset_bitmap' is not implemented yet");
+    }
+
     /// <https://gpuweb.github.io/gpuweb/#ref-for-abstract-opdef-get-a-copy-of-the-image-contents-of-a-context%E2%91%A5>
     fn get_image_data(&self) -> Option<Snapshot> {
         // 1. Return a copy of the image contents of context.
@@ -294,8 +298,8 @@ impl CanvasContext for GPUCanvasContext {
         })
     }
 
-    fn canvas(&self) -> HTMLCanvasElementOrOffscreenCanvas {
-        self.canvas.clone()
+    fn canvas(&self) -> Option<HTMLCanvasElementOrOffscreenCanvas> {
+        Some(self.canvas.clone())
     }
 }
 

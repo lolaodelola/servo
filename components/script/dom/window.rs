@@ -8,14 +8,16 @@ use std::cmp;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::default::Default;
+use std::ffi::c_void;
 use std::io::{Write, stderr, stdout};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use app_units::Au;
 use backtrace::Backtrace;
 use base::cross_process_instant::CrossProcessInstant;
+use base::generic_channel::GenericSender;
 use base::id::{BrowsingContextId, PipelineId, WebViewId};
 use base64::Engine;
 #[cfg(feature = "bluetooth")]
@@ -24,7 +26,7 @@ use canvas_traits::webgl::WebGLChan;
 use compositing_traits::CrossProcessCompositorApi;
 use constellation_traits::{
     DocumentState, LoadData, LoadOrigin, NavigationHistoryBehavior, ScriptToConstellationChan,
-    ScriptToConstellationMessage, ScrollState, StructuredSerializedData, WindowSizeType,
+    ScriptToConstellationMessage, StructuredSerializedData, WindowSizeType,
 };
 use crossbeam_channel::{Sender, unbounded};
 use cssparser::SourceLocation;
@@ -32,15 +34,14 @@ use devtools_traits::{ScriptToDevtoolsControlMsg, TimelineMarker, TimelineMarker
 use dom_struct::dom_struct;
 use embedder_traits::user_content_manager::{UserContentManager, UserScript};
 use embedder_traits::{
-    AlertResponse, ConfirmResponse, EmbedderMsg, GamepadEvent, GamepadSupportedHapticEffects,
-    GamepadUpdateType, PromptResponse, SimpleDialog, Theme, ViewportDetails, WebDriverJSError,
-    WebDriverJSResult,
+    AlertResponse, ConfirmResponse, EmbedderMsg, PromptResponse, SimpleDialog, Theme,
+    UntrustedNodeAddress, ViewportDetails, WebDriverJSError, WebDriverJSResult,
+    WebDriverLoadStatus,
 };
-use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect};
-use euclid::{Point2D, Rect, Scale, Size2D, Vector2D};
+use euclid::default::{Point2D as UntypedPoint2D, Rect as UntypedRect, Size2D as UntypedSize2D};
+use euclid::{Point2D, Scale, Size2D, Vector2D};
 use fonts::FontContext;
 use ipc_channel::ipc::{self, IpcSender};
-use js::conversions::ToJSValConvertible;
 use js::glue::DumpJSStack;
 use js::jsapi::{
     GCReason, Heap, JS_GC, JSAutoRealm, JSContext as RawJSContext, JSObject, JSPROP_ENUMERATE,
@@ -51,36 +52,36 @@ use js::rust::{
     CustomAutoRooter, CustomAutoRooterGuard, HandleObject, HandleValue, MutableHandleObject,
     MutableHandleValue,
 };
+use layout_api::{
+    BoxAreaType, ElementsFromPointFlags, ElementsFromPointResult, FragmentType, Layout,
+    PendingImage, PendingImageState, PendingRasterizationImage, QueryMsg, ReflowGoal,
+    ReflowPhasesRun, ReflowRequest, ReflowRequestRestyle, RestyleReason, TrustedNodeAddress,
+    combine_id_with_fragment_type,
+};
 use malloc_size_of::MallocSizeOf;
 use media::WindowGLContext;
 use net_traits::ResourceThreads;
 use net_traits::image_cache::{
-    ImageCache, ImageResponder, ImageResponse, PendingImageId, PendingImageResponse,
+    ImageCache, ImageCacheResponseMessage, ImageLoadListener, ImageResponse, PendingImageId,
+    PendingImageResponse, RasterizationCompleteResponse,
 };
 use net_traits::storage_thread::StorageType;
 use num_traits::ToPrimitive;
 use profile_traits::ipc as ProfiledIpc;
 use profile_traits::mem::ProfilerChan as MemProfilerChan;
 use profile_traits::time::ProfilerChan as TimeProfilerChan;
-use script_bindings::codegen::GenericBindings::NavigatorBinding::NavigatorMethods;
-use script_bindings::codegen::GenericBindings::PerformanceBinding::PerformanceMethods;
+use script_bindings::conversions::SafeToJSValConvertible;
 use script_bindings::interfaces::WindowHelpers;
 use script_bindings::root::Root;
-use script_layout_interface::{
-    FragmentType, Layout, PendingImageState, QueryMsg, Reflow, ReflowGoal, ReflowRequest,
-    TrustedNodeAddress, combine_id_with_fragment_type,
-};
-use script_traits::ScriptThreadMessage;
+use script_traits::{ConstellationInputEvent, ScriptThreadMessage};
 use selectors::attr::CaseSensitivity;
 use servo_arc::Arc as ServoArc;
 use servo_config::{opts, pref};
-use servo_geometry::{DeviceIndependentIntRect, MaxRect, f32_rect_to_au_rect};
+use servo_geometry::{DeviceIndependentIntRect, f32_rect_to_au_rect};
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
-use style::dom::OpaqueNode;
 use style::error_reporting::{ContextualParseError, ParseErrorReporter};
 use style::properties::PropertyId;
 use style::properties::style_structs::Font;
-use style::queries::values::PrefersColorScheme;
 use style::selector_parser::PseudoElement;
 use style::str::HTML_SPACE_CHARACTERS;
 use style::stylesheets::UrlExtraData;
@@ -88,10 +89,11 @@ use style_traits::CSSPixel;
 use stylo_atoms::Atom;
 use url::Position;
 use webrender_api::ExternalScrollId;
-use webrender_api::units::{DevicePixel, LayoutPixel};
+use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutPixel, LayoutPoint};
 
 use super::bindings::codegen::Bindings::MessagePortBinding::StructuredSerializeOptions;
 use super::bindings::trace::HashMapTracedValues;
+use super::types::SVGSVGElement;
 use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
     DocumentMethods, DocumentReadyState, NamedPropertyValue,
@@ -102,13 +104,16 @@ use crate::dom::bindings::codegen::Bindings::ImageBitmapBinding::{
     ImageBitmapOptions, ImageBitmapSource,
 };
 use crate::dom::bindings::codegen::Bindings::MediaQueryListBinding::MediaQueryList_Binding::MediaQueryListMethods;
+use crate::dom::bindings::codegen::Bindings::ReportingObserverBinding::Report;
 use crate::dom::bindings::codegen::Bindings::RequestBinding::RequestInit;
 use crate::dom::bindings::codegen::Bindings::VoidFunctionBinding::VoidFunction;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::{
     self, FrameRequestCallback, ScrollBehavior, ScrollToOptions, WindowMethods,
     WindowPostMessageOptions,
 };
-use crate::dom::bindings::codegen::UnionTypes::{RequestOrUSVString, StringOrFunction};
+use crate::dom::bindings::codegen::UnionTypes::{
+    RequestOrUSVString, TrustedScriptOrString, TrustedScriptOrStringOrFunction,
+};
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::num::Finite;
@@ -122,20 +127,21 @@ use crate::dom::bindings::utils::GlobalStaticData;
 use crate::dom::bindings::weakref::DOMTracker;
 #[cfg(feature = "bluetooth")]
 use crate::dom::bluetooth::BluetoothExtraPermissionData;
+use crate::dom::cookiestore::CookieStore;
 use crate::dom::crypto::Crypto;
 use crate::dom::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration, CSSStyleOwner};
 use crate::dom::customelementregistry::CustomElementRegistry;
-use crate::dom::document::{AnimationFrameCallback, Document, ReflowTriggerCondition};
+use crate::dom::document::{AnimationFrameCallback, Document};
 use crate::dom::element::Element;
-use crate::dom::event::{Event, EventBubbles, EventCancelable, EventStatus};
+use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::gamepad::{Gamepad, contains_user_gesture};
-use crate::dom::gamepadevent::GamepadEventType;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::hashchangeevent::HashChangeEvent;
 use crate::dom::history::History;
 use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
 use crate::dom::htmliframeelement::HTMLIFrameElement;
+use crate::dom::idbfactory::IDBFactory;
+use crate::dom::inputevent::HitTestResult;
 use crate::dom::location::Location;
 use crate::dom::medialist::MediaList;
 use crate::dom::mediaquerylist::{MediaQueryList, MediaQueryListMatchState};
@@ -145,6 +151,8 @@ use crate::dom::navigator::Navigator;
 use crate::dom::node::{Node, NodeDamage, NodeTraits, from_untrusted_node_address};
 use crate::dom::performance::Performance;
 use crate::dom::promise::Promise;
+use crate::dom::reportingendpoint::{ReportingEndpoint, SendReportsToEndpoints};
+use crate::dom::reportingobserver::ReportingObserver;
 use crate::dom::screen::Screen;
 use crate::dom::selection::Selection;
 use crate::dom::shadowroot::ShadowRoot;
@@ -152,8 +160,8 @@ use crate::dom::storage::Storage;
 #[cfg(feature = "bluetooth")]
 use crate::dom::testrunner::TestRunner;
 use crate::dom::trustedtypepolicyfactory::TrustedTypePolicyFactory;
-use crate::dom::types::UIEvent;
-use crate::dom::webglrenderingcontext::WebGLCommandSender;
+use crate::dom::types::{ImageBitmap, UIEvent};
+use crate::dom::webgl::webglrenderingcontext::WebGLCommandSender;
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::dom::windowproxy::{WindowProxy, WindowProxyHandler};
@@ -219,6 +227,13 @@ impl LayoutBlocker {
     }
 }
 
+/// An id used to cancel navigations; for now only used for planned form navigations.
+/// Loosely based on <https://html.spec.whatwg.org/multipage/#ongoing-navigation>.
+#[derive(Clone, Copy, Debug, Default, JSTraceable, MallocSizeOf, PartialEq)]
+pub(crate) struct OngoingNavigation(u32);
+
+type PendingImageRasterizationKey = (PendingImageId, DeviceIntSize);
+
 #[dom_struct]
 pub(crate) struct Window {
     globalscope: GlobalScope,
@@ -231,21 +246,17 @@ pub(crate) struct Window {
     #[no_trace]
     #[ignore_malloc_size_of = "TODO: Add MallocSizeOf support to layout"]
     layout: RefCell<Box<dyn Layout>>,
-    /// A [`FontContext`] which is used to store and match against fonts for this `Window` and to
-    /// trigger the download of web fonts.
-    #[no_trace]
-    #[conditional_malloc_size_of]
-    font_context: Arc<FontContext>,
     navigator: MutNullableDom<Navigator>,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
     image_cache: Arc<dyn ImageCache>,
     #[no_trace]
-    image_cache_sender: IpcSender<PendingImageResponse>,
+    image_cache_sender: IpcSender<ImageCacheResponseMessage>,
     window_proxy: MutNullableDom<WindowProxy>,
     document: MutNullableDom<Document>,
     location: MutNullableDom<Location>,
     history: MutNullableDom<History>,
+    indexeddb: MutNullableDom<IDBFactory>,
     custom_element_registry: MutNullableDom<CustomElementRegistry>,
     performance: MutNullableDom<Performance>,
     #[no_trace]
@@ -255,6 +266,10 @@ pub(crate) struct Window {
     local_storage: MutNullableDom<Storage>,
     status: DomRefCell<DOMString>,
     trusted_types: MutNullableDom<TrustedTypePolicyFactory>,
+
+    /// The start of something resembling
+    /// <https://html.spec.whatwg.org/multipage/#ongoing-navigation>
+    ongoing_navigation: Cell<OngoingNavigation>,
 
     /// For sending timeline markers. Will be ignored if
     /// no devtools server
@@ -269,7 +284,7 @@ pub(crate) struct Window {
 
     /// Platform theme.
     #[no_trace]
-    theme: Cell<PrefersColorScheme>,
+    theme: Cell<Theme>,
 
     /// Parent id associated with this page, if any.
     #[no_trace]
@@ -294,11 +309,6 @@ pub(crate) struct Window {
     #[cfg(feature = "bluetooth")]
     bluetooth_extra_permission_data: BluetoothExtraPermissionData,
 
-    /// An enlarged rectangle around the page contents visible in the viewport, used
-    /// to prevent creating display list items for content that is far away from the viewport.
-    #[no_trace]
-    page_clip_rect: Cell<UntypedRect<Au>>,
-
     /// See the documentation for [`LayoutBlocker`]. Essentially, this flag prevents
     /// layouts from happening before the first load event, apart from a few exceptional
     /// cases.
@@ -309,17 +319,19 @@ pub(crate) struct Window {
     #[no_trace]
     webdriver_script_chan: DomRefCell<Option<IpcSender<WebDriverJSResult>>>,
 
+    /// A channel to notify webdriver if there is a navigation
+    #[no_trace]
+    webdriver_load_status_sender: RefCell<Option<GenericSender<WebDriverLoadStatus>>>,
+
     /// The current state of the window object
     current_state: Cell<WindowState>,
 
+    /// The current size of the viewport. This might change if the `WebView` or containing `<iframe>`
+    /// for this `Window` object change.
     #[no_trace]
-    current_viewport: Cell<UntypedRect<Au>>,
+    current_viewport_size: Cell<UntypedSize2D<Au>>,
 
     error_reporter: CSSErrorReporter,
-
-    /// A list of scroll offsets for each scrollable element.
-    #[no_trace]
-    scroll_offsets: DomRefCell<HashMap<OpaqueNode, Vector2D<f32, LayoutPixel>>>,
 
     /// All the MediaQueryLists we need to update
     media_query_lists: DOMTracker<MediaQueryList>,
@@ -344,10 +356,16 @@ pub(crate) struct Window {
     pending_image_callbacks: DomRefCell<HashMap<PendingImageId, Vec<PendingImageCallback>>>,
 
     /// All of the elements that have an outstanding image request that was
-    /// initiated by layout during a reflow. They are stored in the script thread
+    /// initiated by layout during a reflow. They are stored in the [`ScriptThread`]
     /// to ensure that the element can be marked dirty when the image data becomes
     /// available at some point in the future.
     pending_layout_images: DomRefCell<HashMapTracedValues<PendingImageId, Vec<Dom<Node>>>>,
+
+    /// Vector images for which layout has intiated rasterization at a specific size
+    /// and whose results are not yet available. They are stored in the [`ScriptThread`]
+    /// so that the element can be marked dirty once the rasterization is completed.
+    pending_images_for_rasterization:
+        DomRefCell<HashMapTracedValues<PendingImageRasterizationKey, Vec<Dom<Node>>>>,
 
     /// Directory to store unminified css for this window if unminify-css
     /// opt is enabled.
@@ -373,9 +391,6 @@ pub(crate) struct Window {
     /// It is used to avoid sending idle message more than once, which is unneccessary.
     has_sent_idle_message: Cell<bool>,
 
-    /// Emits notifications when there is a relayout.
-    relayout_event: bool,
-
     /// Unminify Css.
     unminify_css: bool,
 
@@ -398,6 +413,16 @@ pub(crate) struct Window {
 
     /// <https://dom.spec.whatwg.org/#window-current-event>
     current_event: DomRefCell<Option<Dom<Event>>>,
+
+    /// <https://w3c.github.io/reporting/#windoworworkerglobalscope-registered-reporting-observer-list>
+    reporting_observer_list: DomRefCell<Vec<DomRoot<ReportingObserver>>>,
+
+    /// <https://w3c.github.io/reporting/#windoworworkerglobalscope-reports>
+    report_list: DomRefCell<Vec<Report>>,
+
+    /// <https://w3c.github.io/reporting/#windoworworkerglobalscope-endpoints>
+    #[no_trace]
+    endpoints_list: DomRefCell<Vec<ReportingEndpoint>>,
 }
 
 impl Window {
@@ -409,11 +434,11 @@ impl Window {
         self.upcast::<GlobalScope>()
     }
 
-    pub(crate) fn layout(&self) -> Ref<Box<dyn Layout>> {
+    pub(crate) fn layout(&self) -> Ref<'_, Box<dyn Layout>> {
         self.layout.borrow()
     }
 
-    pub(crate) fn layout_mut(&self) -> RefMut<Box<dyn Layout>> {
+    pub(crate) fn layout_mut(&self) -> RefMut<'_, Box<dyn Layout>> {
         self.layout.borrow_mut()
     }
 
@@ -469,7 +494,7 @@ impl Window {
         unsafe { JSContext::from_ptr(self.js_runtime.borrow().as_ref().unwrap().cx()) }
     }
 
-    pub(crate) fn get_js_runtime(&self) -> Ref<Option<Rc<Runtime>>> {
+    pub(crate) fn get_js_runtime(&self) -> Ref<'_, Option<Rc<Runtime>>> {
         self.js_runtime.borrow()
     }
 
@@ -500,6 +525,51 @@ impl Window {
     /// This can panic if it is called after the browsing context has been discarded
     pub(crate) fn window_proxy(&self) -> DomRoot<WindowProxy> {
         self.window_proxy.get().unwrap()
+    }
+
+    pub(crate) fn append_reporting_observer(&self, reporting_observer: DomRoot<ReportingObserver>) {
+        self.reporting_observer_list
+            .borrow_mut()
+            .push(reporting_observer);
+    }
+
+    pub(crate) fn remove_reporting_observer(&self, reporting_observer: &ReportingObserver) {
+        if let Some(index) = self
+            .reporting_observer_list
+            .borrow()
+            .iter()
+            .position(|observer| &**observer == reporting_observer)
+        {
+            self.reporting_observer_list.borrow_mut().remove(index);
+        }
+    }
+
+    pub(crate) fn registered_reporting_observers(&self) -> Vec<DomRoot<ReportingObserver>> {
+        self.reporting_observer_list.borrow().clone()
+    }
+
+    pub(crate) fn append_report(&self, report: Report) {
+        self.report_list.borrow_mut().push(report);
+        let trusted_window = Trusted::new(self);
+        self.upcast::<GlobalScope>()
+            .task_manager()
+            .dom_manipulation_task_source()
+            .queue(task!(send_to_reporting_endpoints: move || {
+                let window = trusted_window.root();
+                let reports = std::mem::take(&mut *window.report_list.borrow_mut());
+                window.upcast::<GlobalScope>().send_reports_to_endpoints(
+                    reports,
+                    window.endpoints_list.borrow().clone(),
+                );
+            }));
+    }
+
+    pub(crate) fn buffered_reports(&self) -> Vec<Report> {
+        self.report_list.borrow().clone()
+    }
+
+    pub(crate) fn set_endpoints_list(&self, endpoints: Vec<ReportingEndpoint>) {
+        *self.endpoints_list.borrow_mut() = endpoints;
     }
 
     /// Returns the window proxy if it has not been discarded.
@@ -535,20 +605,6 @@ impl Window {
         Some(&self.error_reporter)
     }
 
-    /// Sets a new list of scroll offsets.
-    ///
-    /// This is called when layout gives us new ones and WebRender is in use.
-    pub(crate) fn set_scroll_offsets(
-        &self,
-        offsets: HashMap<OpaqueNode, Vector2D<f32, LayoutPixel>>,
-    ) {
-        *self.scroll_offsets.borrow_mut() = offsets
-    }
-
-    pub(crate) fn current_viewport(&self) -> UntypedRect<Au> {
-        self.current_viewport.clone().get()
-    }
-
     pub(crate) fn webgl_chan(&self) -> Option<WebGLCommandSender> {
         self.webgl_chan
             .as_ref()
@@ -569,7 +625,7 @@ impl Window {
         &self,
         id: PendingImageId,
         callback: impl Fn(PendingImageResponse) + 'static,
-    ) -> IpcSender<PendingImageResponse> {
+    ) -> IpcSender<ImageCacheResponseMessage> {
         self.pending_image_callbacks
             .borrow_mut()
             .entry(id)
@@ -585,8 +641,10 @@ impl Window {
             Entry::Occupied(nodes) => nodes,
             Entry::Vacant(_) => return,
         };
-        for node in nodes.get() {
-            node.dirty(NodeDamage::OtherNodeDamage);
+        if matches!(response.response, ImageResponse::Loaded(_, _)) {
+            for node in nodes.get() {
+                node.dirty(NodeDamage::Other);
+            }
         }
         match response.response {
             ImageResponse::MetadataLoaded(_) => {},
@@ -596,6 +654,22 @@ impl Window {
                 nodes.remove();
             },
         }
+    }
+
+    pub(crate) fn handle_image_rasterization_complete_notification(
+        &self,
+        response: RasterizationCompleteResponse,
+    ) {
+        let mut images = self.pending_images_for_rasterization.borrow_mut();
+        let nodes = images.entry((response.image_id, response.requested_size));
+        let nodes = match nodes {
+            Entry::Occupied(nodes) => nodes,
+            Entry::Vacant(_) => return,
+        };
+        for node in nodes.get() {
+            node.dirty(NodeDamage::Other);
+        }
+        nodes.remove();
     }
 
     pub(crate) fn pending_image_notification(&self, response: PendingImageResponse) {
@@ -638,136 +712,57 @@ impl Window {
     }
 
     // see note at https://dom.spec.whatwg.org/#concept-event-dispatch step 2
-    pub(crate) fn dispatch_event_with_target_override(
-        &self,
-        event: &Event,
-        can_gc: CanGc,
-    ) -> EventStatus {
-        event.dispatch(self.upcast(), true, can_gc)
+    pub(crate) fn dispatch_event_with_target_override(&self, event: &Event, can_gc: CanGc) {
+        event.dispatch(self.upcast(), true, can_gc);
     }
 
     pub(crate) fn font_context(&self) -> &Arc<FontContext> {
-        &self.font_context
+        self.as_global_scope()
+            .font_context()
+            .expect("A `Window` should always have a `FontContext`")
     }
 
-    pub(crate) fn handle_gamepad_event(&self, gamepad_event: GamepadEvent) {
-        match gamepad_event {
-            GamepadEvent::Connected(index, name, bounds, supported_haptic_effects) => {
-                self.handle_gamepad_connect(
-                    index.0,
-                    name,
-                    bounds.axis_bounds,
-                    bounds.button_bounds,
-                    supported_haptic_effects,
-                );
-            },
-            GamepadEvent::Disconnected(index) => {
-                self.handle_gamepad_disconnect(index.0);
-            },
-            GamepadEvent::Updated(index, update_type) => {
-                self.receive_new_gamepad_button_or_axis(index.0, update_type);
-            },
-        };
+    pub(crate) fn ongoing_navigation(&self) -> OngoingNavigation {
+        self.ongoing_navigation.get()
     }
 
-    /// <https://www.w3.org/TR/gamepad/#dfn-gamepadconnected>
-    fn handle_gamepad_connect(
-        &self,
-        // As the spec actually defines how to set the gamepad index, the GilRs index
-        // is currently unused, though in practice it will almost always be the same.
-        // More infra is currently needed to track gamepads across windows.
-        _index: usize,
-        name: String,
-        axis_bounds: (f64, f64),
-        button_bounds: (f64, f64),
-        supported_haptic_effects: GamepadSupportedHapticEffects,
-    ) {
-        // TODO: 2. If document is not null and is not allowed to use the "gamepad" permission,
-        //          then abort these steps.
-        let this = Trusted::new(self);
-        self.upcast::<GlobalScope>()
-            .task_manager()
-            .gamepad_task_source()
-            .queue(task!(gamepad_connected: move || {
-                let window = this.root();
+    /// <https://html.spec.whatwg.org/multipage/#set-the-ongoing-navigation>
+    pub(crate) fn set_ongoing_navigation(&self) -> OngoingNavigation {
+        // Note: since this value, for now, is only used in a single `ScriptThread`,
+        // we just increment it (it is not a uuid), which implies not
+        // using a `newValue` variable.
+        let new_value = self.ongoing_navigation.get().0.wrapping_add(1);
 
-                let navigator = window.Navigator();
-                let selected_index = navigator.select_gamepad_index();
-                let gamepad = Gamepad::new(
-                    &window,
-                    selected_index,
-                    name,
-                    "standard".into(),
-                    axis_bounds,
-                    button_bounds,
-                    supported_haptic_effects,
-                    false,
-                    CanGc::note(),
-                );
-                navigator.set_gamepad(selected_index as usize, &gamepad, CanGc::note());
-            }));
+        // 1. If navigable's ongoing navigation is equal to newValue, then return.
+        // Note: cannot happen in the way it is currently used.
+
+        // TODO: 2. Inform the navigation API about aborting navigation given navigable.
+
+        // 3. Set navigable's ongoing navigation to newValue.
+        self.ongoing_navigation.set(OngoingNavigation(new_value));
+
+        // Note: Return the ongoing navigation for the caller to use.
+        OngoingNavigation(new_value)
     }
 
-    /// <https://www.w3.org/TR/gamepad/#dfn-gamepaddisconnected>
-    fn handle_gamepad_disconnect(&self, index: usize) {
-        let this = Trusted::new(self);
-        self.upcast::<GlobalScope>()
-            .task_manager()
-            .gamepad_task_source()
-            .queue(task!(gamepad_disconnected: move || {
-                let window = this.root();
-                let navigator = window.Navigator();
-                if let Some(gamepad) = navigator.get_gamepad(index) {
-                    if window.Document().is_fully_active() {
-                        gamepad.update_connected(false, gamepad.exposed(), CanGc::note());
-                        navigator.remove_gamepad(index);
-                    }
-                }
-            }));
-    }
+    /// <https://html.spec.whatwg.org/multipage/#nav-stop>
+    fn stop_loading(&self, can_gc: CanGc) {
+        // 1. Let document be navigable's active document.
+        let doc = self.Document();
 
-    /// <https://www.w3.org/TR/gamepad/#receiving-inputs>
-    fn receive_new_gamepad_button_or_axis(&self, index: usize, update_type: GamepadUpdateType) {
-        let this = Trusted::new(self);
+        // 2. If document's unload counter is 0,
+        // and navigable's ongoing navigation is a navigation ID,
+        // then set the ongoing navigation for navigable to null.
+        //
+        // Note: since the concept of `navigable` is nascent in Servo,
+        // for now we do two things:
+        // - increment the `ongoing_navigation`(preventing planned form navigations).
+        // - Send a `AbortLoadUrl` message(in case the navigation
+        // already started at the constellation).
+        self.set_ongoing_navigation();
 
-        // <https://w3c.github.io/gamepad/#dfn-update-gamepad-state>
-        self.upcast::<GlobalScope>().task_manager().gamepad_task_source().queue(
-                task!(update_gamepad_state: move || {
-                    let window = this.root();
-                    let navigator = window.Navigator();
-                    if let Some(gamepad) = navigator.get_gamepad(index) {
-                        let current_time = window.Performance().Now();
-                        gamepad.update_timestamp(*current_time);
-                        match update_type {
-                            GamepadUpdateType::Axis(index, value) => {
-                                gamepad.map_and_normalize_axes(index, value);
-                            },
-                            GamepadUpdateType::Button(index, value) => {
-                                gamepad.map_and_normalize_buttons(index, value);
-                            }
-                        };
-                        if !navigator.has_gamepad_gesture() && contains_user_gesture(update_type) {
-                            navigator.set_has_gamepad_gesture(true);
-                            navigator.GetGamepads()
-                                .iter()
-                                .filter_map(|g| g.as_ref())
-                                .for_each(|gamepad| {
-                                    gamepad.set_exposed(true);
-                                    gamepad.update_timestamp(*current_time);
-                                    let new_gamepad = Trusted::new(&**gamepad);
-                                    if window.Document().is_fully_active() {
-                                        window.upcast::<GlobalScope>().task_manager().gamepad_task_source().queue(
-                                            task!(update_gamepad_connect: move || {
-                                                let gamepad = new_gamepad.root();
-                                                gamepad.notify_event(GamepadEventType::Connected, CanGc::note());
-                                            })
-                                        );
-                                    }
-                                });
-                        }
-                    }
-                })
-            );
+        // 3. Abort a document and its descendants given document.
+        doc.abort(can_gc);
     }
 }
 
@@ -798,7 +793,7 @@ pub(crate) fn base64_btoa(input: DOMString) -> Fallible<DOMString> {
 pub(crate) fn base64_atob(input: DOMString) -> Fallible<DOMString> {
     // "Remove all space characters from input."
     fn is_html_space(c: char) -> bool {
-        HTML_SPACE_CHARACTERS.iter().any(|&m| m == c)
+        HTML_SPACE_CHARACTERS.contains(&c)
     }
     let without_spaces = input
         .chars()
@@ -874,7 +869,11 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         };
         let msg = EmbedderMsg::ShowSimpleDialog(self.webview_id(), dialog);
         self.send_to_embedder(msg);
-        let AlertResponse::Ok = receiver.recv().unwrap();
+        receiver.recv().unwrap_or_else(|_| {
+            // If the receiver is closed, we assume the dialog was cancelled.
+            debug!("Alert dialog was cancelled or failed to show.");
+            AlertResponse::Ok
+        });
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-confirm
@@ -887,7 +886,14 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         };
         let msg = EmbedderMsg::ShowSimpleDialog(self.webview_id(), dialog);
         self.send_to_embedder(msg);
-        receiver.recv().unwrap() == ConfirmResponse::Ok
+        match receiver.recv() {
+            Ok(ConfirmResponse::Ok) => true,
+            Ok(ConfirmResponse::Cancel) => false,
+            Err(_) => {
+                warn!("Confirm dialog was cancelled or failed to show.");
+                false
+            },
+        }
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-prompt
@@ -901,17 +907,23 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         };
         let msg = EmbedderMsg::ShowSimpleDialog(self.webview_id(), dialog);
         self.send_to_embedder(msg);
-        match receiver.recv().unwrap() {
-            PromptResponse::Ok(input) => Some(input.into()),
-            PromptResponse::Cancel => None,
+        match receiver.recv() {
+            Ok(PromptResponse::Ok(input)) => Some(input.into()),
+            Ok(PromptResponse::Cancel) => None,
+            Err(_) => {
+                warn!("Prompt dialog was cancelled or failed to show.");
+                None
+            },
         }
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-window-stop
     fn Stop(&self, can_gc: CanGc) {
-        // TODO: Cancel ongoing navigation.
-        let doc = self.Document();
-        doc.abort(can_gc);
+        // 1. If this's navigable is null, then return.
+        // Note: Servo doesn't have a concept of navigable yet.
+
+        // 2. Stop loading this's navigable.
+        self.stop_loading(can_gc);
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-window-focus>
@@ -1077,6 +1089,14 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         self.history.or_init(|| History::new(self, CanGc::note()))
     }
 
+    // https://w3c.github.io/IndexedDB/#factory-interface
+    fn IndexedDB(&self) -> DomRoot<IDBFactory> {
+        self.indexeddb.or_init(|| {
+            let global_scope = self.upcast::<GlobalScope>();
+            IDBFactory::new(global_scope, CanGc::note())
+        })
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-window-customelements
     fn CustomElements(&self) -> DomRoot<CustomElementRegistry> {
         self.custom_element_registry
@@ -1098,6 +1118,11 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     fn LocalStorage(&self) -> DomRoot<Storage> {
         self.local_storage
             .or_init(|| Storage::new(self, StorageType::Local, CanGc::note()))
+    }
+
+    // https://cookiestore.spec.whatwg.org/#Window
+    fn CookieStore(&self, can_gc: CanGc) -> DomRoot<CookieStore> {
+        self.global().cookie_store(can_gc)
     }
 
     // https://dvcs.w3.org/hg/webcrypto-api/raw-file/tip/spec/Overview.html#dfn-GlobalCrypto
@@ -1135,23 +1160,30 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
             .or_init(|| Navigator::new(self, CanGc::note()))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-windowtimers-settimeout
+    // https://html.spec.whatwg.org/multipage/#dom-settimeout
     fn SetTimeout(
         &self,
         _cx: JSContext,
-        callback: StringOrFunction,
+        callback: TrustedScriptOrStringOrFunction,
         timeout: i32,
         args: Vec<HandleValue>,
-    ) -> i32 {
+        can_gc: CanGc,
+    ) -> Fallible<i32> {
         let callback = match callback {
-            StringOrFunction::String(i) => TimerCallback::StringTimerCallback(i),
-            StringOrFunction::Function(i) => TimerCallback::FunctionTimerCallback(i),
+            TrustedScriptOrStringOrFunction::String(i) => {
+                TimerCallback::StringTimerCallback(TrustedScriptOrString::String(i))
+            },
+            TrustedScriptOrStringOrFunction::TrustedScript(i) => {
+                TimerCallback::StringTimerCallback(TrustedScriptOrString::TrustedScript(i))
+            },
+            TrustedScriptOrStringOrFunction::Function(i) => TimerCallback::FunctionTimerCallback(i),
         };
         self.as_global_scope().set_timeout_or_interval(
             callback,
             args,
             Duration::from_millis(timeout.max(0) as u64),
             IsInterval::NonInterval,
+            can_gc,
         )
     }
 
@@ -1164,19 +1196,26 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     fn SetInterval(
         &self,
         _cx: JSContext,
-        callback: StringOrFunction,
+        callback: TrustedScriptOrStringOrFunction,
         timeout: i32,
         args: Vec<HandleValue>,
-    ) -> i32 {
+        can_gc: CanGc,
+    ) -> Fallible<i32> {
         let callback = match callback {
-            StringOrFunction::String(i) => TimerCallback::StringTimerCallback(i),
-            StringOrFunction::Function(i) => TimerCallback::FunctionTimerCallback(i),
+            TrustedScriptOrStringOrFunction::String(i) => {
+                TimerCallback::StringTimerCallback(TrustedScriptOrString::String(i))
+            },
+            TrustedScriptOrStringOrFunction::TrustedScript(i) => {
+                TimerCallback::StringTimerCallback(TrustedScriptOrString::TrustedScript(i))
+            },
+            TrustedScriptOrStringOrFunction::Function(i) => TimerCallback::FunctionTimerCallback(i),
         };
         self.as_global_scope().set_timeout_or_interval(
             callback,
             args,
             Duration::from_millis(timeout.max(0) as u64),
             IsInterval::Interval,
+            can_gc,
         )
     }
 
@@ -1190,17 +1229,46 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         self.as_global_scope().queue_function_as_microtask(callback);
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-createimagebitmap
+    /// <https://html.spec.whatwg.org/multipage/#dom-createimagebitmap>
     fn CreateImageBitmap(
         &self,
         image: ImageBitmapSource,
         options: &ImageBitmapOptions,
         can_gc: CanGc,
     ) -> Rc<Promise> {
-        let p = self
-            .as_global_scope()
-            .create_image_bitmap(image, options, can_gc);
-        p
+        ImageBitmap::create_image_bitmap(
+            self.as_global_scope(),
+            image,
+            0,
+            0,
+            None,
+            None,
+            options,
+            can_gc,
+        )
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-createimagebitmap>
+    fn CreateImageBitmap_(
+        &self,
+        image: ImageBitmapSource,
+        sx: i32,
+        sy: i32,
+        sw: i32,
+        sh: i32,
+        options: &ImageBitmapOptions,
+        can_gc: CanGc,
+    ) -> Rc<Promise> {
+        ImageBitmap::create_image_bitmap(
+            self.as_global_scope(),
+            image,
+            sx,
+            sy,
+            Some(sw),
+            Some(sh),
+            options,
+            can_gc,
+        )
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-window
@@ -1397,27 +1465,35 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     fn WebdriverElement(&self, id: DOMString) -> Option<DomRoot<Element>> {
-        find_node_by_unique_id_in_document(&self.Document(), id.into())
-            .ok()
-            .and_then(Root::downcast)
+        find_node_by_unique_id_in_document(&self.Document(), id.into()).and_then(Root::downcast)
     }
 
     fn WebdriverFrame(&self, id: DOMString) -> Option<DomRoot<Element>> {
         find_node_by_unique_id_in_document(&self.Document(), id.into())
-            .ok()
             .and_then(Root::downcast::<HTMLIFrameElement>)
             .map(Root::upcast::<Element>)
     }
 
-    fn WebdriverWindow(&self, _id: DOMString) -> Option<DomRoot<Window>> {
-        warn!("Window references are not supported in webdriver yet");
-        None
+    fn WebdriverWindow(&self, id: DOMString) -> Option<DomRoot<WindowProxy>> {
+        let window_proxy = self.window_proxy.get()?;
+
+        // Window must be top level browsing context.
+        if window_proxy.browsing_context_id() != window_proxy.webview_id() {
+            return None;
+        }
+
+        let pipeline_id = window_proxy.currently_active()?;
+        let document = ScriptThread::find_document(pipeline_id)?;
+
+        if document.upcast::<Node>().unique_id(pipeline_id) == id.str() {
+            Some(DomRoot::from_ref(&window_proxy))
+        } else {
+            None
+        }
     }
 
     fn WebdriverShadowRoot(&self, id: DOMString) -> Option<DomRoot<ShadowRoot>> {
-        find_node_by_unique_id_in_document(&self.Document(), id.into())
-            .ok()
-            .and_then(Root::downcast)
+        find_node_by_unique_id_in_document(&self.Document(), id.into()).and_then(Root::downcast)
     }
 
     // https://drafts.csswg.org/cssom/#dom-window-getcomputedstyle
@@ -1484,7 +1560,7 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-innerheight
-    //TODO Include Scrollbar
+    // TODO Include Scrollbar
     fn InnerHeight(&self) -> i32 {
         self.viewport_details
             .get()
@@ -1495,14 +1571,14 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-innerwidth
-    //TODO Include Scrollbar
+    // TODO Include Scrollbar
     fn InnerWidth(&self) -> i32 {
         self.viewport_details.get().size.width.to_i32().unwrap_or(0)
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-window-scrollx
+    /// <https://drafts.csswg.org/cssom-view/#dom-window-scrollx>
     fn ScrollX(&self) -> i32 {
-        self.current_viewport.get().origin.x.to_px()
+        self.scroll_offset().x as i32
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-pagexoffset
@@ -1510,9 +1586,9 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         self.ScrollX()
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-window-scrolly
+    /// <https://drafts.csswg.org/cssom-view/#dom-window-scrolly>
     fn ScrollY(&self) -> i32 {
-        self.current_viewport.get().origin.y.to_px()
+        self.scroll_offset().y as i32
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-pageyoffset
@@ -1521,46 +1597,47 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-scroll
-    fn Scroll(&self, options: &ScrollToOptions, can_gc: CanGc) {
+    fn Scroll(&self, options: &ScrollToOptions) {
         // Step 1
         let left = options.left.unwrap_or(0.0f64);
         let top = options.top.unwrap_or(0.0f64);
-        self.scroll(left, top, options.parent.behavior, can_gc);
+        self.scroll(left, top, options.parent.behavior);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-scroll
-    fn Scroll_(&self, x: f64, y: f64, can_gc: CanGc) {
-        self.scroll(x, y, ScrollBehavior::Auto, can_gc);
+    fn Scroll_(&self, x: f64, y: f64) {
+        self.scroll(x, y, ScrollBehavior::Auto);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-scrollto
     fn ScrollTo(&self, options: &ScrollToOptions) {
-        self.Scroll(options, CanGc::note());
+        self.Scroll(options);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-scrollto
     fn ScrollTo_(&self, x: f64, y: f64) {
-        self.scroll(x, y, ScrollBehavior::Auto, CanGc::note());
+        self.scroll(x, y, ScrollBehavior::Auto);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-scrollby
-    fn ScrollBy(&self, options: &ScrollToOptions, can_gc: CanGc) {
+    fn ScrollBy(&self, options: &ScrollToOptions) {
         // Step 1
         let x = options.left.unwrap_or(0.0f64);
         let y = options.top.unwrap_or(0.0f64);
-        self.ScrollBy_(x, y, can_gc);
-        self.scroll(x, y, options.parent.behavior, can_gc);
+        self.ScrollBy_(x, y);
+        self.scroll(x, y, options.parent.behavior);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-scrollby
-    fn ScrollBy_(&self, x: f64, y: f64, can_gc: CanGc) {
+    fn ScrollBy_(&self, x: f64, y: f64) {
+        let scroll_offset = self.scroll_offset();
         // Step 3
-        let left = x + self.ScrollX() as f64;
+        let left = x + scroll_offset.x as f64;
         // Step 4
-        let top = y + self.ScrollY() as f64;
+        let top = y + scroll_offset.y as f64;
 
         // Step 5
-        self.scroll(left, top, ScrollBehavior::Auto, can_gc);
+        self.scroll(left, top, ScrollBehavior::Auto);
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-resizeto
@@ -1584,18 +1661,15 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 
     // https://drafts.csswg.org/cssom-view/#dom-window-resizeby
     fn ResizeBy(&self, x: i32, y: i32) {
-        let (size, _) = self.client_window();
+        let size = self.client_window().size();
         // Step 1
-        self.ResizeTo(
-            x + size.width.to_i32().unwrap_or(1),
-            y + size.height.to_i32().unwrap_or(1),
-        )
+        self.ResizeTo(x + size.width, y + size.height)
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-moveto
     fn MoveTo(&self, x: i32, y: i32) {
         // Step 1
-        //TODO determine if this operation is allowed
+        // TODO determine if this operation is allowed
         let dpr = self.device_pixel_ratio();
         let point = Point2D::new(x, y).to_f32() * dpr;
         let msg = EmbedderMsg::MoveTo(self.webview_id(), point.to_i32());
@@ -1604,33 +1678,29 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 
     // https://drafts.csswg.org/cssom-view/#dom-window-moveby
     fn MoveBy(&self, x: i32, y: i32) {
-        let (_, origin) = self.client_window();
+        let origin = self.client_window().min;
         // Step 1
         self.MoveTo(x + origin.x, y + origin.y)
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-screenx
     fn ScreenX(&self) -> i32 {
-        let (_, origin) = self.client_window();
-        origin.x
+        self.client_window().min.x
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-screeny
     fn ScreenY(&self) -> i32 {
-        let (_, origin) = self.client_window();
-        origin.y
+        self.client_window().min.y
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-outerheight
     fn OuterHeight(&self) -> i32 {
-        let (size, _) = self.client_window();
-        size.height.to_i32().unwrap_or(1)
+        self.client_window().height()
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-outerwidth
     fn OuterWidth(&self) -> i32 {
-        let (size, _) = self.client_window();
-        size.width.to_i32().unwrap_or(1)
+        self.client_window().width()
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-window-devicepixelratio
@@ -1708,12 +1778,9 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
     }
 
     // https://dom.spec.whatwg.org/#dom-window-event
-    #[allow(unsafe_code)]
     fn Event(&self, cx: JSContext, rval: MutableHandleValue) {
         if let Some(ref event) = *self.current_event.borrow() {
-            unsafe {
-                event.reflector().get_jsobject().to_jsval(*cx, rval);
-            }
+            event.reflector().get_jsobject().safe_to_jsval(cx, rval);
         }
     }
 
@@ -1889,6 +1956,10 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
 }
 
 impl Window {
+    pub(crate) fn scroll_offset(&self) -> Vector2D<f32, LayoutPixel> {
+        self.scroll_offset_query_with_external_scroll_id(self.pipeline_id().root_scroll_id())
+    }
+
     // https://heycam.github.io/webidl/#named-properties-object
     // https://html.spec.whatwg.org/multipage/#named-access-on-the-window-object
     #[allow(unsafe_code)]
@@ -1961,20 +2032,6 @@ impl Window {
             custom_elements.teardown();
         }
 
-        // The above code may not catch all DOM objects (e.g. DOM
-        // objects removed from the tree that haven't been collected
-        // yet). There should not be any such DOM nodes with layout
-        // data, but if there are, then when they are dropped, they
-        // will attempt to send a message to layout.
-        // This causes memory safety issues, because the DOM node uses
-        // the layout channel from its window, and the window has
-        // already been GC'd.  For nodes which do not have a live
-        // pointer, we can avoid this by GCing now:
-        self.Gc();
-        // but there may still be nodes being kept alive by user
-        // script.
-        // TODO: ensure that this doesn't happen!
-
         self.current_state.set(WindowState::Zombie);
         *self.js_runtime.borrow_mut() = None;
 
@@ -1998,7 +2055,7 @@ impl Window {
     }
 
     /// <https://drafts.csswg.org/cssom-view/#dom-window-scroll>
-    pub(crate) fn scroll(&self, x_: f64, y_: f64, behavior: ScrollBehavior, can_gc: CanGc) {
+    pub(crate) fn scroll(&self, x_: f64, y_: f64, behavior: ScrollBehavior) {
         // Step 3
         let xfinite = if x_.is_finite() { x_ } else { 0.0f64 };
         let yfinite = if y_.is_finite() { y_ } else { 0.0f64 };
@@ -2011,7 +2068,7 @@ impl Window {
 
         // Step 7 & 8
         // TODO: Consider `block-end` and `inline-end` overflow direction.
-        let scrolling_area = self.scrolling_area_query(None, can_gc);
+        let scrolling_area = self.scrolling_area_query(None);
         let x = xfinite
             .min(scrolling_area.width() as f64 - viewport.width as f64)
             .max(0.0f64);
@@ -2020,24 +2077,23 @@ impl Window {
             .max(0.0f64);
 
         // Step 10
-        //TODO handling ongoing smooth scrolling
-        if x == self.ScrollX() as f64 && y == self.ScrollY() as f64 {
+        // TODO handling ongoing smooth scrolling
+        let scroll_offset = self.scroll_offset();
+        if x == scroll_offset.x as f64 && y == scroll_offset.y as f64 {
             return;
         }
 
-        //TODO Step 11
-        //let document = self.Document();
-        // Step 12
-        let x = x.to_f32().unwrap_or(0.0f32);
-        let y = y.to_f32().unwrap_or(0.0f32);
-        self.update_viewport_for_scroll(x, y);
+        // TODO Step 11
+
+        // Step 12: Perform a scroll of the viewport to position, document’s root element
+        // as the associated element, if there is one, or null otherwise, and the scroll
+        // behavior being the value of the behavior dictionary member of options.
         self.perform_a_scroll(
-            x,
-            y,
+            x.to_f32().unwrap_or(0.0f32),
+            y.to_f32().unwrap_or(0.0f32),
             self.pipeline_id().root_scroll_id(),
             behavior,
             None,
-            can_gc,
         );
     }
 
@@ -2048,43 +2104,39 @@ impl Window {
         y: f32,
         scroll_id: ExternalScrollId,
         _behavior: ScrollBehavior,
-        _element: Option<&Element>,
-        can_gc: CanGc,
+        element: Option<&Element>,
     ) {
         // TODO Step 1
         // TODO(mrobinson, #18709): Add smooth scrolling support to WebRender so that we can
         // properly process ScrollBehavior here.
-        self.reflow(
-            ReflowGoal::UpdateScrollNode(ScrollState {
-                scroll_id,
-                scroll_offset: Vector2D::new(-x, -y),
-            }),
-            can_gc,
-        );
-    }
+        let reflow_phases_run =
+            self.reflow(ReflowGoal::UpdateScrollNode(scroll_id, Vector2D::new(x, y)));
+        if reflow_phases_run.needs_frame() {
+            self.compositor_api().generate_frame();
+        }
 
-    pub(crate) fn update_viewport_for_scroll(&self, x: f32, y: f32) {
-        let size = self.current_viewport.get().size;
-        let new_viewport = Rect::new(Point2D::new(Au::from_f32_px(x), Au::from_f32_px(y)), size);
-        self.current_viewport.set(new_viewport)
+        // > If the scroll position did not change as a result of the user interaction or programmatic
+        // > invocation, where no translations were applied as a result, then no scrollend event fires
+        // > because no scrolling occurred.
+        // Even though the note mention the scrollend, it is relevant to the scroll as well.
+        if reflow_phases_run.contains(ReflowPhasesRun::UpdatedScrollNodeOffset) {
+            match element {
+                Some(el) => self.Document().handle_element_scroll_event(el),
+                None => self.Document().handle_viewport_scroll_event(),
+            };
+        }
     }
 
     pub(crate) fn device_pixel_ratio(&self) -> Scale<f32, CSSPixel, DevicePixel> {
         self.viewport_details.get().hidpi_scale_factor
     }
 
-    fn client_window(&self) -> (Size2D<u32, CSSPixel>, Point2D<i32, CSSPixel>) {
-        let timer_profile_chan = self.global().time_profiler_chan().clone();
-        let (sender, receiver) =
-            ProfiledIpc::channel::<DeviceIndependentIntRect>(timer_profile_chan).unwrap();
-        let _ = self.compositor_api.sender().send(
-            compositing_traits::CompositorMsg::GetClientWindowRect(self.webview_id(), sender),
-        );
-        let rect = receiver.recv().unwrap_or_default();
-        (
-            Size2D::new(rect.size().width as u32, rect.size().height as u32),
-            Point2D::new(rect.min.x, rect.min.y),
-        )
+    fn client_window(&self) -> DeviceIndependentIntRect {
+        let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel!");
+
+        self.send_to_embedder(EmbedderMsg::GetWindowRect(self.webview_id(), sender));
+
+        receiver.recv().unwrap_or_default()
     }
 
     /// Prepares to tick animations and then does a reflow which also advances the
@@ -2101,39 +2153,27 @@ impl Window {
     /// no reflow is performed. If reflow is suppressed, no reflow will be performed for ForDisplay
     /// goals.
     ///
-    /// Returns true if layout actually happened, false otherwise.
-    ///
     /// NOTE: This method should almost never be called directly! Layout and rendering updates should
     /// happen as part of the HTML event loop via *update the rendering*.
-    #[allow(unsafe_code)]
-    fn force_reflow(
-        &self,
-        reflow_goal: ReflowGoal,
-        condition: Option<ReflowTriggerCondition>,
-    ) -> bool {
+    pub(crate) fn reflow(&self, reflow_goal: ReflowGoal) -> ReflowPhasesRun {
+        let document = self.Document();
+
+        // Never reflow inactive Documents.
+        if !document.is_fully_active() {
+            return ReflowPhasesRun::empty();
+        }
+
         self.Document().ensure_safe_to_run_script_or_layout();
 
         // If layouts are blocked, we block all layouts that are for display only. Other
         // layouts (for queries and scrolling) are not blocked, as they do not display
-        // anything and script excpects the layout to be up-to-date after they run.
-        let layout_blocked = self.layout_blocker.get().layout_blocked();
+        // anything and script expects the layout to be up-to-date after they run.
         let pipeline_id = self.pipeline_id();
-        if reflow_goal == ReflowGoal::UpdateTheRendering && layout_blocked {
+        if reflow_goal == ReflowGoal::UpdateTheRendering &&
+            self.layout_blocker.get().layout_blocked()
+        {
             debug!("Suppressing pre-load-event reflow pipeline {pipeline_id}");
-            return false;
-        }
-
-        if condition != Some(ReflowTriggerCondition::PaintPostponed) {
-            debug!(
-                "Invalidating layout cache due to reflow condition {:?}",
-                condition
-            );
-            // Invalidate any existing cached layout values.
-            self.layout_marker.borrow().set(false);
-            // Create a new layout caching token.
-            *self.layout_marker.borrow_mut() = Rc::new(Cell::new(true));
-        } else {
-            debug!("Not invalidating cached layout values for paint-only reflow.");
+            return ReflowPhasesRun::empty();
         }
 
         debug!("script: performing reflow for goal {reflow_goal:?}");
@@ -2143,57 +2183,49 @@ impl Window {
             None
         };
 
-        // On debug mode, print the reflow event information.
-        if self.relayout_event {
-            debug_reflow_events(pipeline_id, &reflow_goal);
-        }
+        let restyle_reason = document.restyle_reason();
+        document.clear_restyle_reasons();
+        let restyle = if restyle_reason.needs_restyle() {
+            debug!("Invalidating layout cache due to reflow condition {restyle_reason:?}",);
+            // Invalidate any existing cached layout values.
+            self.layout_marker.borrow().set(false);
+            // Create a new layout caching token.
+            *self.layout_marker.borrow_mut() = Rc::new(Cell::new(true));
 
-        let document = self.Document();
+            let stylesheets_changed = document.flush_stylesheets_for_reflow();
+            let pending_restyles = document.drain_pending_restyles();
+            let dirty_root = document
+                .take_dirty_root()
+                .filter(|_| !stylesheets_changed)
+                .or_else(|| document.GetDocumentElement())
+                .map(|root| root.upcast::<Node>().to_trusted_node_address());
 
-        let stylesheets_changed = document.flush_stylesheets_for_reflow();
+            Some(ReflowRequestRestyle {
+                reason: restyle_reason,
+                dirty_root,
+                stylesheets_changed,
+                pending_restyles,
+            })
+        } else {
+            None
+        };
 
-        // If this reflow is for display, ensure webgl canvases are composited with
-        // up-to-date contents.
-        let for_display = reflow_goal.needs_display();
-        if for_display {
-            document.flush_dirty_webgl_canvases();
-            document.flush_dirty_2d_canvases();
-        }
-
-        let pending_restyles = document.drain_pending_restyles();
-
-        let dirty_root = document
-            .take_dirty_root()
-            .filter(|_| !stylesheets_changed)
-            .or_else(|| document.GetDocumentElement())
-            .map(|root| root.upcast::<Node>().to_trusted_node_address());
-
-        let highlighted_dom_node = document.highlighted_dom_node().map(|node| node.to_opaque());
-
-        // Send new document and relevant styles to layout.
         let reflow = ReflowRequest {
-            reflow_info: Reflow {
-                page_clip_rect: self.page_clip_rect.get(),
-            },
             document: document.upcast::<Node>().to_trusted_node_address(),
-            dirty_root,
-            stylesheets_changed,
+            restyle,
             viewport_details: self.viewport_details.get(),
             origin: self.origin().immutable().clone(),
             reflow_goal,
             dom_count: document.dom_count(),
-            pending_restyles,
             animation_timeline_value: document.current_animation_timeline_value(),
             animations: document.animations().sets.clone(),
-            node_to_image_animation_map: document
-                .image_animation_manager_mut()
-                .take_image_animate_set(),
+            node_to_animating_image_map: document.image_animation_manager().node_to_image_map(),
             theme: self.theme.get(),
-            highlighted_dom_node,
+            highlighted_dom_node: document.highlighted_dom_node().map(|node| node.to_opaque()),
         };
 
-        let Some(results) = self.layout.borrow_mut().reflow(reflow) else {
-            return false;
+        let Some(reflow_result) = self.layout.borrow_mut().reflow(reflow) else {
+            return ReflowPhasesRun::empty();
         };
 
         debug!("script: layout complete");
@@ -2201,155 +2233,78 @@ impl Window {
             self.emit_timeline_marker(marker.end());
         }
 
-        // Either this reflow caused new contents to be displayed or on the next
-        // full layout attempt a reflow should be forced in order to update the
-        // visual contents of the page. A case where full display might be delayed
-        // is when reflowing just for the purpose of doing a layout query.
-        document.set_needs_paint(!for_display);
+        self.handle_pending_images_post_reflow(
+            reflow_result.pending_images,
+            reflow_result.pending_rasterization_images,
+            reflow_result.pending_svg_elements_for_serialization,
+        );
 
-        for image in results.pending_images {
-            let id = image.id;
-            let node = unsafe { from_untrusted_node_address(image.node) };
-
-            if let PendingImageState::Unrequested(ref url) = image.state {
-                fetch_image_for_layout(url.clone(), &node, id, self.image_cache.clone());
-            }
-
-            let mut images = self.pending_layout_images.borrow_mut();
-            if !images.contains_key(&id) {
-                let trusted_node = Trusted::new(&*node);
-                let sender = self.register_image_cache_listener(id, move |response| {
-                    trusted_node
-                        .root()
-                        .owner_window()
-                        .pending_layout_image_notification(response);
-                });
-
-                self.image_cache
-                    .add_listener(ImageResponder::new(sender, self.pipeline_id(), id));
-            }
-
-            let nodes = images.entry(id).or_default();
-            if !nodes.iter().any(|n| std::ptr::eq(&**n, &*node)) {
-                nodes.push(Dom::from_ref(&*node));
-            }
+        if let Some(iframe_sizes) = reflow_result.iframe_sizes {
+            document
+                .iframes_mut()
+                .handle_new_iframe_sizes_after_layout(self, iframe_sizes);
         }
 
-        let size_messages = self
-            .Document()
-            .iframes_mut()
-            .handle_new_iframe_sizes_after_layout(results.iframe_sizes);
-        if !size_messages.is_empty() {
-            self.send_to_constellation(ScriptToConstellationMessage::IFrameSizes(size_messages));
-        }
-        document
-            .image_animation_manager_mut()
-            .restore_image_animate_set(results.node_to_image_animation_map);
         document.update_animations_post_reflow();
         self.update_constellation_epoch();
 
-        true
+        reflow_result.reflow_phases_run
     }
 
-    /// Reflows the page if it's possible to do so and the page is dirty. Returns true if layout
-    /// actually happened, false otherwise.
-    ///
-    /// NOTE: This method should almost never be called directly! Layout and rendering updates
-    /// should happen as part of the HTML event loop via *update the rendering*. Currerntly, the
-    /// only exceptions are script queries and scroll requests.
-    pub(crate) fn reflow(&self, reflow_goal: ReflowGoal, can_gc: CanGc) -> bool {
-        // Count the pending web fonts before layout, in case a font loads during the layout.
-        let waiting_for_web_fonts_to_load = self.font_context.web_fonts_still_loading() != 0;
+    pub(crate) fn maybe_send_idle_document_state_to_constellation(&self) {
+        if !opts::get().wait_for_stable_image {
+            return;
+        }
 
-        self.Document().ensure_safe_to_run_script_or_layout();
-
-        let mut issued_reflow = false;
-        let condition = self.Document().needs_reflow();
-        let updating_the_rendering = reflow_goal == ReflowGoal::UpdateTheRendering;
-        let for_display = reflow_goal.needs_display();
-        if !updating_the_rendering || condition.is_some() {
-            debug!("Reflowing document ({:?})", self.pipeline_id());
-            issued_reflow = self.force_reflow(reflow_goal, condition);
-
-            // We shouldn't need a reflow immediately after a completed reflow, unless the reflow didn't
-            // display anything and it wasn't for display. Queries can cause this to happen.
-            if issued_reflow {
-                let condition = self.Document().needs_reflow();
-                let display_is_pending = condition == Some(ReflowTriggerCondition::PaintPostponed);
-                assert!(
-                    condition.is_none() || (display_is_pending && !for_display),
-                    "Needed reflow after reflow: {:?}",
-                    condition
-                );
-            }
-        } else {
-            debug!(
-                "Document ({:?}) doesn't need reflow - skipping it (goal {reflow_goal:?})",
-                self.pipeline_id()
-            );
+        if self.has_sent_idle_message.get() {
+            return;
         }
 
         let document = self.Document();
-        let font_face_set = document.Fonts(can_gc);
-        let is_ready_state_complete = document.ReadyState() == DocumentReadyState::Complete;
-
-        // From https://drafts.csswg.org/css-font-loading/#font-face-set-ready:
-        // > A FontFaceSet is pending on the environment if any of the following are true:
-        // >  - the document is still loading
-        // >  - the document has pending stylesheet requests
-        // >  - the document has pending layout operations which might cause the user agent to request
-        // >    a font, or which depend on recently-loaded fonts
-        //
-        // Thus, we are queueing promise resolution here. This reflow should have been triggered by
-        // a "rendering opportunity" in `ScriptThread::handle_web_font_loaded, which should also
-        // make sure a microtask checkpoint happens, triggering the promise callback.
-        if !waiting_for_web_fonts_to_load && is_ready_state_complete {
-            font_face_set.fulfill_ready_promise_if_needed(can_gc);
+        if document.ReadyState() != DocumentReadyState::Complete {
+            return;
         }
 
-        // If writing a screenshot, check if the script has reached a state
-        // where it's safe to write the image. This means that:
-        // 1) The reflow is for display (otherwise it could be a query)
-        // 2) The html element doesn't contain the 'reftest-wait' class
-        // 3) The load event has fired.
+        // Checks if the html element has reftest-wait attribute present.
+        // See http://testthewebforward.org/docs/reftests.html
+        // and https://web-platform-tests.org/writing-tests/crashtest.html
+        if document.GetDocumentElement().is_some_and(|elem| {
+            elem.has_class(&atom!("reftest-wait"), CaseSensitivity::CaseSensitive) ||
+                elem.has_class(&Atom::from("test-wait"), CaseSensitivity::CaseSensitive)
+        }) {
+            return;
+        }
+
+        if self.font_context().web_fonts_still_loading() != 0 {
+            return;
+        }
+
+        if !self.pending_layout_images.borrow().is_empty() ||
+            !self.pending_images_for_rasterization.borrow().is_empty()
+        {
+            return;
+        }
+
+        if self.Document().needs_rendering_update() {
+            return;
+        }
+
         // When all these conditions are met, notify the constellation
         // that this pipeline is ready to write the image (from the script thread
         // perspective at least).
-        if opts::get().wait_for_stable_image && updating_the_rendering {
-            // Checks if the html element has reftest-wait attribute present.
-            // See http://testthewebforward.org/docs/reftests.html
-            // and https://web-platform-tests.org/writing-tests/crashtest.html
-            let html_element = document.GetDocumentElement();
-            let reftest_wait = html_element.is_some_and(|elem| {
-                elem.has_class(&atom!("reftest-wait"), CaseSensitivity::CaseSensitive) ||
-                    elem.has_class(&Atom::from("test-wait"), CaseSensitivity::CaseSensitive)
-            });
-
-            let has_sent_idle_message = self.has_sent_idle_message.get();
-            let pending_images = !self.pending_layout_images.borrow().is_empty();
-
-            if !has_sent_idle_message &&
-                is_ready_state_complete &&
-                !reftest_wait &&
-                !pending_images &&
-                !waiting_for_web_fonts_to_load
-            {
-                debug!(
-                    "{:?}: Sending DocumentState::Idle to Constellation",
-                    self.pipeline_id()
-                );
-                let event = ScriptToConstellationMessage::SetDocumentState(DocumentState::Idle);
-                self.send_to_constellation(event);
-                self.has_sent_idle_message.set(true);
-            }
-        }
-
-        issued_reflow
+        debug!(
+            "{:?}: Sending DocumentState::Idle to Constellation",
+            self.pipeline_id()
+        );
+        self.send_to_constellation(ScriptToConstellationMessage::SetDocumentState(
+            DocumentState::Idle,
+        ));
+        self.has_sent_idle_message.set(true);
     }
 
     /// If parsing has taken a long time and reflows are still waiting for the `load` event,
     /// start allowing them. See <https://github.com/servo/servo/pull/6028>.
-    pub(crate) fn reflow_if_reflow_timer_expired(&self, can_gc: CanGc) {
+    pub(crate) fn reflow_if_reflow_timer_expired(&self) {
         // Only trigger a long parsing time reflow if we are in the first parse of `<body>`
         // and it started more than `INITIAL_REFLOW_DELAY` ago.
         if !matches!(
@@ -2358,7 +2313,7 @@ impl Window {
         ) {
             return;
         }
-        self.allow_layout_if_necessary(can_gc);
+        self.allow_layout_if_necessary();
     }
 
     /// Block layout for this `Window` until parsing is done. If parsing takes a long time,
@@ -2377,7 +2332,7 @@ impl Window {
 
     /// Inform the [`Window`] that layout is allowed either because `load` has happened
     /// or because parsing the `<body>` took so long that we cannot wait any longer.
-    pub(crate) fn allow_layout_if_necessary(&self, can_gc: CanGc) {
+    pub(crate) fn allow_layout_if_necessary(&self) {
         if matches!(
             self.layout_blocker.get(),
             LayoutBlocker::FiredLoadEventOrParsingTimerExpired
@@ -2387,7 +2342,6 @@ impl Window {
 
         self.layout_blocker
             .set(LayoutBlocker::FiredLoadEventOrParsingTimerExpired);
-        self.Document().set_needs_paint(true);
 
         // We do this immediately instead of scheduling a future task, because this can
         // happen if parsing is taking a very long time, which means that the
@@ -2400,7 +2354,9 @@ impl Window {
         // iframe size updates.
         //
         // See <https://github.com/servo/servo/issues/14719>
-        self.reflow(ReflowGoal::UpdateTheRendering, can_gc);
+        if self.Document().update_the_rendering().needs_frame() {
+            self.compositor_api().generate_frame();
+        }
     }
 
     pub(crate) fn layout_blocked(&self) -> bool {
@@ -2425,19 +2381,17 @@ impl Window {
         let _ = receiver.recv();
     }
 
-    pub(crate) fn layout_reflow(&self, query_msg: QueryMsg, can_gc: CanGc) -> bool {
-        self.reflow(ReflowGoal::LayoutQuery(query_msg), can_gc)
+    /// Trigger a reflow that is required by a certain queries.
+    pub(crate) fn layout_reflow(&self, query_msg: QueryMsg) {
+        self.reflow(ReflowGoal::LayoutQuery(query_msg));
     }
 
     pub(crate) fn resolved_font_style_query(
         &self,
         node: &Node,
         value: String,
-        can_gc: CanGc,
     ) -> Option<ServoArc<Font>> {
-        if !self.layout_reflow(QueryMsg::ResolvedFontStyleQuery, can_gc) {
-            return None;
-        }
+        self.layout_reflow(QueryMsg::ResolvedFontStyleQuery);
 
         let document = self.Document();
         let animations = document.animations().sets.clone();
@@ -2449,33 +2403,34 @@ impl Window {
         )
     }
 
-    // Query content box without considering any reflow
-    pub(crate) fn content_box_query_unchecked(&self, node: &Node) -> Option<UntypedRect<Au>> {
+    /// Do the same kind of query as `Self::box_area_query`, but do not force a reflow.
+    /// This is used for things like `IntersectionObserver` which should observe the value
+    /// from the most recent reflow, but do not need it to reflect the current state of
+    /// the DOM / style.
+    pub(crate) fn box_area_query_without_reflow(
+        &self,
+        node: &Node,
+        area: BoxAreaType,
+    ) -> Option<UntypedRect<Au>> {
+        let layout = self.layout.borrow();
+        layout.ensure_stacking_context_tree(self.viewport_details.get());
+        layout.query_box_area(node.to_trusted_node_address(), area)
+    }
+
+    pub(crate) fn box_area_query(&self, node: &Node, area: BoxAreaType) -> Option<UntypedRect<Au>> {
+        self.layout_reflow(QueryMsg::BoxArea);
+        self.box_area_query_without_reflow(node, area)
+    }
+
+    pub(crate) fn box_areas_query(&self, node: &Node, area: BoxAreaType) -> Vec<UntypedRect<Au>> {
+        self.layout_reflow(QueryMsg::BoxAreas);
         self.layout
             .borrow()
-            .query_content_box(node.to_trusted_node_address())
+            .query_box_areas(node.to_trusted_node_address(), area)
     }
 
-    pub(crate) fn content_box_query(&self, node: &Node, can_gc: CanGc) -> Option<UntypedRect<Au>> {
-        if !self.layout_reflow(QueryMsg::ContentBox, can_gc) {
-            return None;
-        }
-        self.content_box_query_unchecked(node)
-    }
-
-    pub(crate) fn content_boxes_query(&self, node: &Node, can_gc: CanGc) -> Vec<UntypedRect<Au>> {
-        if !self.layout_reflow(QueryMsg::ContentBoxes, can_gc) {
-            return vec![];
-        }
-        self.layout
-            .borrow()
-            .query_content_boxes(node.to_trusted_node_address())
-    }
-
-    pub(crate) fn client_rect_query(&self, node: &Node, can_gc: CanGc) -> UntypedRect<i32> {
-        if !self.layout_reflow(QueryMsg::ClientRectQuery, can_gc) {
-            return Rect::zero();
-        }
+    pub(crate) fn client_rect_query(&self, node: &Node) -> UntypedRect<i32> {
+        self.layout_reflow(QueryMsg::ClientRectQuery);
         self.layout
             .borrow()
             .query_client_rect(node.to_trusted_node_address())
@@ -2483,54 +2438,65 @@ impl Window {
 
     /// Find the scroll area of the given node, if it is not None. If the node
     /// is None, find the scroll area of the viewport.
-    pub(crate) fn scrolling_area_query(
-        &self,
-        node: Option<&Node>,
-        can_gc: CanGc,
-    ) -> UntypedRect<i32> {
-        if !self.layout_reflow(QueryMsg::ScrollingAreaQuery, can_gc) {
-            return Rect::zero();
-        }
+    pub(crate) fn scrolling_area_query(&self, node: Option<&Node>) -> UntypedRect<i32> {
+        self.layout_reflow(QueryMsg::ScrollingAreaOrOffsetQuery);
         self.layout
             .borrow()
             .query_scrolling_area(node.map(Node::to_trusted_node_address))
     }
 
     pub(crate) fn scroll_offset_query(&self, node: &Node) -> Vector2D<f32, LayoutPixel> {
-        if let Some(scroll_offset) = self.scroll_offsets.borrow().get(&node.to_opaque()) {
-            return *scroll_offset;
-        }
-        Vector2D::new(0.0, 0.0)
-    }
-
-    // https://drafts.csswg.org/cssom-view/#element-scrolling-members
-    pub(crate) fn scroll_node(
-        &self,
-        node: &Node,
-        x_: f64,
-        y_: f64,
-        behavior: ScrollBehavior,
-        can_gc: CanGc,
-    ) {
-        // The scroll offsets are immediatly updated since later calls
-        // to topScroll and others may access the properties before
-        // webrender has a chance to update the offsets.
-        self.scroll_offsets
-            .borrow_mut()
-            .insert(node.to_opaque(), Vector2D::new(x_ as f32, y_ as f32));
-        let scroll_id = ExternalScrollId(
+        let external_scroll_id = ExternalScrollId(
             combine_id_with_fragment_type(node.to_opaque().id(), FragmentType::FragmentBody),
             self.pipeline_id().into(),
         );
+        self.scroll_offset_query_with_external_scroll_id(external_scroll_id)
+    }
 
-        // Step 12
+    fn scroll_offset_query_with_external_scroll_id(
+        &self,
+        external_scroll_id: ExternalScrollId,
+    ) -> Vector2D<f32, LayoutPixel> {
+        self.layout_reflow(QueryMsg::ScrollingAreaOrOffsetQuery);
+        self.scroll_offset_query_with_external_scroll_id_no_reflow(external_scroll_id)
+    }
+
+    fn scroll_offset_query_with_external_scroll_id_no_reflow(
+        &self,
+        external_scroll_id: ExternalScrollId,
+    ) -> Vector2D<f32, LayoutPixel> {
+        self.layout
+            .borrow()
+            .scroll_offset(external_scroll_id)
+            .unwrap_or_default()
+    }
+
+    /// <https://drafts.csswg.org/cssom-view/#scroll-an-element>
+    // TODO(stevennovaryo): Need to update the scroll API to follow the spec since it is quite outdated.
+    pub(crate) fn scroll_an_element(
+        &self,
+        element: &Element,
+        x_: f64,
+        y_: f64,
+        behavior: ScrollBehavior,
+    ) {
+        let scroll_id = ExternalScrollId(
+            combine_id_with_fragment_type(
+                element.upcast::<Node>().to_opaque().id(),
+                FragmentType::FragmentBody,
+            ),
+            self.pipeline_id().into(),
+        );
+
+        // Step 6.
+        // > Perform a scroll of box to position, element as the associated element and behavior as
+        // > the scroll behavior.
         self.perform_a_scroll(
             x_.to_f32().unwrap_or(0.0f32),
             y_.to_f32().unwrap_or(0.0f32),
             scroll_id,
             behavior,
-            None,
-            can_gc,
+            Some(element),
         );
     }
 
@@ -2539,11 +2505,8 @@ impl Window {
         element: TrustedNodeAddress,
         pseudo: Option<PseudoElement>,
         property: PropertyId,
-        can_gc: CanGc,
     ) -> DOMString {
-        if !self.layout_reflow(QueryMsg::ResolvedStyleQuery, can_gc) {
-            return DOMString::new();
-        }
+        self.layout_reflow(QueryMsg::ResolvedStyleQuery);
 
         let document = self.Document();
         let animations = document.animations().sets.clone();
@@ -2562,10 +2525,9 @@ impl Window {
     pub(crate) fn get_iframe_viewport_details_if_known(
         &self,
         browsing_context_id: BrowsingContextId,
-        can_gc: CanGc,
     ) -> Option<ViewportDetails> {
         // Reflow might fail, but do a best effort to return the right size.
-        self.layout_reflow(QueryMsg::InnerWindowDimensionsQuery, can_gc);
+        self.layout_reflow(QueryMsg::InnerWindowDimensionsQuery);
         self.Document()
             .iframes()
             .get(browsing_context_id)
@@ -2576,12 +2538,8 @@ impl Window {
     pub(crate) fn offset_parent_query(
         &self,
         node: &Node,
-        can_gc: CanGc,
     ) -> (Option<DomRoot<Element>>, UntypedRect<Au>) {
-        if !self.layout_reflow(QueryMsg::OffsetParentQuery, can_gc) {
-            return (None, Rect::zero());
-        }
-
+        self.layout_reflow(QueryMsg::OffsetParentQuery);
         let response = self
             .layout
             .borrow()
@@ -2597,14 +2555,54 @@ impl Window {
         &self,
         node: &Node,
         point_in_node: UntypedPoint2D<f32>,
-        can_gc: CanGc,
     ) -> Option<usize> {
-        if !self.layout_reflow(QueryMsg::TextIndexQuery, can_gc) {
-            return None;
-        }
+        self.layout_reflow(QueryMsg::TextIndexQuery);
         self.layout
             .borrow()
             .query_text_indext(node.to_opaque(), point_in_node)
+    }
+
+    pub(crate) fn elements_from_point_query(
+        &self,
+        point: LayoutPoint,
+        flags: ElementsFromPointFlags,
+    ) -> Vec<ElementsFromPointResult> {
+        self.layout_reflow(QueryMsg::ElementsFromPoint);
+        self.layout().query_elements_from_point(point, flags)
+    }
+
+    pub(crate) fn hit_test_from_input_event(
+        &self,
+        input_event: &ConstellationInputEvent,
+    ) -> Option<HitTestResult> {
+        self.hit_test_from_point_in_viewport(
+            input_event.hit_test_result.as_ref()?.point_in_viewport,
+        )
+    }
+
+    #[allow(unsafe_code)]
+    pub(crate) fn hit_test_from_point_in_viewport(
+        &self,
+        point_in_frame: Point2D<f32, CSSPixel>,
+    ) -> Option<HitTestResult> {
+        let result = self
+            .elements_from_point_query(point_in_frame.cast_unit(), ElementsFromPointFlags::empty())
+            .into_iter()
+            .nth(0)?;
+
+        let point_relative_to_initial_containing_block =
+            point_in_frame + self.scroll_offset().cast_unit();
+
+        // SAFETY: This is safe because `Window::query_elements_from_point` has ensured that
+        // layout has run and any OpaqueNodes that no longer refer to real nodes are gone.
+        let address = UntrustedNodeAddress(result.node.0 as *const c_void);
+        Some(HitTestResult {
+            node: unsafe { from_untrusted_node_address(address) },
+            cursor: result.cursor,
+            point_in_node: result.point_in_target,
+            point_in_frame,
+            point_relative_to_initial_containing_block,
+        })
     }
 
     #[allow(unsafe_code)]
@@ -2648,11 +2646,16 @@ impl Window {
             // Step 6
             // TODO: Fragment handling appears to have moved to step 13
             if let Some(fragment) = load_data.url.fragment() {
+                let webdriver_sender = self.webdriver_load_status_sender.borrow().clone();
+                if let Some(ref sender) = webdriver_sender {
+                    let _ = sender.send(WebDriverLoadStatus::NavigationStart);
+                }
+
                 self.send_to_constellation(ScriptToConstellationMessage::NavigatedToFragment(
                     load_data.url.clone(),
                     history_handling,
                 ));
-                doc.check_and_scroll_fragment(fragment, can_gc);
+                doc.check_and_scroll_fragment(fragment);
                 let this = Trusted::new(self);
                 let old_url = doc.url().into_string();
                 let new_url = load_data.url.clone().into_string();
@@ -2667,6 +2670,9 @@ impl Window {
                         new_url,
                         CanGc::note());
                     event.upcast::<Event>().fire(this.upcast::<EventTarget>(), CanGc::note());
+                    if let Some(sender) = webdriver_sender {
+                        let _ = sender.send(WebDriverLoadStatus::NavigationStop);
+                    }
                 });
                 self.as_global_scope()
                     .task_manager()
@@ -2721,13 +2727,12 @@ impl Window {
                 NavigationHistoryBehavior::Push
             };
 
+            if let Some(sender) = self.webdriver_load_status_sender.borrow().as_ref() {
+                let _ = sender.send(WebDriverLoadStatus::NavigationStart);
+            }
+
             // Step 13
-            ScriptThread::navigate(
-                window_proxy.browsing_context_id(),
-                pipeline_id,
-                load_data,
-                resolved_history_handling,
-            );
+            ScriptThread::navigate(pipeline_id, load_data, resolved_history_handling);
         };
     }
 
@@ -2739,18 +2744,19 @@ impl Window {
         self.viewport_details.get()
     }
 
+    /// Get the theme of this [`Window`].
+    pub(crate) fn theme(&self) -> Theme {
+        self.theme.get()
+    }
+
     /// Handle a theme change request, triggering a reflow is any actual change occured.
     pub(crate) fn handle_theme_change(&self, new_theme: Theme) {
-        let new_theme = match new_theme {
-            Theme::Light => PrefersColorScheme::Light,
-            Theme::Dark => PrefersColorScheme::Dark,
-        };
-
         if self.theme.get() == new_theme {
             return;
         }
         self.theme.set(new_theme);
-        self.Document().set_needs_paint(true);
+        self.Document()
+            .add_restyle_reason(RestyleReason::ThemeChanged);
     }
 
     pub(crate) fn get_url(&self) -> ServoUrl {
@@ -2771,36 +2777,32 @@ impl Window {
         self.unhandled_resize_event.borrow_mut().take()
     }
 
-    pub(crate) fn set_page_clip_rect_with_new_viewport(&self, viewport: UntypedRect<f32>) -> bool {
-        let rect = f32_rect_to_au_rect(viewport);
-        self.current_viewport.set(rect);
-        // We use a clipping rectangle that is five times the size of the of the viewport,
-        // so that we don't collect display list items for areas too far outside the viewport,
-        // but also don't trigger reflows every time the viewport changes.
-        static VIEWPORT_EXPANSION: f32 = 2.0; // 2 lengths on each side plus original length is 5 total.
-        let proposed_clip_rect = f32_rect_to_au_rect(viewport.inflate(
-            viewport.size.width * VIEWPORT_EXPANSION,
-            viewport.size.height * VIEWPORT_EXPANSION,
-        ));
-        let clip_rect = self.page_clip_rect.get();
-        if proposed_clip_rect == clip_rect {
-            return false;
+    /// Whether or not this [`Window`] has any resize events that have not been processed.
+    pub(crate) fn has_unhandled_resize_event(&self) -> bool {
+        self.unhandled_resize_event.borrow().is_some()
+    }
+
+    pub(crate) fn set_viewport_size(&self, new_viewport_size: UntypedSize2D<f32>) {
+        let new_viewport_size = Size2D::new(
+            Au::from_f32_px(new_viewport_size.width),
+            Au::from_f32_px(new_viewport_size.height),
+        );
+        if new_viewport_size == self.current_viewport_size.get() {
+            return;
         }
 
-        let had_clip_rect = clip_rect != MaxRect::max_rect();
-        if had_clip_rect && !should_move_clip_rect(clip_rect, viewport) {
-            return false;
-        }
-
-        self.page_clip_rect.set(proposed_clip_rect);
+        self.current_viewport_size.set(new_viewport_size);
 
         // The document needs to be repainted, because the initial containing block
         // is now a different size.
-        self.Document().set_needs_paint(true);
+        self.Document()
+            .add_restyle_reason(RestyleReason::ViewportSizeChanged);
 
-        // If we didn't have a clip rect, the previous display doesn't need rebuilding
-        // because it was built for infinite clip (MaxRect::amax_rect()).
-        had_clip_rect
+        // If viewport units were used, all nodes need to be restyled, because
+        // we currently do not track which ones rely on viewport units.
+        if self.layout().device().used_viewport_units() {
+            self.Document().dirty_all_nodes();
+        }
     }
 
     pub(crate) fn suspend(&self, can_gc: CanGc) {
@@ -2865,6 +2867,13 @@ impl Window {
         *self.webdriver_script_chan.borrow_mut() = chan;
     }
 
+    pub(crate) fn set_webdriver_load_status_sender(
+        &self,
+        sender: Option<GenericSender<WebDriverLoadStatus>>,
+    ) {
+        *self.webdriver_load_status_sender.borrow_mut() = sender;
+    }
+
     pub(crate) fn is_alive(&self) -> bool {
         self.current_state.get() == WindowState::Alive
     }
@@ -2895,6 +2904,18 @@ impl Window {
         );
         self.set_viewport_details(new_size);
 
+        // The document needs to be repainted, because the initial containing
+        // block is now a different size. This should be triggered before the
+        // event is fired below so that any script queries trigger a restyle.
+        self.Document()
+            .add_restyle_reason(RestyleReason::ViewportSizeChanged);
+
+        // If viewport units were used, all nodes need to be restyled, because
+        // we currently do not track which ones rely on viewport units.
+        if self.layout().device().used_viewport_units() {
+            self.Document().dirty_all_nodes();
+        }
+
         // http://dev.w3.org/csswg/cssom-view/#resizing-viewports
         if size_type == WindowSizeType::Resize {
             let uievent = UIEvent::new(
@@ -2908,10 +2929,6 @@ impl Window {
             );
             uievent.upcast::<Event>().fire(self.upcast(), can_gc);
         }
-
-        // The document needs to be repainted, because the initial containing block
-        // is now a different size.
-        self.Document().set_needs_paint(true);
 
         true
     }
@@ -2995,6 +3012,69 @@ impl Window {
     pub(crate) fn in_immersive_xr_session(&self) -> bool {
         false
     }
+
+    #[allow(unsafe_code)]
+    fn handle_pending_images_post_reflow(
+        &self,
+        pending_images: Vec<PendingImage>,
+        pending_rasterization_images: Vec<PendingRasterizationImage>,
+        pending_svg_element_for_serialization: Vec<UntrustedNodeAddress>,
+    ) {
+        let pipeline_id = self.pipeline_id();
+        for image in pending_images {
+            let id = image.id;
+            let node = unsafe { from_untrusted_node_address(image.node) };
+
+            if let PendingImageState::Unrequested(ref url) = image.state {
+                fetch_image_for_layout(url.clone(), &node, id, self.image_cache.clone());
+            }
+
+            let mut images = self.pending_layout_images.borrow_mut();
+            if !images.contains_key(&id) {
+                let trusted_node = Trusted::new(&*node);
+                let sender = self.register_image_cache_listener(id, move |response| {
+                    trusted_node
+                        .root()
+                        .owner_window()
+                        .pending_layout_image_notification(response);
+                });
+
+                self.image_cache
+                    .add_listener(ImageLoadListener::new(sender, pipeline_id, id));
+            }
+
+            let nodes = images.entry(id).or_default();
+            if !nodes.iter().any(|n| std::ptr::eq(&**n, &*node)) {
+                nodes.push(Dom::from_ref(&*node));
+            }
+        }
+
+        for image in pending_rasterization_images {
+            let node = unsafe { from_untrusted_node_address(image.node) };
+
+            let mut images = self.pending_images_for_rasterization.borrow_mut();
+            if !images.contains_key(&(image.id, image.size)) {
+                self.image_cache.add_rasterization_complete_listener(
+                    pipeline_id,
+                    image.id,
+                    image.size,
+                    self.image_cache_sender.clone(),
+                );
+            }
+
+            let nodes = images.entry((image.id, image.size)).or_default();
+            if !nodes.iter().any(|n| std::ptr::eq(&**n, &*node)) {
+                nodes.push(Dom::from_ref(&*node));
+            }
+        }
+
+        for node in pending_svg_element_for_serialization.into_iter() {
+            let node = unsafe { from_untrusted_node_address(node) };
+            let svg = node.downcast::<SVGSVGElement>().unwrap();
+            svg.serialize_and_cache_subtree();
+            node.dirty(NodeDamage::Other);
+        }
+    }
 }
 
 impl Window {
@@ -3006,7 +3086,7 @@ impl Window {
         script_chan: Sender<MainThreadScriptMsg>,
         layout: Box<dyn Layout>,
         font_context: Arc<FontContext>,
-        image_cache_sender: IpcSender<PendingImageResponse>,
+        image_cache_sender: IpcSender<ImageCacheResponseMessage>,
         image_cache: Arc<dyn ImageCache>,
         resource_threads: ResourceThreads,
         #[cfg(feature = "bluetooth")] bluetooth_thread: IpcSender<BluetoothRequest>,
@@ -3014,18 +3094,18 @@ impl Window {
         time_profiler_chan: TimeProfilerChan,
         devtools_chan: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
         constellation_chan: ScriptToConstellationChan,
-        control_chan: IpcSender<ScriptThreadMessage>,
+        control_chan: GenericSender<ScriptThreadMessage>,
         pipeline_id: PipelineId,
         parent_info: Option<PipelineId>,
         viewport_details: ViewportDetails,
         origin: MutableOrigin,
-        creator_url: ServoUrl,
+        creation_url: ServoUrl,
+        top_level_creation_url: ServoUrl,
         navigation_start: CrossProcessInstant,
         webgl_chan: Option<WebGLChan>,
         #[cfg(feature = "webxr")] webxr_registry: Option<webxr_api::Registry>,
         microtask_queue: Rc<MicrotaskQueue>,
         compositor_api: CrossProcessCompositorApi,
-        relayout_event: bool,
         unminify_js: bool,
         unminify_css: bool,
         local_script_source: Option<String>,
@@ -3033,10 +3113,11 @@ impl Window {
         player_context: WindowGLContext,
         #[cfg(feature = "webgpu")] gpu_id_hub: Arc<IdentityHub>,
         inherited_secure_context: Option<bool>,
+        theme: Theme,
     ) -> DomRoot<Self> {
         let error_reporter = CSSErrorReporter {
             pipelineid: pipeline_id,
-            script_chan: Arc::new(Mutex::new(control_chan)),
+            script_chan: control_chan,
         };
 
         let initial_viewport = f32_rect_to_au_rect(UntypedRect::new(
@@ -3054,21 +3135,24 @@ impl Window {
                 constellation_chan,
                 resource_threads,
                 origin,
-                Some(creator_url),
+                creation_url,
+                Some(top_level_creation_url),
                 microtask_queue,
                 #[cfg(feature = "webgpu")]
                 gpu_id_hub,
                 inherited_secure_context,
                 unminify_js,
+                Some(font_context.clone()),
             ),
+            ongoing_navigation: Default::default(),
             script_chan,
             layout: RefCell::new(layout),
-            font_context,
             image_cache_sender,
             image_cache,
             navigator: Default::default(),
             location: Default::default(),
             history: Default::default(),
+            indexeddb: Default::default(),
             custom_element_registry: Default::default(),
             window_proxy: Default::default(),
             document: Default::default(),
@@ -3085,17 +3169,16 @@ impl Window {
             bluetooth_thread,
             #[cfg(feature = "bluetooth")]
             bluetooth_extra_permission_data: BluetoothExtraPermissionData::new(),
-            page_clip_rect: Cell::new(MaxRect::max_rect()),
             unhandled_resize_event: Default::default(),
             viewport_details: Cell::new(viewport_details),
-            current_viewport: Cell::new(initial_viewport.to_untyped()),
+            current_viewport_size: Cell::new(initial_viewport.to_untyped().size),
             layout_blocker: Cell::new(LayoutBlocker::WaitingForParse),
             current_state: Cell::new(WindowState::Alive),
             devtools_marker_sender: Default::default(),
             devtools_markers: Default::default(),
             webdriver_script_chan: Default::default(),
+            webdriver_load_status_sender: Default::default(),
             error_reporter,
-            scroll_offsets: Default::default(),
             media_query_lists: DOMTracker::new(),
             #[cfg(feature = "bluetooth")]
             test_runner: Default::default(),
@@ -3104,6 +3187,7 @@ impl Window {
             webxr_registry,
             pending_image_callbacks: Default::default(),
             pending_layout_images: Default::default(),
+            pending_images_for_rasterization: Default::default(),
             unminified_css_dir: Default::default(),
             local_script_source,
             test_worklet: Default::default(),
@@ -3111,20 +3195,20 @@ impl Window {
             exists_mut_observer: Cell::new(false),
             compositor_api,
             has_sent_idle_message: Cell::new(false),
-            relayout_event,
             unminify_css,
             user_content_manager,
             player_context,
             throttled: Cell::new(false),
             layout_marker: DomRefCell::new(Rc::new(Cell::new(true))),
             current_event: DomRefCell::new(None),
-            theme: Cell::new(PrefersColorScheme::Light),
+            theme: Cell::new(theme),
             trusted_types: Default::default(),
+            reporting_observer_list: Default::default(),
+            report_list: Default::default(),
+            endpoints_list: Default::default(),
         });
 
-        unsafe {
-            WindowBinding::Wrap::<crate::DomTypeHolder>(JSContext::from_ptr(runtime.cx()), win)
-        }
+        WindowBinding::Wrap::<crate::DomTypeHolder>(GlobalScope::get_cx(), win)
     }
 
     pub(crate) fn pipeline_id(&self) -> PipelineId {
@@ -3154,7 +3238,7 @@ pub(crate) struct LayoutValue<T: MallocSizeOf> {
 #[allow(unsafe_code)]
 unsafe impl<T: JSTraceable + MallocSizeOf> JSTraceable for LayoutValue<T> {
     unsafe fn trace(&self, trc: *mut js::jsapi::JSTracer) {
-        self.value.trace(trc)
+        unsafe { self.value.trace(trc) };
     }
 }
 
@@ -3197,29 +3281,6 @@ fn should_move_clip_rect(clip_rect: UntypedRect<Au>, new_viewport: UntypedRect<f
         (clip_rect.max_x() - new_viewport.max_x()).abs() <= viewport_scroll_margin.width ||
         (clip_rect.origin.y - new_viewport.origin.y).abs() <= viewport_scroll_margin.height ||
         (clip_rect.max_y() - new_viewport.max_y()).abs() <= viewport_scroll_margin.height
-}
-
-fn debug_reflow_events(id: PipelineId, reflow_goal: &ReflowGoal) {
-    let goal_string = match *reflow_goal {
-        ReflowGoal::UpdateTheRendering => "\tFull",
-        ReflowGoal::UpdateScrollNode(_) => "\tUpdateScrollNode",
-        ReflowGoal::LayoutQuery(ref query_msg) => match *query_msg {
-            QueryMsg::ContentBox => "\tContentBoxQuery",
-            QueryMsg::ContentBoxes => "\tContentBoxesQuery",
-            QueryMsg::NodesFromPointQuery => "\tNodesFromPointQuery",
-            QueryMsg::ClientRectQuery => "\tClientRectQuery",
-            QueryMsg::ScrollingAreaQuery => "\tNodeScrollGeometryQuery",
-            QueryMsg::ResolvedStyleQuery => "\tResolvedStyleQuery",
-            QueryMsg::ResolvedFontStyleQuery => "\nResolvedFontStyleQuery",
-            QueryMsg::OffsetParentQuery => "\tOffsetParentQuery",
-            QueryMsg::StyleQuery => "\tStyleQuery",
-            QueryMsg::TextIndexQuery => "\tTextIndexQuery",
-            QueryMsg::ElementInnerOuterTextQuery => "\tElementInnerOuterTextQuery",
-            QueryMsg::InnerWindowDimensionsQuery => "\tInnerWindowDimensionsQuery",
-        },
-    };
-
-    println!("**** pipeline={id}\t{goal_string}");
 }
 
 impl Window {
@@ -3278,14 +3339,10 @@ impl Window {
     }
 }
 
-#[derive(Clone, MallocSizeOf)]
+#[derive(MallocSizeOf)]
 pub(crate) struct CSSErrorReporter {
     pub(crate) pipelineid: PipelineId,
-    // Arc+Mutex combo is necessary to make this struct Sync,
-    // which is necessary to fulfill the bounds required by the
-    // uses of the ParseErrorReporter trait.
-    #[ignore_malloc_size_of = "Arc is defined in libstd"]
-    pub(crate) script_chan: Arc<Mutex<IpcSender<ScriptThreadMessage>>>,
+    pub(crate) script_chan: GenericSender<ScriptThreadMessage>,
 }
 unsafe_no_jsmanaged_fields!(CSSErrorReporter);
 
@@ -3306,18 +3363,14 @@ impl ParseErrorReporter for CSSErrorReporter {
             )
         }
 
-        //TODO: report a real filename
-        let _ = self
-            .script_chan
-            .lock()
-            .unwrap()
-            .send(ScriptThreadMessage::ReportCSSError(
-                self.pipelineid,
-                url.0.to_string(),
-                location.line,
-                location.column,
-                error.to_string(),
-            ));
+        // TODO: report a real filename
+        let _ = self.script_chan.send(ScriptThreadMessage::ReportCSSError(
+            self.pipelineid,
+            url.0.to_string(),
+            location.line,
+            location.column,
+            error.to_string(),
+        ));
     }
 }
 

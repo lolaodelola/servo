@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use core::f32;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::mem;
 use std::sync::Arc;
 
@@ -14,9 +14,11 @@ use compositing_traits::display_list::{
     AxesScrollSensitivity, CompositorDisplayListInfo, ReferenceFrameNodeInfo, ScrollableNodeInfo,
     SpatialTreeNodeInfo, StickyNodeInfo,
 };
+use embedder_traits::ViewportDetails;
 use euclid::SideOffsets2D;
 use euclid::default::{Point2D, Rect, Size2D};
 use log::warn;
+use malloc_size_of_derive::MallocSizeOf;
 use servo_config::opts::DebugOptions;
 use style::Zero;
 use style::color::AbsoluteColor;
@@ -32,7 +34,7 @@ use style::values::generics::box_::Perspective;
 use style::values::generics::transform::{self, GenericRotate, GenericScale, GenericTranslate};
 use style::values::specified::box_::DisplayOutside;
 use webrender_api::units::{LayoutPoint, LayoutRect, LayoutTransform, LayoutVector2D};
-use webrender_api::{self as wr, BorderRadius};
+use webrender_api::{self as wr, BorderRadius, ExternalScrollId};
 use wr::StickyOffsetBounds;
 use wr::units::{LayoutPixel, LayoutSize};
 
@@ -91,7 +93,7 @@ impl ContainingBlock {
 
 pub(crate) type ContainingBlockInfo<'a> = ContainingBlockManager<'a, ContainingBlock>;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, MallocSizeOf, PartialEq, PartialOrd)]
 pub(crate) enum StackingContextSection {
     OwnBackgroundsAndBorders,
     DescendantBackgroundsAndBorders,
@@ -99,6 +101,24 @@ pub(crate) enum StackingContextSection {
     Outline,
 }
 
+#[derive(MallocSizeOf)]
+pub(crate) struct ScrollFrameHitTestItem {
+    /// The [`ScrollTreeNodeId`] of the spatial node that contains this hit test item.
+    pub scroll_node_id: ScrollTreeNodeId,
+
+    /// The [`ClipId`] of the clip that clips this [`ScrollFrameHitTestItems`].
+    pub clip_id: ClipId,
+
+    /// The rectangle of the scroll frame in the coordinate space of [`Self::scroll_node_id`].
+    pub rect: LayoutRect,
+
+    /// The WebRender [`ExternalScrollId`] of the scrolling spatial node that
+    /// this [`ScrollFrameHitTestItem`] identifies. Note that this is a *different*
+    /// spatial node than the one identified by [`Self::scroll_node_id`] (the parent).
+    pub external_scroll_id: ExternalScrollId,
+}
+
+#[derive(MallocSizeOf)]
 pub(crate) struct StackingContextTree {
     /// The root stacking context of this [`StackingContextTree`].
     pub root_stacking_context: StackingContext,
@@ -113,6 +133,10 @@ pub(crate) struct StackingContextTree {
     /// for things like `overflow`. More clips may be created later during WebRender
     /// display list construction, but they are never added here.
     pub clip_store: StackingContextTreeClipStore,
+
+    /// A vector of hit test items, one per scroll frame. These are used for allowing
+    /// renderer-side scrolling in the Servo renderer.
+    pub hit_test_items: Vec<ScrollFrameHitTestItem>,
 }
 
 impl StackingContextTree {
@@ -120,20 +144,25 @@ impl StackingContextTree {
     /// pipeline id.
     pub fn new(
         fragment_tree: &FragmentTree,
-        viewport_size: LayoutSize,
-        content_size: LayoutSize,
+        viewport_details: ViewportDetails,
         pipeline_id: wr::PipelineId,
-        viewport_scroll_sensitivity: AxesScrollSensitivity,
         first_reflow: bool,
         debug: &DebugOptions,
     ) -> Self {
+        let scrollable_overflow = fragment_tree.scrollable_overflow();
+        let scrollable_overflow = LayoutSize::from_untyped(Size2D::new(
+            scrollable_overflow.size.width.to_f32_px(),
+            scrollable_overflow.size.height.to_f32_px(),
+        ));
+
+        let viewport_size = viewport_details.layout_size();
         let compositor_info = CompositorDisplayListInfo::new(
-            viewport_size,
-            content_size,
+            viewport_details,
+            scrollable_overflow,
             pipeline_id,
             // This epoch is set when the WebRender display list is built. For now use a dummy value.
             wr::Epoch(0),
-            viewport_scroll_sensitivity,
+            fragment_tree.viewport_scroll_sensitivity,
             first_reflow,
         );
 
@@ -141,7 +170,7 @@ impl StackingContextTree {
         let cb_for_non_fixed_descendants = ContainingBlock::new(
             fragment_tree.initial_containing_block,
             root_scroll_node_id,
-            Some(compositor_info.viewport_size),
+            Some(viewport_size),
             ClipId::INVALID,
         );
         let cb_for_fixed_descendants = ContainingBlock::new(
@@ -168,6 +197,7 @@ impl StackingContextTree {
             root_stacking_context: StackingContext::create_root(root_scroll_node_id, debug),
             compositor_info,
             clip_store: Default::default(),
+            hit_test_items: Vec::new(),
         };
 
         let mut root_stacking_context = StackingContext::create_root(root_scroll_node_id, debug);
@@ -195,6 +225,7 @@ impl StackingContextTree {
     fn push_reference_frame(
         &mut self,
         origin: LayoutPoint,
+        frame_origin_for_query: LayoutPoint,
         parent_scroll_node_id: &ScrollTreeNodeId,
         transform_style: wr::TransformStyle,
         transform: LayoutTransform,
@@ -204,8 +235,9 @@ impl StackingContextTree {
             Some(parent_scroll_node_id),
             SpatialTreeNodeInfo::ReferenceFrame(ReferenceFrameNodeInfo {
                 origin,
+                frame_origin_for_query,
                 transform_style,
-                transform,
+                transform: transform.into(),
                 kind,
             }),
         )
@@ -227,6 +259,7 @@ impl StackingContextTree {
                 clip_rect,
                 scroll_sensitivity,
                 offset: LayoutVector2D::zero(),
+                offset_changed: Cell::new(false),
             }),
         )
     }
@@ -252,7 +285,7 @@ impl StackingContextTree {
 }
 
 /// The text decorations for a Fragment, collecting during [`StackingContextTree`] construction.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, MallocSizeOf)]
 pub(crate) struct FragmentTextDecoration {
     pub line: TextDecorationLine,
     pub color: AbsoluteColor,
@@ -263,6 +296,7 @@ pub(crate) struct FragmentTextDecoration {
 ///
 /// This is generally part of a fragment, like its borders or foreground, but it
 /// can also be a stacking container that needs to be painted in fragment order.
+#[derive(MallocSizeOf)]
 pub(crate) enum StackingContextContent {
     /// A fragment that does not generate a stacking context or stacking container.
     Fragment {
@@ -272,8 +306,8 @@ pub(crate) enum StackingContextContent {
         section: StackingContextSection,
         containing_block: PhysicalRect<Au>,
         fragment: Fragment,
-        is_hit_test_for_scrollable_overflow: bool,
         is_collapsed_table_borders: bool,
+        #[conditional_malloc_size_of]
         text_decorations: Arc<Vec<FragmentTextDecoration>>,
     },
 
@@ -284,7 +318,7 @@ pub(crate) enum StackingContextContent {
 }
 
 impl StackingContextContent {
-    fn section(&self) -> StackingContextSection {
+    pub(crate) fn section(&self) -> StackingContextSection {
         match self {
             Self::Fragment { section, .. } => *section,
             Self::AtomicInlineStackingContainer { .. } => StackingContextSection::Foreground,
@@ -304,7 +338,6 @@ impl StackingContextContent {
                 section,
                 containing_block,
                 fragment,
-                is_hit_test_for_scrollable_overflow,
                 is_collapsed_table_borders,
                 text_decorations,
             } => {
@@ -315,7 +348,6 @@ impl StackingContextContent {
                     builder,
                     containing_block,
                     *section,
-                    *is_hit_test_for_scrollable_overflow,
                     *is_collapsed_table_borders,
                     text_decorations,
                 );
@@ -327,7 +359,7 @@ impl StackingContextContent {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, MallocSizeOf, PartialEq)]
 pub(crate) enum StackingContextType {
     RealStackingContext,
     PositionedStackingContainer,
@@ -340,6 +372,7 @@ pub(crate) enum StackingContextType {
 ///
 /// We use the term “real stacking context” in situations that call for a
 /// stacking context but not a stacking container.
+#[derive(MallocSizeOf)]
 pub struct StackingContext {
     /// The spatial id of this fragment. This is used to properly handle
     /// things like preserve-3d.
@@ -356,7 +389,7 @@ pub struct StackingContext {
     context_type: StackingContextType,
 
     /// The contents that need to be painted in fragment order.
-    contents: Vec<StackingContextContent>,
+    pub(super) contents: Vec<StackingContextContent>,
 
     /// Stacking contexts that need to be stolen by the parent stacking context
     /// if this is a stacking container, that is, real stacking contexts and
@@ -367,13 +400,13 @@ pub struct StackingContext {
     /// >     if it created a new stacking context, but omitting any positioned
     /// >     descendants or descendants that actually create a stacking context
     /// >     (letting the parent stacking context paint them, instead).
-    real_stacking_contexts_and_positioned_stacking_containers: Vec<StackingContext>,
+    pub(super) real_stacking_contexts_and_positioned_stacking_containers: Vec<StackingContext>,
 
     /// Float stacking containers.
     /// Separate from real_stacking_contexts_or_positioned_stacking_containers
     /// because they should never be stolen by the parent stacking context.
     /// <https://drafts.csswg.org/css-position-4/#paint-a-stacking-container>
-    float_stacking_containers: Vec<StackingContext>,
+    pub(super) float_stacking_containers: Vec<StackingContext>,
 
     /// Atomic inline stacking containers.
     /// Separate from real_stacking_contexts_or_positioned_stacking_containers
@@ -382,26 +415,25 @@ pub struct StackingContext {
     /// can index into this vec to paint them in fragment order.
     /// <https://drafts.csswg.org/css-position-4/#paint-a-stacking-container>
     /// <https://drafts.csswg.org/css-position-4/#paint-a-box-in-a-line-box>
-    atomic_inline_stacking_containers: Vec<StackingContext>,
+    pub(super) atomic_inline_stacking_containers: Vec<StackingContext>,
 
     /// Information gathered about the painting order, for [Self::debug_print].
     debug_print_items: Option<RefCell<Vec<DebugPrintItem>>>,
 }
 
 /// Refers to one of the child contents or stacking contexts of a [StackingContext].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, MallocSizeOf)]
 pub struct DebugPrintItem {
     field: DebugPrintField,
     index: usize,
 }
 
 /// Refers to one of the vecs of a [StackingContext].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, MallocSizeOf)]
 pub enum DebugPrintField {
     Contents,
     RealStackingContextsAndPositionedStackingContainers,
     FloatStackingContainers,
-    AtomicInlineStackingContainers,
 }
 
 impl StackingContext {
@@ -464,7 +496,7 @@ impl StackingContext {
         .push(stacking_context)
     }
 
-    fn z_index(&self) -> i32 {
+    pub(crate) fn z_index(&self) -> i32 {
         self.initializing_fragment.as_ref().map_or(0, |fragment| {
             let fragment = fragment.borrow();
             fragment.style.effective_z_index(fragment.base.flags)
@@ -572,7 +604,7 @@ impl StackingContext {
     pub(crate) fn build_canvas_background_display_list(
         &self,
         builder: &mut DisplayListBuilder,
-        fragment_tree: &crate::FragmentTree,
+        fragment_tree: &crate::fragment_tree::FragmentTree,
     ) {
         let Some(root_fragment) = fragment_tree.root_fragments.iter().find(|fragment| {
             fragment
@@ -618,7 +650,7 @@ impl StackingContext {
         // If it’s larger, we also want to paint areas reachable after scrolling.
         let painting_area = fragment_tree
             .initial_containing_block
-            .union(&fragment_tree.scrollable_overflow)
+            .union(&fragment_tree.scrollable_overflow())
             .to_webrender();
 
         let background_color =
@@ -632,7 +664,6 @@ impl StackingContext {
         let mut fragment_builder = BuilderForBoxFragment::new(
             &root_fragment,
             &fragment_tree.initial_containing_block,
-            false, /* is_hit_test_for_scrollable_overflow */
             false, /* is_collapsed_table_borders */
         );
         let painter = super::background::BackgroundPainter {
@@ -643,6 +674,9 @@ impl StackingContext {
         fragment_builder.build_background_image(builder, &painter);
     }
 
+    /// Build a display list from a a [`StackingContext`]. Note that this is the forward
+    /// version of the reversed stacking context walk algorithm in `hit_test.rs`. Any
+    /// changes made here should be reflected in the reverse version in that file.
     pub(crate) fn build_display_list(&self, builder: &mut DisplayListBuilder) {
         let pushed_context = self.push_webrender_stacking_context_if_necessary(builder);
 
@@ -787,9 +821,6 @@ impl StackingContext {
                 DebugPrintField::FloatStackingContainers => {
                     self.float_stacking_containers[*index].debug_print_with_tree(tree);
                 },
-                DebugPrintField::AtomicInlineStackingContainers => {
-                    // do nothing; we print these in DebugPrintField::Contents
-                },
             }
         }
         match self.context_type {
@@ -833,16 +864,6 @@ impl Fragment {
                     Fragment::Float(..) => &Default::default(),
                     _ => text_decorations,
                 };
-
-                // If this fragment has a transform applied that makes it take up no space
-                // then we don't need to create any stacking contexts for it.
-                let has_non_invertible_transform = fragment
-                    .has_non_invertible_transform_or_zero_scale(
-                        &containing_block.rect.to_untyped(),
-                    );
-                if has_non_invertible_transform {
-                    return;
-                }
 
                 fragment.build_stacking_context_tree(
                     fragment_clone,
@@ -890,7 +911,6 @@ impl Fragment {
                         clip_id: containing_block.clip_id,
                         containing_block: containing_block.rect,
                         fragment: fragment_clone,
-                        is_hit_test_for_scrollable_overflow: false,
                         is_collapsed_table_borders: false,
                         text_decorations: text_decorations.clone(),
                     });
@@ -916,7 +936,8 @@ struct OverflowFrameData {
 
 impl BoxFragment {
     fn get_stacking_context_type(&self) -> Option<StackingContextType> {
-        if self.style.establishes_stacking_context(self.base.flags) {
+        let flags = self.base.flags;
+        if self.style.establishes_stacking_context(flags) {
             return Some(StackingContextType::RealStackingContext);
         }
 
@@ -929,7 +950,10 @@ impl BoxFragment {
             return Some(StackingContextType::FloatStackingContainer);
         }
 
-        if self.is_atomic_inline_level() {
+        // Flex and grid items are painted like inline blocks.
+        // <https://drafts.csswg.org/css-flexbox-1/#painting>
+        // <https://drafts.csswg.org/css-grid/#z-order>
+        if self.is_atomic_inline_level() || flags.contains(FragmentFlags::IS_FLEX_OR_GRID_ITEM) {
             return Some(StackingContextType::AtomicInlineStackingContainer);
         }
 
@@ -991,8 +1015,18 @@ impl BoxFragment {
                 },
             };
 
+        // <https://drafts.csswg.org/css-transforms/#transform-function-lists>
+        // > If a transform function causes the current transformation matrix of an object
+        // > to be non-invertible, the object and its content do not get displayed.
+        if !reference_frame_data.transform.is_invertible() {
+            return;
+        }
+
+        let frame_origin_for_query = self.cumulative_border_box_rect().origin.to_webrender();
+
         let new_spatial_id = stacking_context_tree.push_reference_frame(
             reference_frame_data.origin.to_webrender(),
+            frame_origin_for_query,
             &containing_block.scroll_node_id,
             self.style.get_box().transform_style.to_webrender(),
             reference_frame_data.transform,
@@ -1080,7 +1114,6 @@ impl BoxFragment {
                 BuilderForBoxFragment::new(
                     self,
                     &containing_block.rect,
-                    false, /* is_hit_test_for_scrollable_overflow */
                     false, /* is_collapsed_table_borders */
                 ),
             )
@@ -1164,7 +1197,6 @@ impl BoxFragment {
             BuilderForBoxFragment::new(
                 self,
                 &containing_block.rect,
-                false, /* is_hit_test_for_scrollable_overflow*/
                 false, /* is_collapsed_table_borders */
             ),
         ) {
@@ -1197,7 +1229,6 @@ impl BoxFragment {
                     section,
                     containing_block: containing_block.rect,
                     fragment: fragment.clone(),
-                    is_hit_test_for_scrollable_overflow: false,
                     is_collapsed_table_borders: false,
                     text_decorations: text_decorations.clone(),
                 });
@@ -1208,6 +1239,11 @@ impl BoxFragment {
         if !self.style.get_outline().outline_width.is_zero() {
             add_fragment(StackingContextSection::Outline);
         }
+
+        // Spatial tree node that will affect the transform of the fragment. Note that the next frame,
+        // scroll frame, does not affect the transform of the fragment but affect the transform of it
+        // children.
+        *self.spatial_tree_node.borrow_mut() = Some(new_scroll_node_id);
 
         // We want to build the scroll frame after the background and border, because
         // they shouldn't scroll with the rest of the box content.
@@ -1221,21 +1257,6 @@ impl BoxFragment {
             if let Some(scroll_frame_data) = overflow_frame_data.scroll_frame_data {
                 new_scroll_node_id = scroll_frame_data.scroll_tree_node_id;
                 new_scroll_frame_size = Some(scroll_frame_data.scroll_frame_rect.size());
-
-                stacking_context
-                    .contents
-                    .push(StackingContextContent::Fragment {
-                        scroll_node_id: new_scroll_node_id,
-                        reference_frame_scroll_node_id:
-                            reference_frame_scroll_node_id_for_fragments,
-                        clip_id: new_clip_id,
-                        section,
-                        containing_block: containing_block.rect,
-                        fragment: fragment.clone(),
-                        is_hit_test_for_scrollable_overflow: true,
-                        is_collapsed_table_borders: false,
-                        text_decorations: text_decorations.clone(),
-                    });
             }
         }
 
@@ -1320,7 +1341,7 @@ impl BoxFragment {
         }
 
         if matches!(&fragment, Fragment::Box(box_fragment) if matches!(
-            box_fragment.borrow().specific_layout_info,
+            box_fragment.borrow().specific_layout_info(),
             Some(SpecificLayoutInfo::TableGridWithCollapsedBorders(_))
         )) {
             stacking_context
@@ -1332,7 +1353,6 @@ impl BoxFragment {
                     section,
                     containing_block: containing_block.rect,
                     fragment: fragment.clone(),
-                    is_hit_test_for_scrollable_overflow: false,
                     is_collapsed_table_borders: true,
                     text_decorations: text_decorations.clone(),
                 });
@@ -1349,7 +1369,7 @@ impl BoxFragment {
         let position = self.style.get_box().position;
         // https://drafts.csswg.org/css2/#clipping
         // The clip property applies only to absolutely positioned elements
-        if position != ComputedPosition::Absolute && position != ComputedPosition::Fixed {
+        if !position.is_absolutely_positioned() {
             return None;
         }
 
@@ -1404,7 +1424,7 @@ impl BoxFragment {
             // https://drafts.csswg.org/css-overflow-3/#corner-clipping
             let radii;
             if overflow.x == ComputedOverflow::Clip && overflow.y == ComputedOverflow::Clip {
-                let builder = BuilderForBoxFragment::new(self, containing_block_rect, false, false);
+                let builder = BuilderForBoxFragment::new(self, containing_block_rect, false);
                 radii = offset_radii(builder.border_radius, clip_margin);
             } else if overflow.x != ComputedOverflow::Clip {
                 overflow_clip_rect.min.x = f32::MIN;
@@ -1429,39 +1449,20 @@ impl BoxFragment {
             });
         }
 
-        // scrollable overflow path
-        // From https://drafts.csswg.org/css-overflow/#propdef-overflow:
-        // > UAs must apply the overflow-* values set on the root element to the viewport when the
-        // > root element’s display value is not none. However, when the root element is an [HTML]
-        // > html element (including XML syntax for HTML) whose overflow value is visible (in both
-        // > axes), and that element has as a child a body element whose display value is also not
-        // > none, user agents must instead apply the overflow-* values of the first such child
-        // > element to the viewport. The element from which the value is propagated must then have a
-        // > used overflow value of visible.
-        //
-        // TODO: This should only happen when the `display` value is actually propagated.
-        if self
-            .base
-            .flags
-            .contains(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT)
-        {
-            return None;
-        }
-
         let scroll_frame_rect = self
             .padding_rect()
             .translate(containing_block_rect.origin.to_vector())
             .to_webrender();
 
         let clip_id = stacking_context_tree.clip_store.add(
-            BuilderForBoxFragment::new(self, containing_block_rect, false, false).border_radius,
+            BuilderForBoxFragment::new(self, containing_block_rect, false).border_radius,
             scroll_frame_rect,
             *parent_scroll_node_id,
             parent_clip_id,
         );
 
         let tag = self.base.tag?;
-        let external_id = wr::ExternalScrollId(
+        let external_scroll_id = wr::ExternalScrollId(
             tag.to_display_list_fragment_id(),
             stacking_context_tree.compositor_info.pipeline_id,
         );
@@ -1471,15 +1472,26 @@ impl BoxFragment {
             y: overflow.y.into(),
         };
 
-        let content_rect = self.reachable_scrollable_overflow_region().to_webrender();
-
         let scroll_tree_node_id = stacking_context_tree.define_scroll_frame(
             parent_scroll_node_id,
-            external_id,
-            content_rect,
+            external_scroll_id,
+            self.scrollable_overflow().to_webrender(),
             scroll_frame_rect,
             sensitivity,
         );
+
+        use style::computed_values::pointer_events::T as PointerEvents;
+
+        if self.style.get_inherited_ui().pointer_events != PointerEvents::None {
+            stacking_context_tree
+                .hit_test_items
+                .push(ScrollFrameHitTestItem {
+                    scroll_node_id: *parent_scroll_node_id,
+                    clip_id,
+                    rect: scroll_frame_rect,
+                    external_scroll_id,
+                });
+        }
 
         Some(OverflowFrameData {
             clip_id,
@@ -1505,7 +1517,10 @@ impl BoxFragment {
             Some(size) => size,
             None => {
                 // This is a direct descendant of a reference frame.
-                &stacking_context_tree.compositor_info.viewport_size
+                &stacking_context_tree
+                    .compositor_info
+                    .viewport_details
+                    .layout_size()
             },
         };
 
@@ -1622,15 +1637,6 @@ impl BoxFragment {
         })
     }
 
-    /// Returns true if the given style contains a transform that is not invertible.
-    fn has_non_invertible_transform_or_zero_scale(&self, containing_block: &Rect<Au>) -> bool {
-        let list = &self.style.get_box().transform;
-        match list.to_transform_3d_matrix(Some(&au_rect_to_length_rect(containing_block))) {
-            Ok(t) => !t.0.is_invertible() || t.0.m11 == 0. || t.0.m22 == 0.,
-            Err(_) => false,
-        }
-    }
-
     /// Returns the 4D matrix representing this fragment's transform.
     pub fn calculate_transform_matrix(&self, border_rect: &Rect<Au>) -> Option<LayoutTransform> {
         let list = &self.style.get_box().transform;
@@ -1660,11 +1666,6 @@ impl BoxFragment {
             .then_rotate(rotate.0, rotate.1, rotate.2, angle)
             .then_scale(scale.0, scale.1, scale.2)
             .then(&translation);
-        // WebRender will end up dividing by the scale value of this transform, so we
-        // want to ensure we don't feed it a divisor of 0.
-        if transform.m11 == 0. || transform.m22 == 0. {
-            return Some(LayoutTransform::identity());
-        }
 
         let transform_origin = &self.style.get_box().transform_origin;
         let transform_origin_x = transform_origin

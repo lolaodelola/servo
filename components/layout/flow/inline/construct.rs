@@ -18,6 +18,7 @@ use super::{
 };
 use crate::cell::ArcRefCell;
 use crate::context::LayoutContext;
+use crate::dom::LayoutBox;
 use crate::dom_traversal::NodeAndStyleInfo;
 use crate::flow::float::FloatBox;
 use crate::formatting_contexts::IndependentFormattingContext;
@@ -70,7 +71,7 @@ pub(crate) struct InlineFormattingContextBuilder {
     /// The traversal is at all times as deep in the tree as this stack is,
     /// which is why the code doesn't need to keep track of the actual
     /// container root (see `handle_inline_level_element`).
-    //_
+    // _
     /// When an inline box ends, it's removed from this stack.
     inline_box_stack: Vec<InlineBoxIdentifier>,
 
@@ -83,6 +84,15 @@ pub(crate) struct InlineFormattingContextBuilder {
     ///
     /// [to be split]: https://www.w3.org/TR/CSS2/visuren.html#anonymous-block-level
     block_in_inline_splits: Vec<Vec<ArcRefCell<InlineItem>>>,
+
+    /// If the [`InlineBox`] of an inline-level element is not damaged, it can be reused
+    /// to support incremental layout. An [`InlineBox`] can be split by block elements
+    /// into multiple [`InlineBox`]es, all inserted into different
+    /// [`InlineFormattingContext`]s. Therefore, [`Self::old_block_in_inline_splits`] is
+    /// used to hold all these split inline boxes from the previous box tree construction
+    /// that are about to be reused, ensuring they can be sequentially inserted into each
+    /// newly built [`InlineFormattingContext`].
+    old_block_in_inline_splits: Vec<Vec<ArcRefCell<InlineBox>>>,
 
     /// Whether or not the inline formatting context under construction has any
     /// uncollapsible text content.
@@ -153,10 +163,21 @@ impl InlineFormattingContextBuilder {
 
     pub(crate) fn push_atomic(
         &mut self,
-        independent_formatting_context: IndependentFormattingContext,
+        independent_formatting_context_creator: impl FnOnce()
+            -> ArcRefCell<IndependentFormattingContext>,
+        old_layout_box: Option<LayoutBox>,
     ) -> ArcRefCell<InlineItem> {
+        // If there is an existing undamaged layout box that's compatible, use that.
+        let independent_formatting_context = old_layout_box
+            .and_then(LayoutBox::unsplit_inline_level_layout_box)
+            .and_then(|inline_item| match &*inline_item.borrow() {
+                InlineItem::Atomic(atomic, ..) => Some(atomic.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(independent_formatting_context_creator);
+
         let inline_level_box = ArcRefCell::new(InlineItem::Atomic(
-            ArcRefCell::new(independent_formatting_context),
+            independent_formatting_context,
             self.current_text_offset,
             Level::ltr(), /* This will be assigned later if necessary. */
         ));
@@ -174,9 +195,20 @@ impl InlineFormattingContextBuilder {
 
     pub(crate) fn push_absolutely_positioned_box(
         &mut self,
-        absolutely_positioned_box: AbsolutelyPositionedBox,
+        absolutely_positioned_box_creator: impl FnOnce() -> ArcRefCell<AbsolutelyPositionedBox>,
+        old_layout_box: Option<LayoutBox>,
     ) -> ArcRefCell<InlineItem> {
-        let absolutely_positioned_box = ArcRefCell::new(absolutely_positioned_box);
+        let absolutely_positioned_box = old_layout_box
+            .and_then(LayoutBox::unsplit_inline_level_layout_box)
+            .and_then(|inline_item| match &*inline_item.borrow() {
+                InlineItem::OutOfFlowAbsolutelyPositionedBox(positioned_box, ..) => {
+                    Some(positioned_box.clone())
+                },
+                _ => None,
+            })
+            .unwrap_or_else(absolutely_positioned_box_creator);
+
+        // We cannot just reuse the old inline item, because the `current_text_offset` may have changed.
         let inline_level_box = ArcRefCell::new(InlineItem::OutOfFlowAbsolutelyPositionedBox(
             absolutely_positioned_box,
             self.current_text_offset,
@@ -186,9 +218,23 @@ impl InlineFormattingContextBuilder {
         inline_level_box
     }
 
-    pub(crate) fn push_float_box(&mut self, float_box: FloatBox) -> ArcRefCell<InlineItem> {
-        let inline_level_box =
-            ArcRefCell::new(InlineItem::OutOfFlowFloatBox(ArcRefCell::new(float_box)));
+    pub(crate) fn push_float_box(
+        &mut self,
+        float_box_creator: impl FnOnce() -> ArcRefCell<FloatBox>,
+        old_layout_box: Option<LayoutBox>,
+    ) -> ArcRefCell<InlineItem> {
+        let inline_level_box = old_layout_box
+            .and_then(LayoutBox::unsplit_inline_level_layout_box)
+            .unwrap_or_else(|| ArcRefCell::new(InlineItem::OutOfFlowFloatBox(float_box_creator())));
+
+        debug_assert!(
+            matches!(
+                &*inline_level_box.borrow(),
+                InlineItem::OutOfFlowFloatBox(..),
+            ),
+            "Created float box with incompatible `old_layout_box`"
+        );
+
         self.inline_items.push(inline_level_box.clone());
         self.contains_floats = true;
         inline_level_box
@@ -196,20 +242,60 @@ impl InlineFormattingContextBuilder {
 
     pub(crate) fn start_inline_box(
         &mut self,
-        inline_box: InlineBox,
+        inline_box_creator: impl FnOnce() -> ArcRefCell<InlineBox>,
         block_in_inline_splits: Option<Vec<ArcRefCell<InlineItem>>>,
+        old_layout_box: Option<LayoutBox>,
     ) {
-        self.push_control_character_string(inline_box.base.style.bidi_control_chars().0);
+        // If there is an existing undamaged layout box that's compatible, use the `InlineBox` within it.
+        if let Some(LayoutBox::InlineLevel(inline_level_box)) = old_layout_box {
+            let old_block_in_inline_splits: Vec<ArcRefCell<InlineBox>> = inline_level_box
+                .iter()
+                .rev() // reverse to facilate the `Vec::pop` operation
+                .filter_map(|inline_item| match &*inline_item.borrow() {
+                    InlineItem::StartInlineBox(inline_box) => Some(inline_box.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            debug_assert!(
+                old_block_in_inline_splits.is_empty() ||
+                    old_block_in_inline_splits.len() == inline_level_box.len(),
+                "Create inline box with incompatible `old_layout_box`"
+            );
+
+            self.start_inline_box_internal(
+                inline_box_creator,
+                block_in_inline_splits,
+                old_block_in_inline_splits,
+            );
+        } else {
+            self.start_inline_box_internal(inline_box_creator, block_in_inline_splits, vec![]);
+        }
+    }
+
+    pub fn start_inline_box_internal(
+        &mut self,
+        inline_box_creator: impl FnOnce() -> ArcRefCell<InlineBox>,
+        block_in_inline_splits: Option<Vec<ArcRefCell<InlineItem>>>,
+        mut old_block_in_inline_splits: Vec<ArcRefCell<InlineBox>>,
+    ) {
+        let inline_box = old_block_in_inline_splits
+            .pop()
+            .unwrap_or_else(inline_box_creator);
+
+        let borrowed_inline_box = inline_box.borrow();
+        self.push_control_character_string(borrowed_inline_box.base.style.bidi_control_chars().0);
 
         // Don't push a `SharedInlineStyles` if we are pushing this box when splitting
         // an IFC for a block-in-inline split. Shared styles are pushed as part of setting
         // up the second split of the IFC.
-        if inline_box.is_first_split {
+        if borrowed_inline_box.is_first_split {
             self.shared_inline_styles_stack
-                .push(inline_box.shared_inline_styles.clone());
+                .push(borrowed_inline_box.shared_inline_styles.clone());
         }
+        std::mem::drop(borrowed_inline_box);
 
-        let (identifier, inline_box) = self.inline_boxes.start_inline_box(inline_box);
+        let identifier = self.inline_boxes.start_inline_box(inline_box.clone());
         let inline_level_box = ArcRefCell::new(InlineItem::StartInlineBox(inline_box));
         self.inline_items.push(inline_level_box.clone());
         self.inline_box_stack.push(identifier);
@@ -217,6 +303,9 @@ impl InlineFormattingContextBuilder {
         let mut block_in_inline_splits = block_in_inline_splits.unwrap_or_default();
         block_in_inline_splits.push(inline_level_box);
         self.block_in_inline_splits.push(block_in_inline_splits);
+
+        self.old_block_in_inline_splits
+            .push(old_block_in_inline_splits);
     }
 
     /// End the ongoing inline box in this [`InlineFormattingContextBuilder`], returning
@@ -233,6 +322,14 @@ impl InlineFormattingContextBuilder {
             inline_level_box.is_last_split = true;
             self.push_control_character_string(inline_level_box.base.style.bidi_control_chars().1);
         }
+
+        debug_assert!(
+            self.old_block_in_inline_splits
+                .last()
+                .is_some_and(|inline_boxes| inline_boxes.is_empty()),
+            "Reuse incompatible `old_block_in_inline_splits` for inline boxes",
+        );
+        let _ = self.old_block_in_inline_splits.pop();
 
         block_in_inline_splits.unwrap_or_default()
     }
@@ -357,20 +454,31 @@ impl InlineFormattingContextBuilder {
         let mut new_builder = Self::new_for_shared_styles(self.shared_inline_styles_stack.clone());
 
         let block_in_inline_splits = std::mem::take(&mut self.block_in_inline_splits);
-        for (identifier, historical_inline_boxes) in
-            izip!(self.inline_box_stack.iter(), block_in_inline_splits)
-        {
+        let old_block_in_inline_splits = std::mem::take(&mut self.old_block_in_inline_splits);
+        for (identifier, already_collected_inline_boxes, being_recollected_inline_boxes) in izip!(
+            self.inline_box_stack.iter(),
+            block_in_inline_splits,
+            old_block_in_inline_splits
+        ) {
             // Start a new inline box for every ongoing inline box in this
             // InlineFormattingContext once we are done processing this block element,
             // being sure to give the block-in-inline-split to the new
             // InlineFormattingContext. These will finally be inserted into the DOM's
-            // BoxSlot once the inline box has been fully processed.
-            new_builder.start_inline_box(
-                self.inline_boxes
-                    .get(identifier)
-                    .borrow()
-                    .split_around_block(),
-                Some(historical_inline_boxes),
+            // BoxSlot once the inline box has been fully processed. Meanwhile, being
+            // sure to give the old-block-in-inline-split to new InlineFormattingContext,
+            // so that them will be inserted into each following InlineFormattingContext.
+            let split_inline_box_callback = || {
+                ArcRefCell::new(
+                    self.inline_boxes
+                        .get(identifier)
+                        .borrow()
+                        .split_around_block(),
+                )
+            };
+            new_builder.start_inline_box_internal(
+                split_inline_box_callback,
+                Some(already_collected_inline_boxes),
+                being_recollected_inline_boxes,
             );
         }
         let mut inline_builder_from_before_split = std::mem::replace(self, new_builder);
@@ -403,6 +511,7 @@ impl InlineFormattingContextBuilder {
         }
 
         assert!(self.inline_box_stack.is_empty());
+        debug_assert!(self.old_block_in_inline_splits.is_empty());
         Some(InlineFormattingContext::new_with_builder(
             self,
             layout_context,
@@ -672,7 +781,7 @@ where
 
 /// Given a string and whether the start of the string represents a word boundary, create a copy of
 /// the string with letters after word boundaries capitalized.
-fn capitalize_string(string: &str, allow_word_at_start: bool) -> String {
+pub(crate) fn capitalize_string(string: &str, allow_word_at_start: bool) -> String {
     let mut output_string = String::new();
     output_string.reserve(string.len());
 

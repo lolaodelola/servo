@@ -8,12 +8,14 @@ use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
 
+use base::generic_channel::GenericSender;
+use base::id::CookieStoreId;
 use cookie::Cookie;
 use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
@@ -23,14 +25,16 @@ use ipc_channel::ipc::{self, IpcReceiver, IpcReceiverSet, IpcSender};
 use log::{debug, trace, warn};
 use net_traits::blob_url_store::parse_blob_url;
 use net_traits::filemanager_thread::FileTokenCheck;
+use net_traits::indexeddb_thread::IndexedDBThreadMsg;
 use net_traits::pub_domains::public_suffix_list_size_of;
 use net_traits::request::{Destination, RequestBuilder, RequestId};
 use net_traits::response::{Response, ResponseInit};
 use net_traits::storage_thread::StorageThreadMsg;
 use net_traits::{
-    CookieSource, CoreResourceMsg, CoreResourceThread, CustomResponseMediator, DiscardFetch,
-    FetchChannels, FetchTaskTarget, ResourceFetchTiming, ResourceThreads, ResourceTimingType,
-    WebSocketDomAction, WebSocketNetworkEvent,
+    AsyncRuntime, CookieAsyncResponse, CookieData, CookieSource, CoreResourceMsg,
+    CoreResourceThread, CustomResponseMediator, DiscardFetch, FetchChannels, FetchTaskTarget,
+    ResourceFetchTiming, ResourceThreads, ResourceTimingType, WebSocketDomAction,
+    WebSocketNetworkEvent,
 };
 use profile_traits::mem::{
     ProcessReports, ProfilerChan as MemProfilerChan, Report, ReportKind, ReportsChan,
@@ -43,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
 use servo_url::{ImmutableOrigin, ServoUrl};
 
-use crate::async_runtime::HANDLE;
+use crate::async_runtime::{init_async_runtime, spawn_task};
 use crate::connector::{
     CACertificates, CertificateErrorOverrideManager, create_http_client, create_tls_config,
 };
@@ -56,6 +60,7 @@ use crate::filemanager_thread::FileManager;
 use crate::hsts::{self, HstsList};
 use crate::http_cache::HttpCache;
 use crate::http_loader::{HttpState, http_redirect_fetch};
+use crate::indexeddb::idb_thread::IndexedDBThreadFactory;
 use crate::protocols::ProtocolRegistry;
 use crate::request_interceptor::RequestInterceptor;
 use crate::storage_thread::StorageThreadFactory;
@@ -82,7 +87,10 @@ pub fn new_resource_threads(
     certificate_path: Option<String>,
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
-) -> (ResourceThreads, ResourceThreads) {
+) -> (ResourceThreads, ResourceThreads, Box<dyn AsyncRuntime>) {
+    // Initialize the async runtime, and get a handle to it for use in clean shutdown.
+    let async_runtime = init_async_runtime();
+
     let ca_certificates = match certificate_path {
         Some(path) => match load_root_cert_store_from_file(path) {
             Ok(root_cert_store) => CACertificates::Override(root_cert_store),
@@ -104,11 +112,13 @@ pub fn new_resource_threads(
         ignore_certificate_errors,
         protocols,
     );
-    let storage: IpcSender<StorageThreadMsg> =
+    let idb: IpcSender<IndexedDBThreadMsg> = IndexedDBThreadFactory::new(config_dir.clone());
+    let storage: GenericSender<StorageThreadMsg> =
         StorageThreadFactory::new(config_dir, mem_profiler_chan);
     (
-        ResourceThreads::new(public_core, storage.clone()),
-        ResourceThreads::new(private_core, storage),
+        ResourceThreads::new(public_core, storage.clone(), idb.clone()),
+        ResourceThreads::new(private_core, storage, idb),
+        async_runtime,
     )
 }
 
@@ -145,6 +155,7 @@ pub fn new_core_resource_thread(
                 ca_certificates,
                 ignore_certificate_errors,
                 cancellation_listeners: Default::default(),
+                cookie_listeners: Default::default(),
             };
 
             mem_profiler_chan.run_with_memory_reporting(
@@ -172,6 +183,7 @@ struct ResourceChannelManager {
     ca_certificates: CACertificates,
     ignore_certificate_errors: bool,
     cancellation_listeners: HashMap<RequestId, Weak<CancellationListener>>,
+    cookie_listeners: HashMap<CookieStoreId, IpcSender<CookieAsyncResponse>>,
 }
 
 fn create_http_states(
@@ -328,6 +340,20 @@ impl ResourceChannelManager {
         cancellation_listener
     }
 
+    fn send_cookie_response(&self, store_id: CookieStoreId, data: CookieData) {
+        let Some(sender) = self.cookie_listeners.get(&store_id) else {
+            warn!(
+                "Async cookie request made for store id that is non-existent {:?}",
+                store_id
+            );
+            return;
+        };
+        let res = sender.send(CookieAsyncResponse { data });
+        if res.is_err() {
+            warn!("Unable to send cookie response to script thread");
+        }
+    }
+
     /// Returns false if the thread should exit.
     fn process_msg(
         &mut self,
@@ -391,6 +417,14 @@ impl ResourceChannelManager {
                     .delete_cookie_with_name(&request, name);
                 return true;
             },
+            CoreResourceMsg::DeleteCookieAsync(cookie_store_id, url, name) => {
+                http_state
+                    .cookie_jar
+                    .write()
+                    .unwrap()
+                    .delete_cookie_with_name(&url, name);
+                self.send_cookie_response(cookie_store_id, CookieData::Delete(Ok(())));
+            },
             CoreResourceMsg::FetchRedirect(request_builder, res_init, sender) => {
                 let cancellation_listener =
                     self.get_or_create_cancellation_listener(request_builder.id);
@@ -416,12 +450,48 @@ impl ResourceChannelManager {
                     );
                 }
             },
+            CoreResourceMsg::SetCookieForUrlAsync(cookie_store_id, url, cookie, source) => {
+                self.resource_manager.set_cookie_for_url(
+                    &url,
+                    cookie.into_inner().to_owned(),
+                    source,
+                    http_state,
+                );
+                self.send_cookie_response(cookie_store_id, CookieData::Set(Ok(())));
+            },
             CoreResourceMsg::GetCookiesForUrl(url, consumer, source) => {
                 let mut cookie_jar = http_state.cookie_jar.write().unwrap();
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 consumer
                     .send(cookie_jar.cookies_for_url(&url, source))
                     .unwrap();
+            },
+            CoreResourceMsg::GetCookieDataForUrlAsync(cookie_store_id, url, name) => {
+                let mut cookie_jar = http_state.cookie_jar.write().unwrap();
+                cookie_jar.remove_expired_cookies_for_url(&url);
+                let cookie = cookie_jar
+                    .query_cookies(&url, name)
+                    .into_iter()
+                    .map(Serde)
+                    .next();
+                self.send_cookie_response(cookie_store_id, CookieData::Get(cookie));
+            },
+            CoreResourceMsg::GetAllCookieDataForUrlAsync(cookie_store_id, url, name) => {
+                let mut cookie_jar = http_state.cookie_jar.write().unwrap();
+                cookie_jar.remove_expired_cookies_for_url(&url);
+                let cookies = cookie_jar
+                    .query_cookies(&url, name)
+                    .into_iter()
+                    .map(Serde)
+                    .collect();
+                self.send_cookie_response(cookie_store_id, CookieData::GetAll(cookies));
+            },
+            CoreResourceMsg::NewCookieListener(cookie_store_id, sender, _url) => {
+                // TODO: Use the URL for setting up the actual monitoring
+                self.cookie_listeners.insert(cookie_store_id, sender);
+            },
+            CoreResourceMsg::RemoveCookieListener(cookie_store_id) => {
+                self.cookie_listeners.remove(&cookie_store_id);
             },
             CoreResourceMsg::NetworkMediator(mediator_chan, origin) => {
                 self.resource_manager
@@ -514,10 +584,6 @@ pub fn write_json_to_file<T>(data: &T, config_dir: &Path, filename: &str)
 where
     T: Serialize,
 {
-    let json_encoded: String = match serde_json::to_string_pretty(&data) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
     let path = config_dir.join(filename);
     let display = path.display();
 
@@ -525,11 +591,9 @@ where
         Err(why) => panic!("couldn't create {}: {}", display, why),
         Ok(file) => file,
     };
-
-    match file.write_all(json_encoded.as_bytes()) {
-        Err(why) => panic!("couldn't write to {}: {}", display, why),
-        Ok(_) => trace!("successfully wrote to {}", display),
-    }
+    let mut writer = BufWriter::new(&mut file);
+    serde_json::to_writer_pretty(&mut writer, data).expect("Could not serialize to file");
+    trace!("successfully wrote to {display}");
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -784,7 +848,7 @@ impl CoreResourceManager {
             _ => (FileTokenCheck::NotRequired, None),
         };
 
-        HANDLE.spawn(async move {
+        spawn_task(async move {
             // XXXManishearth: Check origin against pipeline id (also ensure that the mode is allowed)
             // todo load context / mimesniff in fetch
             // todo referrer policy?

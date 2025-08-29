@@ -55,7 +55,7 @@ pub(crate) trait MicrotaskRunnable {
 /// A promise callback scheduled to run during the next microtask checkpoint (#4283).
 #[derive(JSTraceable, MallocSizeOf)]
 pub(crate) struct EnqueuedPromiseCallback {
-    #[ignore_malloc_size_of = "Rc has unclear ownership"]
+    #[conditional_malloc_size_of]
     pub(crate) callback: Rc<PromiseJobCallback>,
     #[no_trace]
     pub(crate) pipeline: PipelineId,
@@ -66,7 +66,7 @@ pub(crate) struct EnqueuedPromiseCallback {
 /// identical to EnqueuedPromiseCallback once it's on the queue
 #[derive(JSTraceable, MallocSizeOf)]
 pub(crate) struct UserMicrotask {
-    #[ignore_malloc_size_of = "Rc has unclear ownership"]
+    #[conditional_malloc_size_of]
     pub(crate) callback: Rc<VoidFunction>,
     #[no_trace]
     pub(crate) pipeline: PipelineId,
@@ -147,7 +147,8 @@ impl MicrotaskQueue {
                         MutationObserver::notify_mutation_observers(can_gc);
                     },
                     Microtask::ReadableStreamTeeReadRequest(ref task) => {
-                        task.microtask_chunk_steps(cx, can_gc)
+                        let _realm = task.enter_realm();
+                        task.handler(can_gc);
                     },
                 }
             }

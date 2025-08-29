@@ -34,6 +34,7 @@ use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::HTMLElementMeth
 use crate::dom::bindings::codegen::Bindings::HTMLFormControlsCollectionBinding::HTMLFormControlsCollectionMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLFormElementBinding::HTMLFormElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLInputElementBinding::HTMLInputElementMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
 use crate::dom::bindings::codegen::Bindings::HTMLTextAreaElementBinding::HTMLTextAreaElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::{NodeConstants, NodeMethods};
 use crate::dom::bindings::codegen::Bindings::NodeListBinding::NodeListMethods;
@@ -82,9 +83,6 @@ use crate::links::{LinkRelations, get_element_target};
 use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 
-#[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
-pub(crate) struct GenerationId(u32);
-
 #[dom_struct]
 pub(crate) struct HTMLFormElement {
     htmlelement: HTMLElement,
@@ -92,7 +90,6 @@ pub(crate) struct HTMLFormElement {
     /// <https://html.spec.whatwg.org/multipage/#constructing-entry-list>
     constructing_entry_list: Cell<bool>,
     elements: DomOnceCell<HTMLFormControlsCollection>,
-    generation_id: Cell<GenerationId>,
     controls: DomRefCell<Vec<Dom<Element>>>,
 
     #[allow(clippy::type_complexity)]
@@ -103,6 +100,9 @@ pub(crate) struct HTMLFormElement {
 
     firing_submission_events: Cell<bool>,
     rel_list: MutNullableDom<DOMTokenList>,
+
+    /// <https://html.spec.whatwg.org/multipage/#planned-navigation>
+    planned_navigation: Cell<usize>,
 
     #[no_trace]
     relations: Cell<LinkRelations>,
@@ -124,12 +124,12 @@ impl HTMLFormElement {
             marked_for_reset: Cell::new(false),
             constructing_entry_list: Cell::new(false),
             elements: Default::default(),
-            generation_id: Cell::new(GenerationId(0)),
             controls: DomRefCell::new(Vec::new()),
             past_names_map: DomRefCell::new(HashMapTracedValues::new()),
             current_name_generation: Cell::new(0),
             firing_submission_events: Cell::new(false),
             rel_list: Default::default(),
+            planned_navigation: Default::default(),
             relations: Cell::new(LinkRelations::empty()),
         }
     }
@@ -537,10 +537,8 @@ impl HTMLFormElementMethods<crate::DomTypeHolder> for HTMLFormElement {
 
         let mut sourced_names_vec: Vec<SourcedName> = Vec::new();
 
-        let controls = self.controls.borrow();
-
         // Step 2
-        for child in controls.iter() {
+        for child in self.controls.borrow().iter() {
             if child
                 .downcast::<HTMLElement>()
                 .is_some_and(|c| c.is_listed_element())
@@ -565,7 +563,7 @@ impl HTMLFormElementMethods<crate::DomTypeHolder> for HTMLFormElement {
         }
 
         // Step 3
-        for child in controls.iter() {
+        for child in self.controls.borrow().iter() {
             if child.is::<HTMLImageElement>() {
                 if let Some(id_atom) = child.get_id() {
                     let entry = SourcedName {
@@ -713,8 +711,9 @@ impl HTMLFormElement {
     }
 
     pub(crate) fn update_validity(&self, can_gc: CanGc) {
-        let controls = self.controls.borrow();
-        let is_any_invalid = controls
+        let is_any_invalid = self
+            .controls
+            .borrow()
             .iter()
             .any(|control| control.is_invalid(false, can_gc));
 
@@ -1005,14 +1004,10 @@ impl HTMLFormElement {
 
     /// [Planned navigation](https://html.spec.whatwg.org/multipage/#planned-navigation)
     fn plan_to_navigate(&self, mut load_data: LoadData, target: &Window) {
-        // Step 1
-        // Each planned navigation task is tagged with a generation ID, and
-        // before the task is handled, it first checks whether the HTMLFormElement's
-        // generation ID is the same as its own generation ID.
-        let generation_id = GenerationId(self.generation_id.get().0 + 1);
-        self.generation_id.set(generation_id);
-
-        // Step 2
+        // 1. Let referrerPolicy be the empty string.
+        // 2. If the form element's link types include the noreferrer keyword,
+        //    then set referrerPolicy to "no-referrer".
+        // Note: both steps done below.
         let elem = self.upcast::<Element>();
         let referrer = match elem.get_attribute(&ns!(), &local_name!("rel")) {
             Some(ref link_types) if link_types.Value().contains("noreferrer") => {
@@ -1021,18 +1016,53 @@ impl HTMLFormElement {
             _ => target.as_global_scope().get_referrer(),
         };
 
+        // 3. If the form has a non-null planned navigation, remove it from its task queue.
+        // Note: done by incrementing `planned_navigation`.
+        self.planned_navigation
+            .set(self.planned_navigation.get().wrapping_add(1));
+        let planned_navigation = self.planned_navigation.get();
+
+        // Note: we start to use
+        // the beginnings of an `ongoing_navigation` concept,
+        // to cancel planned navigations as part of
+        // <https://html.spec.whatwg.org/multipage/#nav-stop>
+        //
+        // The concept of ongoing navigation must be separated from the form's
+        // planned navigation concept, because each planned navigation cancels the previous one
+        // for a given form, whereas an ongoing navigation is a per navigable (read: window for now)
+        // concept.
+        //
+        // Setting the ongoing navigation now means the navigation could be cancelled
+        // even if the below task has not run yet. This is not how the spec is written: it
+        // seems instead to imply that a `window.stop` should only cancel the navigation
+        // that has already started (here the task is queued, but the navigation starts only
+        // in the task). See <https://github.com/whatwg/html/issues/11562>.
+        let ongoing_navigation = target.set_ongoing_navigation();
+
         let referrer_policy = target.Document().get_referrer_policy();
         load_data.creator_pipeline_id = Some(target.pipeline_id());
         load_data.referrer = referrer;
         load_data.referrer_policy = referrer_policy;
 
-        // Step 4.
-        let this = Trusted::new(self);
+        // 4. Queue an element task on the DOM manipulation task source
+        // given the form element and the following steps:
+        let form = Trusted::new(self);
         let window = Trusted::new(target);
         let task = task!(navigate_to_form_planned_navigation: move || {
-            if generation_id != this.root().generation_id.get() {
+            // 4.1 Set the form's planned navigation to null.
+            // Note: we implement the equivalent by incrementing the counter above,
+            // and checking it here.
+            if planned_navigation != form.root().planned_navigation.get() {
                 return;
             }
+
+            // Note: we also check if the navigation has been cancelled,
+            // see https://github.com/whatwg/html/issues/11562
+            if ongoing_navigation != window.root().ongoing_navigation() {
+                return;
+            }
+
+            // 4.2 Navigate targetNavigable to url
             window
                 .root()
                 .load_url(
@@ -1043,7 +1073,10 @@ impl HTMLFormElement {
                 );
         });
 
-        // Step 3.
+        // 5. Set the form's planned navigation to the just-queued task.
+        // Done above as part of incrementing the planned navigation counter.
+
+        // Note: task queued here.
         target
             .global()
             .task_manager()
@@ -1069,7 +1102,9 @@ impl HTMLFormElement {
             }
             if first {
                 if let Some(html_elem) = elem.downcast::<HTMLElement>() {
-                    html_elem.Focus(can_gc);
+                    // TODO: "Focusing steps" has a different meaning from the focus() method.
+                    // The actual focusing steps should be implemented
+                    html_elem.Focus(&FocusOptions::default(), can_gc);
                     first = false;
                 }
             }
@@ -1084,9 +1119,10 @@ impl HTMLFormElement {
     /// Statitically validate the constraints of form elements
     /// <https://html.spec.whatwg.org/multipage/#statically-validate-the-constraints>
     fn static_validation(&self, can_gc: CanGc) -> Result<(), Vec<DomRoot<Element>>> {
-        let controls = self.controls.borrow();
         // Step 1-3
-        let invalid_controls = controls
+        let invalid_controls = self
+            .controls
+            .borrow()
             .iter()
             .filter_map(|field| {
                 if let Some(element) = field.downcast::<Element>() {
@@ -1131,9 +1167,8 @@ impl HTMLFormElement {
         encoding: Option<&'static Encoding>,
         can_gc: CanGc,
     ) -> Vec<FormDatum> {
-        let controls = self.controls.borrow();
         let mut data_set = Vec::new();
-        for child in controls.iter() {
+        for child in self.controls.borrow().iter() {
             // Step 5.1: The field element is disabled.
             if child.disabled_state() {
                 continue;
@@ -1699,8 +1734,18 @@ pub(crate) trait FormControl: DomObject {
         }
     }
 
+    /// <https://html.spec.whatwg.org/multipage/#candidate-for-constraint-validation>
+    fn is_candidate_for_constraint_validation(&self) -> bool {
+        let element = self.to_element();
+        let html_element = element.downcast::<HTMLElement>();
+        if let Some(html_element) = html_element {
+            html_element.is_submittable_element() || element.is_instance_validatable()
+        } else {
+            false
+        }
+    }
+
     // XXXKiChjang: Implement these on inheritors
-    // fn candidate_for_validation(&self) -> bool;
     // fn satisfies_constraints(&self) -> bool;
 }
 

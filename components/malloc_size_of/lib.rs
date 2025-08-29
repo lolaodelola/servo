@@ -116,6 +116,14 @@ impl<T: MallocSizeOf> MallocSizeOf for [T] {
     }
 }
 
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for [T] {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.iter()
+            .map(|element| element.conditional_size_of(ops))
+            .sum()
+    }
+}
+
 /// For use on types where size_of() returns 0.
 #[macro_export]
 macro_rules! malloc_size_of_is_0(
@@ -352,28 +360,20 @@ where
     }
 }
 
-impl<T> MallocShallowSizeOf for thin_vec::ThinVec<T> {
-    fn shallow_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
-        if self.capacity() == 0 {
-            // If it's the singleton we might not be a heap pointer.
+impl<A: MallocConditionalSizeOf> MallocConditionalSizeOf for smallvec::SmallVec<A>
+where
+    A: smallvec::Array,
+    A::Item: MallocConditionalSizeOf,
+{
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        if !self.spilled() {
             return 0;
         }
 
-        assert_eq!(
-            std::mem::size_of::<Self>(),
-            std::mem::size_of::<*const ()>()
-        );
-        unsafe { ops.malloc_size_of(*(self as *const Self as *const *const ())) }
-    }
-}
-
-impl<T: MallocSizeOf> MallocSizeOf for thin_vec::ThinVec<T> {
-    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
-        let mut n = self.shallow_size_of(ops);
-        for elem in self.iter() {
-            n += elem.size_of(ops);
-        }
-        n
+        self.shallow_size_of(ops) +
+            self.iter()
+                .map(|element| element.conditional_size_of(ops))
+                .sum::<usize>()
     }
 }
 
@@ -512,8 +512,8 @@ impl<T: MallocSizeOf> MallocSizeOf for OnceCell<T> {
 // We don't want MallocSizeOf to be defined for Rc and Arc. If negative trait bounds are
 // ever allowed, this code should be uncommented.  Instead, there is a compile-fail test for
 // this.
-//impl<T> !MallocSizeOf for Arc<T> { }
-//impl<T> !MallocShallowSizeOf for Arc<T> { }
+// impl<T> !MallocSizeOf for Arc<T> { }
+// impl<T> !MallocShallowSizeOf for Arc<T> { }
 
 impl<T> MallocUnconditionalShallowSizeOf for servo_arc::Arc<T> {
     fn unconditional_shallow_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
@@ -613,6 +613,18 @@ impl<T: MallocSizeOf> MallocSizeOf for std::sync::Mutex<T> {
     }
 }
 
+impl<T: MallocSizeOf> MallocSizeOf for parking_lot::Mutex<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        (*self.lock()).size_of(ops)
+    }
+}
+
+impl<T: MallocSizeOf> MallocSizeOf for parking_lot::RwLock<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        (*self.read()).size_of(ops)
+    }
+}
+
 impl<T: MallocSizeOf, Unit> MallocSizeOf for euclid::Length<T, Unit> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         self.0.size_of(ops)
@@ -628,6 +640,12 @@ impl<T: MallocSizeOf, Src, Dst> MallocSizeOf for euclid::Scale<T, Src, Dst> {
 impl<T: MallocSizeOf, U> MallocSizeOf for euclid::Point2D<T, U> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         self.x.size_of(ops) + self.y.size_of(ops)
+    }
+}
+
+impl<T: MallocSizeOf, U> MallocSizeOf for euclid::Box2D<T, U> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.min.size_of(ops) + self.max.size_of(ops)
     }
 }
 
@@ -774,6 +792,8 @@ malloc_size_of_is_0!(content_security_policy::Destination);
 malloc_size_of_is_0!(http::StatusCode);
 malloc_size_of_is_0!(app_units::Au);
 malloc_size_of_is_0!(keyboard_types::Modifiers);
+malloc_size_of_is_0!(mime::Mime);
+malloc_size_of_is_0!(std::num::NonZeroU16);
 malloc_size_of_is_0!(std::num::NonZeroU64);
 malloc_size_of_is_0!(std::num::NonZeroUsize);
 malloc_size_of_is_0!(std::sync::atomic::AtomicBool);
@@ -782,6 +802,7 @@ malloc_size_of_is_0!(std::sync::atomic::AtomicUsize);
 malloc_size_of_is_0!(std::time::Duration);
 malloc_size_of_is_0!(std::time::Instant);
 malloc_size_of_is_0!(std::time::SystemTime);
+malloc_size_of_is_0!(resvg::usvg::Tree);
 malloc_size_of_is_0!(style::data::ElementData);
 malloc_size_of_is_0!(style::font_face::SourceList);
 malloc_size_of_is_0!(style::properties::ComputedValues);
@@ -811,7 +832,9 @@ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::BorderRadius);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::BorderStyle);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::BoxShadowClipMode);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ColorF);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::Epoch);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ExtendMode);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ExternalScrollId);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontKey);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontInstanceKey);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::GlyphInstance);
@@ -821,7 +844,14 @@ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ImageRendering);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::LineStyle);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::MixBlendMode);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::NormalBorder);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::PipelineId);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ReferenceFrameKind);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::RepeatMode);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontVariation);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::SpatialId);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::StickyOffsetBounds);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::TransformStyle);
+malloc_size_of_is_webrender_malloc_size_of!(webrender::FastTransform<webrender_api::units::LayoutPixel,webrender_api::units::LayoutPixel>);
 
 macro_rules! malloc_size_of_is_stylo_malloc_size_of(
     ($($ty:ty),+) => (
@@ -861,7 +891,7 @@ impl<T> MallocSizeOf for style::shared_lock::Locked<T> {
     fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
         // TODO: fix this implementation when Locked derives MallocSizeOf.
         0
-        //<style::shared_lock::Locked<T> as stylo_malloc_size_of::MallocSizeOf>::size_of(self, ops)
+        // <style::shared_lock::Locked<T> as stylo_malloc_size_of::MallocSizeOf>::size_of(self, ops)
     }
 }
 
@@ -876,6 +906,7 @@ malloc_size_of_is_stylo_malloc_size_of!(style::attr::AttrIdentifier);
 malloc_size_of_is_stylo_malloc_size_of!(style::attr::AttrValue);
 malloc_size_of_is_stylo_malloc_size_of!(style::color::AbsoluteColor);
 malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::font_variant_caps::T);
+malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::text_decoration_style::T);
 malloc_size_of_is_stylo_malloc_size_of!(style::dom::OpaqueNode);
 malloc_size_of_is_stylo_malloc_size_of!(style::invalidation::element::restyle_hints::RestyleHint);
 malloc_size_of_is_stylo_malloc_size_of!(style::logical_geometry::WritingMode);

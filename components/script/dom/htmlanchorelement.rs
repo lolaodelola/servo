@@ -132,7 +132,8 @@ impl HTMLAnchorElementMethods<crate::DomTypeHolder> for HTMLAnchorElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-a-text
     fn SetText(&self, value: DOMString, can_gc: CanGc) {
-        self.upcast::<Node>().SetTextContent(Some(value), can_gc)
+        self.upcast::<Node>()
+            .set_text_content_for_element(Some(value), can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-a-rel
@@ -318,8 +319,8 @@ impl Activatable for HTMLAnchorElement {
         self.as_element().has_attribute(&local_name!("href"))
     }
 
-    //https://html.spec.whatwg.org/multipage/#the-a-element:activation-behaviour
-    fn activation_behavior(&self, event: &Event, target: &EventTarget, can_gc: CanGc) {
+    // https://html.spec.whatwg.org/multipage/#the-a-element:activation-behaviour
+    fn activation_behavior(&self, event: &Event, target: &EventTarget, _: CanGc) {
         let element = self.as_element();
         let mouse_event = event.downcast::<MouseEvent>().unwrap();
         let mut ismap_suffix = None;
@@ -329,7 +330,7 @@ impl Activatable for HTMLAnchorElement {
         if let Some(element) = target.downcast::<Element>() {
             if target.is::<HTMLImageElement>() && element.has_attribute(&local_name!("ismap")) {
                 let target_node = element.upcast::<Node>();
-                let rect = target_node.bounding_content_box_or_zero(can_gc);
+                let rect = target_node.border_box().unwrap_or_default();
                 ismap_suffix = Some(format!(
                     "?{},{}",
                     mouse_event.ClientX().to_f32().unwrap() - rect.origin.x.to_f32_px(),
@@ -339,7 +340,7 @@ impl Activatable for HTMLAnchorElement {
         }
 
         // Step 2.
-        //TODO: Download the link is `download` attribute is set.
+        // TODO: Download the link is `download` attribute is set.
         follow_hyperlink(element, self.relations.get(), ismap_suffix);
     }
 }

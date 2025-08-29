@@ -11,25 +11,16 @@
 
 mod common;
 
-use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use anyhow::ensure;
-use common::{ServoTest, run_api_tests};
+use common::{ServoTest, WebViewDelegateImpl, evaluate_javascript, run_api_tests};
+use euclid::Point2D;
 use servo::{
-    JSValue, JavaScriptEvaluationError, LoadStatus, WebView, WebViewBuilder, WebViewDelegate,
+    Cursor, InputEvent, JSValue, JavaScriptEvaluationError, LoadStatus, MouseLeftViewportEvent,
+    MouseMoveEvent, Theme, WebViewBuilder,
 };
-
-#[derive(Default)]
-struct WebViewDelegateImpl {
-    url_changed: Cell<bool>,
-}
-
-impl WebViewDelegate for WebViewDelegateImpl {
-    fn notify_url_changed(&self, _webview: servo::WebView, _url: url::Url) {
-        self.url_changed.set(true);
-    }
-}
+use url::Url;
 
 fn test_create_webview(servo_test: &ServoTest) -> Result<(), anyhow::Error> {
     let delegate = Rc::new(WebViewDelegateImpl::default());
@@ -44,28 +35,6 @@ fn test_create_webview(servo_test: &ServoTest) -> Result<(), anyhow::Error> {
     ensure!(url.unwrap().to_string() == "about:blank");
 
     Ok(())
-}
-
-fn evaluate_javascript(
-    servo_test: &ServoTest,
-    webview: WebView,
-    script: impl ToString,
-) -> Result<JSValue, JavaScriptEvaluationError> {
-    let load_webview = webview.clone();
-    let _ = servo_test.spin(move || Ok(load_webview.load_status() != LoadStatus::Complete));
-
-    let saved_result = Rc::new(RefCell::new(None));
-    let callback_result = saved_result.clone();
-    webview.evaluate_javascript(script, move |result| {
-        *callback_result.borrow_mut() = Some(result)
-    });
-
-    let spin_result = saved_result.clone();
-    let _ = servo_test.spin(move || Ok(spin_result.borrow().is_none()));
-
-    (*saved_result.borrow())
-        .clone()
-        .expect("Should have waited until value available")
 }
 
 fn test_evaluate_javascript_basic(servo_test: &ServoTest) -> Result<(), anyhow::Error> {
@@ -114,9 +83,38 @@ fn test_evaluate_javascript_basic(servo_test: &ServoTest) -> Result<(), anyhow::
     let result = evaluate_javascript(
         servo_test,
         webview.clone(),
+        "document.body.attachShadow({mode: 'open'})",
+    );
+    ensure!(matches!(result, Ok(JSValue::ShadowRoot(..))));
+
+    let result = evaluate_javascript(servo_test, webview.clone(), "document.body.shadowRoot");
+    ensure!(matches!(result, Ok(JSValue::ShadowRoot(..))));
+
+    let result = evaluate_javascript(
+        servo_test,
+        webview.clone(),
         "document.body.innerHTML += '<iframe>'; frames[0]",
     );
     ensure!(matches!(result, Ok(JSValue::Frame(..))));
+
+    let result = evaluate_javascript(servo_test, webview.clone(), "lettt badsyntax = 123");
+    ensure!(result == Err(JavaScriptEvaluationError::CompilationFailure));
+
+    let result = evaluate_javascript(servo_test, webview.clone(), "throw new Error()");
+    ensure!(result == Err(JavaScriptEvaluationError::EvaluationFailure));
+
+    Ok(())
+}
+
+fn test_evaluate_javascript_panic(servo_test: &ServoTest) -> Result<(), anyhow::Error> {
+    let delegate = Rc::new(WebViewDelegateImpl::default());
+    let webview = WebViewBuilder::new(servo_test.servo())
+        .delegate(delegate.clone())
+        .build();
+
+    let input = "location";
+    let result = evaluate_javascript(servo_test, webview.clone(), input);
+    ensure!(matches!(result, Ok(JSValue::Object(..))));
 
     Ok(())
 }
@@ -128,10 +126,86 @@ fn test_create_webview_and_immediately_drop_webview_before_shutdown(
     Ok(())
 }
 
+fn test_theme_change(servo_test: &ServoTest) -> Result<(), anyhow::Error> {
+    let delegate = Rc::new(WebViewDelegateImpl::default());
+    let webview = WebViewBuilder::new(servo_test.servo())
+        .delegate(delegate.clone())
+        .url(Url::parse("data:text/html,page one").unwrap())
+        .build();
+
+    let is_dark_theme_script = "window.matchMedia('(prefers-color-scheme: dark)').matches";
+
+    // The default theme is "light".
+    let result = evaluate_javascript(servo_test, webview.clone(), is_dark_theme_script);
+    ensure!(result == Ok(JSValue::Boolean(false)));
+
+    // Changing the theme updates the current page.
+    webview.notify_theme_change(Theme::Dark);
+    let result = evaluate_javascript(servo_test, webview.clone(), is_dark_theme_script);
+    ensure!(result == Ok(JSValue::Boolean(true)));
+
+    delegate.reset();
+    webview.load(Url::parse("data:text/html,page two").unwrap());
+    servo_test.spin(move || Ok(!delegate.url_changed.get()))?;
+
+    // The theme persists after a navigation.
+    let result = evaluate_javascript(servo_test, webview.clone(), is_dark_theme_script);
+    ensure!(result == Ok(JSValue::Boolean(true)));
+
+    Ok(())
+}
+
+fn test_cursor_change(servo_test: &ServoTest) -> Result<(), anyhow::Error> {
+    let delegate = Rc::new(WebViewDelegateImpl::default());
+    let webview = WebViewBuilder::new(servo_test.servo())
+        .delegate(delegate.clone())
+        .url(
+            Url::parse(
+                "data:text/html,<!DOCTYPE html><style> html { cursor: crosshair; margin: 0}</style><body>hello</body>",
+            )
+            .unwrap(),
+        )
+        .build();
+
+    webview.focus();
+    webview.show(true);
+    webview.move_resize(servo_test.rendering_context.size2d().to_f32().into());
+
+    let load_webview = webview.clone();
+    let _ = servo_test.spin(move || Ok(load_webview.load_status() != LoadStatus::Complete));
+
+    // Wait for at least one frame after the load completes.
+    delegate.reset();
+    let captured_delegate = delegate.clone();
+    servo_test.spin(move || Ok(!captured_delegate.new_frame_ready.get()))?;
+
+    webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(Point2D::new(
+        10., 10.,
+    ))));
+
+    let captured_delegate = delegate.clone();
+    servo_test.spin(move || Ok(!captured_delegate.cursor_changed.get()))?;
+    ensure!(webview.cursor() == Cursor::Crosshair);
+
+    delegate.reset();
+    webview.notify_input_event(InputEvent::MouseLeftViewport(
+        MouseLeftViewportEvent::default(),
+    ));
+
+    let captured_delegate = delegate.clone();
+    servo_test.spin(move || Ok(!captured_delegate.cursor_changed.get()))?;
+    ensure!(webview.cursor() == Cursor::Default);
+
+    Ok(())
+}
+
 fn main() {
     run_api_tests!(
         test_create_webview,
+        test_cursor_change,
         test_evaluate_javascript_basic,
+        test_evaluate_javascript_panic,
+        test_theme_change,
         // This test needs to be last, as it tests creating and dropping
         // a WebView right before shutdown.
         test_create_webview_and_immediately_drop_webview_before_shutdown

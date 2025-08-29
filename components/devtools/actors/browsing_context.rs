@@ -20,7 +20,7 @@ use ipc_channel::ipc::{self, IpcSender};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::actor::{Actor, ActorError, ActorRegistry};
 use crate::actors::inspector::InspectorActor;
 use crate::actors::inspector::accessibility::AccessibilityActor;
 use crate::actors::inspector::css_properties::CssPropertiesActor;
@@ -30,7 +30,7 @@ use crate::actors::tab::TabDescriptorActor;
 use crate::actors::thread::ThreadActor;
 use crate::actors::watcher::{SessionContext, SessionContextType, WatcherActor};
 use crate::id::{DevtoolsBrowserId, DevtoolsBrowsingContextId, DevtoolsOuterWindowId, IdMap};
-use crate::protocol::JsonPacketStream;
+use crate::protocol::{ClientRequest, JsonPacketStream};
 use crate::resource::ResourceAvailable;
 use crate::{EmptyReplyMsg, StreamId};
 
@@ -82,6 +82,13 @@ struct BrowsingContextTraits {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TargetType {
+    Frame,
+    // Other target types not implemented yet.
+}
+
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowsingContextActorMsg {
     actor: String,
@@ -104,6 +111,7 @@ pub struct BrowsingContextActorMsg {
     reflow_actor: String,
     style_sheets_actor: String,
     thread_actor: String,
+    target_type: TargetType,
     // Part of the official protocol, but not yet implemented.
     // animations_actor: String,
     // changes_actor: String,
@@ -158,29 +166,28 @@ impl Actor for BrowsingContextActor {
 
     fn handle_message(
         &self,
+        request: ClientRequest,
         _registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "listFrames" => {
                 // TODO: Find out what needs to be listed here
                 let msg = EmptyReplyMsg { from: self.name() };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
             "listWorkers" => {
-                let _ = stream.write_json_packet(&ListWorkersReply {
+                request.reply_final(&ListWorkersReply {
                     from: self.name(),
                     // TODO: Find out what needs to be listed here
                     workers: vec![],
-                });
-                ActorMessageStatus::Processed
+                })?
             },
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 
     fn cleanup(&self, id: StreamId) {
@@ -302,6 +309,7 @@ impl BrowsingContextActor {
             reflow_actor: self.reflow.clone(),
             style_sheets_actor: self.style_sheets.clone(),
             thread_actor: self.thread.clone(),
+            target_type: TargetType::Frame,
         }
     }
 
@@ -344,8 +352,8 @@ impl BrowsingContextActor {
         *self.title.borrow_mut() = title;
     }
 
-    pub(crate) fn frame_update(&self, stream: &mut TcpStream) {
-        let _ = stream.write_json_packet(&FrameUpdateReply {
+    pub(crate) fn frame_update(&self, request: &mut ClientRequest) {
+        let _ = request.write_json_packet(&FrameUpdateReply {
             from: self.name(),
             type_: "frameUpdate".into(),
             frames: vec![FrameUpdateMsg {

@@ -8,44 +8,44 @@ use std::fmt::{Debug, Error, Formatter};
 
 use base::id::{PipelineId, WebViewId};
 use crossbeam_channel::Sender;
-use embedder_traits::{
-    AnimationState, EventLoopWaker, MouseButton, MouseButtonAction, TouchEventResult,
-    WebDriverMessageId,
-};
-use euclid::Rect;
+use embedder_traits::{AnimationState, EventLoopWaker, TouchEventResult};
 use ipc_channel::ipc::IpcSender;
 use log::warn;
 use malloc_size_of_derive::MallocSizeOf;
-use pixels::Image;
+use smallvec::SmallVec;
 use strum_macros::IntoStaticStr;
-use style_traits::CSSPixel;
-use webrender_api::DocumentId;
+use webrender_api::{DocumentId, FontVariation};
 
 pub mod display_list;
 pub mod rendering_context;
+pub mod viewport_description;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use base::generic_channel::{self, GenericSender};
+use bitflags::bitflags;
 use display_list::CompositorDisplayListInfo;
-use embedder_traits::{CompositorHitTestResult, ScreenGeometry};
+use embedder_traits::ScreenGeometry;
 use euclid::default::Size2D as UntypedSize2D;
 use ipc_channel::ipc::{self, IpcSharedMemory};
 use profile_traits::mem::{OpaqueSender, ReportsChan};
 use serde::{Deserialize, Serialize};
-use servo_geometry::{DeviceIndependentIntRect, DeviceIndependentIntSize};
-use webrender_api::units::{DevicePoint, LayoutPoint, TexelRect};
+pub use webrender_api::ExternalImageSource;
+use webrender_api::units::{LayoutVector2D, TexelRect};
 use webrender_api::{
     BuiltDisplayList, BuiltDisplayListDescriptor, ExternalImage, ExternalImageData,
-    ExternalImageHandler, ExternalImageId, ExternalImageSource, ExternalScrollId,
-    FontInstanceFlags, FontInstanceKey, FontKey, HitTestFlags, ImageData, ImageDescriptor,
-    ImageKey, NativeFontHandle, PipelineId as WebRenderPipelineId,
+    ExternalImageHandler, ExternalImageId, ExternalScrollId, FontInstanceFlags, FontInstanceKey,
+    FontKey, ImageData, ImageDescriptor, ImageKey, NativeFontHandle,
+    PipelineId as WebRenderPipelineId,
 };
+
+use crate::viewport_description::ViewportDescription;
 
 /// Sends messages to the compositor.
 #[derive(Clone)]
 pub struct CompositorProxy {
-    pub sender: Sender<CompositorMsg>,
+    pub sender: Sender<Result<CompositorMsg, ipc_channel::Error>>,
     /// Access to [`Self::sender`] that is possible to send across an IPC
     /// channel. These messages are routed via the router thread to
     /// [`Self::sender`].
@@ -61,6 +61,14 @@ impl OpaqueSender<CompositorMsg> for CompositorProxy {
 
 impl CompositorProxy {
     pub fn send(&self, msg: CompositorMsg) {
+        self.route_msg(Ok(msg))
+    }
+
+    /// Helper method to route a deserialized IPC message to the receiver.
+    ///
+    /// This method is a temporary solution, and will be removed when migrating
+    /// to `GenericChannel`.
+    pub fn route_msg(&self, msg: Result<CompositorMsg, ipc_channel::Error>) {
         if let Err(err) = self.sender.send(msg) {
             warn!("Failed to send response ({:?}).", err);
         }
@@ -79,12 +87,6 @@ pub enum CompositorMsg {
     RemoveWebView(WebViewId),
     /// Script has handled a touch event, and either prevented or allowed default actions.
     TouchEventProcessed(WebViewId, TouchEventResult),
-    /// Composite to a PNG file and return the Image over a passed channel.
-    CreatePng(
-        WebViewId,
-        Option<Rect<f32, CSSPixel>>,
-        IpcSender<Option<Image>>,
-    ),
     /// A reply to the compositor asking if the output image is stable.
     IsReadyToSaveImageReply(bool),
     /// Set whether to use less resources by stopping animations.
@@ -93,35 +95,20 @@ pub enum CompositorMsg {
     /// the frame is ready. It contains a bool to indicate if it needs to composite and the
     /// `DocumentId` of the new frame.
     NewWebRenderFrameReady(DocumentId, bool),
-    /// A pipeline was shut down.
-    // This message acts as a synchronization point between the constellation,
-    // when it shuts down a pipeline, to the compositor; when the compositor
-    // sends a reply on the IpcSender, the constellation knows it's safe to
-    // tear down the other threads associated with this pipeline.
-    PipelineExited(WebViewId, PipelineId, IpcSender<()>),
+    /// Script or the Constellation is notifying the renderer that a Pipeline has finished
+    /// shutting down. The renderer will not discard the Pipeline until both report that
+    /// they have fully shut it down, to avoid recreating it due to any subsequent
+    /// messages.
+    PipelineExited(WebViewId, PipelineId, PipelineExitSource),
     /// The load of a page has completed
     LoadComplete(WebViewId),
-    /// WebDriver mouse button event
-    WebDriverMouseButtonEvent(
-        WebViewId,
-        MouseButtonAction,
-        MouseButton,
-        f32,
-        f32,
-        WebDriverMessageId,
-    ),
-    /// WebDriver mouse move event
-    WebDriverMouseMoveEvent(WebViewId, f32, f32, WebDriverMessageId),
-    // Webdriver wheel scroll event
-    WebDriverWheelScrollEvent(WebViewId, f32, f32, f64, f64),
-
     /// Inform WebRender of the existence of this pipeline.
     SendInitialTransaction(WebRenderPipelineId),
     /// Perform a scroll operation.
     SendScrollNode(
         WebViewId,
         WebRenderPipelineId,
-        LayoutPoint,
+        LayoutVector2D,
         ExternalScrollId,
     ),
     /// Inform WebRender of a new display list for the given pipeline.
@@ -133,49 +120,44 @@ pub enum CompositorMsg {
         /// An [ipc::IpcBytesReceiver] used to send the raw data of the display list.
         display_list_receiver: ipc::IpcBytesReceiver,
     },
-    /// Perform a hit test operation. The result will be returned via
-    /// the provided channel sender.
-    HitTest(
-        Option<WebRenderPipelineId>,
-        DevicePoint,
-        HitTestFlags,
-        IpcSender<Vec<CompositorHitTestResult>>,
-    ),
+    /// Ask the renderer to generate a frame for the current set of display lists that
+    /// have been sent to the renderer.
+    GenerateFrame,
     /// Create a new image key. The result will be returned via the
     /// provided channel sender.
     GenerateImageKey(IpcSender<ImageKey>),
-    /// Add an image with the given data and `ImageKey`.
-    AddImage(ImageKey, ImageDescriptor, SerializableImageData),
+    /// The same as the above but it will be forwarded to the pipeline instead
+    /// of send via a channel.
+    GenerateImageKeysForPipeline(PipelineId),
     /// Perform a resource update operation.
-    UpdateImages(Vec<ImageUpdate>),
+    UpdateImages(SmallVec<[ImageUpdate; 1]>),
 
     /// Generate a new batch of font keys which can be used to allocate
     /// keys asynchronously.
     GenerateFontKeys(
         usize,
         usize,
-        IpcSender<(Vec<FontKey>, Vec<FontInstanceKey>)>,
+        GenericSender<(Vec<FontKey>, Vec<FontInstanceKey>)>,
     ),
     /// Add a font with the given data and font key.
     AddFont(FontKey, Arc<IpcSharedMemory>, u32),
     /// Add a system font with the given font key and handle.
     AddSystemFont(FontKey, NativeFontHandle),
     /// Add an instance of a font with the given instance key.
-    AddFontInstance(FontInstanceKey, FontKey, f32, FontInstanceFlags),
+    AddFontInstance(
+        FontInstanceKey,
+        FontKey,
+        f32,
+        FontInstanceFlags,
+        Vec<FontVariation>,
+    ),
     /// Remove the given font resources from our WebRender instance.
     RemoveFonts(Vec<FontKey>, Vec<FontInstanceKey>),
-
-    /// Get the client window size and position.
-    GetClientWindowRect(WebViewId, IpcSender<DeviceIndependentIntRect>),
-    /// Get the size of the screen that the client window inhabits.
-    GetScreenSize(WebViewId, IpcSender<DeviceIndependentIntSize>),
-    /// Get the available screen size (without toolbars and docks) for the screen
-    /// the client window inhabits.
-    GetAvailableScreenSize(WebViewId, IpcSender<DeviceIndependentIntSize>),
-
     /// Measure the current memory usage associated with the compositor.
     /// The report must be sent on the provided channel once it's complete.
     CollectMemoryReport(ReportsChan),
+    /// A top-level frame has parsed a viewport metatag and is sending the new constraints.
+    Viewport(WebViewId, ViewportDescription),
 }
 
 impl Debug for CompositorMsg {
@@ -200,19 +182,19 @@ pub struct CompositionPipeline {
 
 /// A mechanism to send messages from ScriptThread to the parent process' WebRender instance.
 #[derive(Clone, Deserialize, MallocSizeOf, Serialize)]
-pub struct CrossProcessCompositorApi(pub IpcSender<CompositorMsg>);
+pub struct CrossProcessCompositorApi(IpcSender<CompositorMsg>);
 
 impl CrossProcessCompositorApi {
+    /// Create a new [`CrossProcessCompositorApi`] struct.
+    pub fn new(sender: IpcSender<CompositorMsg>) -> Self {
+        CrossProcessCompositorApi(sender)
+    }
+
     /// Create a new [`CrossProcessCompositorApi`] struct that does not have a listener on the other
     /// end to use for unit testing.
     pub fn dummy() -> Self {
         let (sender, _) = ipc::channel().unwrap();
         Self(sender)
-    }
-
-    /// Get the sender for this proxy.
-    pub fn sender(&self) -> &IpcSender<CompositorMsg> {
-        &self.0
     }
 
     /// Inform WebRender of the existence of this pipeline.
@@ -227,7 +209,7 @@ impl CrossProcessCompositorApi {
         &self,
         webview_id: WebViewId,
         pipeline_id: WebRenderPipelineId,
-        point: LayoutPoint,
+        point: LayoutVector2D,
         scroll_id: ExternalScrollId,
     ) {
         if let Err(e) = self.0.send(CompositorMsg::SendScrollNode(
@@ -274,26 +256,30 @@ impl CrossProcessCompositorApi {
         }
     }
 
-    /// Perform a hit test operation. Blocks until the operation is complete and
-    /// and a result is available.
-    pub fn hit_test(
-        &self,
-        pipeline: Option<WebRenderPipelineId>,
-        point: DevicePoint,
-        flags: HitTestFlags,
-    ) -> Vec<CompositorHitTestResult> {
-        let (sender, receiver) = ipc::channel().unwrap();
-        self.0
-            .send(CompositorMsg::HitTest(pipeline, point, flags, sender))
-            .expect("error sending hit test");
-        receiver.recv().expect("error receiving hit test result")
+    /// Ask the Servo renderer to generate a new frame after having new display lists.
+    pub fn generate_frame(&self) {
+        if let Err(error) = self.0.send(CompositorMsg::GenerateFrame) {
+            warn!("Error generating frame: {error}");
+        }
     }
 
     /// Create a new image key. Blocks until the key is available.
-    pub fn generate_image_key(&self) -> Option<ImageKey> {
+    pub fn generate_image_key_blocking(&self) -> Option<ImageKey> {
         let (sender, receiver) = ipc::channel().unwrap();
         self.0.send(CompositorMsg::GenerateImageKey(sender)).ok()?;
         receiver.recv().ok()
+    }
+
+    /// Sends a message to the compositor for creating new image keys.
+    /// The compositor will then send a batch of keys over the constellation to the script_thread
+    /// and the appropriate pipeline.
+    pub fn generate_image_key_async(&self, pipeline_id: PipelineId) {
+        if let Err(e) = self
+            .0
+            .send(CompositorMsg::GenerateImageKeysForPipeline(pipeline_id))
+        {
+            warn!("Could not send image keys to Compositor {}", e);
+        }
     }
 
     pub fn add_image(
@@ -302,13 +288,24 @@ impl CrossProcessCompositorApi {
         descriptor: ImageDescriptor,
         data: SerializableImageData,
     ) {
-        if let Err(e) = self.0.send(CompositorMsg::AddImage(key, descriptor, data)) {
-            warn!("Error sending image update: {}", e);
-        }
+        self.update_images([ImageUpdate::AddImage(key, descriptor, data)].into());
+    }
+
+    pub fn update_image(
+        &self,
+        key: ImageKey,
+        descriptor: ImageDescriptor,
+        data: SerializableImageData,
+    ) {
+        self.update_images([ImageUpdate::UpdateImage(key, descriptor, data)].into());
+    }
+
+    pub fn delete_image(&self, key: ImageKey) {
+        self.update_images([ImageUpdate::DeleteImage(key)].into());
     }
 
     /// Perform an image resource update operation.
-    pub fn update_images(&self, updates: Vec<ImageUpdate>) {
+    pub fn update_images(&self, updates: SmallVec<[ImageUpdate; 1]>) {
         if let Err(e) = self.0.send(CompositorMsg::UpdateImages(updates)) {
             warn!("error sending image updates: {}", e);
         }
@@ -331,12 +328,14 @@ impl CrossProcessCompositorApi {
         font_key: FontKey,
         size: f32,
         flags: FontInstanceFlags,
+        variations: Vec<FontVariation>,
     ) {
         let _x = self.0.send(CompositorMsg::AddFontInstance(
             font_instance_key,
             font_key,
             size,
             flags,
+            variations,
         ));
     }
 
@@ -353,13 +352,32 @@ impl CrossProcessCompositorApi {
         number_of_font_keys: usize,
         number_of_font_instance_keys: usize,
     ) -> (Vec<FontKey>, Vec<FontInstanceKey>) {
-        let (sender, receiver) = ipc_channel::ipc::channel().expect("Could not create IPC channel");
+        let (sender, receiver) = generic_channel::channel().expect("Could not create IPC channel");
         let _ = self.0.send(CompositorMsg::GenerateFontKeys(
             number_of_font_keys,
             number_of_font_instance_keys,
             sender,
         ));
         receiver.recv().unwrap()
+    }
+
+    pub fn viewport(&self, webview_id: WebViewId, description: ViewportDescription) {
+        let _ = self
+            .0
+            .send(CompositorMsg::Viewport(webview_id, description));
+    }
+
+    pub fn pipeline_exited(
+        &self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        source: PipelineExitSource,
+    ) {
+        let _ = self.0.send(CompositorMsg::PipelineExited(
+            webview_id,
+            pipeline_id,
+            source,
+        ));
     }
 }
 
@@ -370,13 +388,8 @@ impl CrossProcessCompositorApi {
 /// This trait is used to notify lock/unlock messages and get the
 /// required info that WR needs.
 pub trait WebrenderExternalImageApi {
-    fn lock(&mut self, id: u64) -> (WebrenderImageSource, UntypedSize2D<i32>);
+    fn lock(&mut self, id: u64) -> (ExternalImageSource<'_>, UntypedSize2D<i32>);
     fn unlock(&mut self, id: u64);
-}
-
-pub enum WebrenderImageSource<'a> {
-    TextureHandle(u32),
-    Raw(&'a [u8]),
 }
 
 /// Type of Webrender External Image Handler.
@@ -458,7 +471,7 @@ impl ExternalImageHandler for WebrenderExternalImageHandlers {
     /// image content.
     /// The WR client should not change the image content until the
     /// unlock() call.
-    fn lock(&mut self, key: ExternalImageId, _channel_index: u8) -> ExternalImage {
+    fn lock(&mut self, key: ExternalImageId, _channel_index: u8) -> ExternalImage<'_> {
         let external_images = self.external_images.lock().unwrap();
         let handler_type = external_images
             .get(&key)
@@ -467,7 +480,7 @@ impl ExternalImageHandler for WebrenderExternalImageHandlers {
             WebrenderImageHandlerType::WebGL => {
                 let (source, size) = self.webgl_handler.as_mut().unwrap().lock(key.0);
                 let texture_id = match source {
-                    WebrenderImageSource::TextureHandle(b) => b,
+                    ExternalImageSource::NativeTexture(b) => b,
                     _ => panic!("Wrong type"),
                 };
                 ExternalImage {
@@ -478,7 +491,7 @@ impl ExternalImageHandler for WebrenderExternalImageHandlers {
             WebrenderImageHandlerType::Media => {
                 let (source, size) = self.media_handler.as_mut().unwrap().lock(key.0);
                 let texture_id = match source {
-                    WebrenderImageSource::TextureHandle(b) => b,
+                    ExternalImageSource::NativeTexture(b) => b,
                     _ => panic!("Wrong type"),
                 };
                 ExternalImage {
@@ -489,7 +502,7 @@ impl ExternalImageHandler for WebrenderExternalImageHandlers {
             WebrenderImageHandlerType::WebGPU => {
                 let (source, size) = self.webgpu_handler.as_mut().unwrap().lock(key.0);
                 let buffer = match source {
-                    WebrenderImageSource::Raw(b) => b,
+                    ExternalImageSource::RawData(b) => b,
                     _ => panic!("Wrong type"),
                 };
                 ExternalImage {
@@ -556,4 +569,16 @@ pub trait WebViewTrait {
     fn id(&self) -> WebViewId;
     fn screen_geometry(&self) -> Option<ScreenGeometry>;
     fn set_animating(&self, new_value: bool);
+}
+
+/// What entity is reporting that a `Pipeline` has exited. Only when all have
+/// done this will the renderer discard its details.
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Serialize)]
+pub struct PipelineExitSource(u8);
+
+bitflags! {
+    impl PipelineExitSource: u8 {
+        const Script = 1 << 0;
+        const Constellation = 1 << 1;
+    }
 }

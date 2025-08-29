@@ -43,14 +43,13 @@ use crate::dom::validitystate::{ValidationFlags, ValidityState};
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::script_runtime::CanGc;
 use crate::textinput::{
-    Direction, KeyReaction, Lines, SelectionDirection, TextInput, UTF8Bytes, UTF16CodeUnits,
-    handle_text_clipboard_action,
+    ClipboardEventReaction, Direction, KeyReaction, Lines, SelectionDirection, TextInput,
+    UTF8Bytes, UTF16CodeUnits,
 };
 
 #[dom_struct]
 pub(crate) struct HTMLTextAreaElement {
     htmlelement: HTMLElement,
-    #[ignore_malloc_size_of = "TextInput contains an IPCSender which cannot be measured"]
     #[no_trace]
     textinput: DomRefCell<TextInput<EmbedderClipboardProvider>>,
     placeholder: DomRefCell<DOMString>,
@@ -204,7 +203,7 @@ impl HTMLTextAreaElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#concept-fe-mutable
-    fn is_mutable(&self) -> bool {
+    pub(crate) fn is_mutable(&self) -> bool {
         // https://html.spec.whatwg.org/multipage/#the-textarea-element%3Aconcept-fe-mutable
         // https://html.spec.whatwg.org/multipage/#the-readonly-attribute:concept-fe-mutable
         !(self.upcast::<Element>().disabled_state() || self.ReadOnly())
@@ -312,7 +311,8 @@ impl HTMLTextAreaElementMethods<crate::DomTypeHolder> for HTMLTextAreaElement {
 
     // https://html.spec.whatwg.org/multipage/#dom-textarea-defaultvalue
     fn SetDefaultValue(&self, value: DOMString, can_gc: CanGc) {
-        self.upcast::<Node>().SetTextContent(Some(value), can_gc);
+        self.upcast::<Node>()
+            .set_text_content_for_element(Some(value), can_gc);
 
         // if the element's dirty value flag is false, then the element's
         // raw value must be set to the value of the element's textContent IDL attribute
@@ -348,7 +348,7 @@ impl HTMLTextAreaElementMethods<crate::DomTypeHolder> for HTMLTextAreaElement {
 
         self.validity_state()
             .perform_validation_and_update(ValidationFlags::all(), CanGc::note());
-        self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+        self.upcast::<Node>().dirty(NodeDamage::Other);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-textarea-textlength
@@ -450,6 +450,13 @@ impl HTMLTextAreaElementMethods<crate::DomTypeHolder> for HTMLTextAreaElement {
 }
 
 impl HTMLTextAreaElement {
+    /// <https://w3c.github.io/webdriver/#ref-for-dfn-clear-algorithm-4>
+    /// Used by WebDriver to clear the textarea element.
+    pub(crate) fn clear(&self) {
+        self.value_dirty.set(false);
+        self.textinput.borrow_mut().set_content(DOMString::from(""));
+    }
+
     pub(crate) fn reset(&self) {
         // https://html.spec.whatwg.org/multipage/#the-textarea-element:concept-form-reset-control
         let mut textinput = self.textinput.borrow_mut();
@@ -458,7 +465,7 @@ impl HTMLTextAreaElement {
     }
 
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    fn selection(&self) -> TextControlSelection<Self> {
+    fn selection(&self) -> TextControlSelection<'_, Self> {
         TextControlSelection::new(self, &self.textinput)
     }
 }
@@ -634,7 +641,7 @@ impl VirtualMethods for HTMLTextAreaElement {
         }
 
         if event.type_() == atom!("click") && !event.DefaultPrevented() {
-            //TODO: set the editing position for text inputs
+            // TODO: set the editing position for text inputs
         } else if event.type_() == atom!("keydown") && !event.DefaultPrevented() {
             if let Some(kevent) = event.downcast::<KeyboardEvent>() {
                 // This can't be inlined, as holding on to textinput.borrow_mut()
@@ -643,30 +650,33 @@ impl VirtualMethods for HTMLTextAreaElement {
                 match action {
                     KeyReaction::TriggerDefaultAction => (),
                     KeyReaction::DispatchInput => {
+                        if event.IsTrusted() {
+                            self.owner_global()
+                                .task_manager()
+                                .user_interaction_task_source()
+                                .queue_event(
+                                    self.upcast(),
+                                    atom!("input"),
+                                    EventBubbles::Bubbles,
+                                    EventCancelable::NotCancelable,
+                                );
+                        }
                         self.value_dirty.set(true);
                         self.update_placeholder_shown_state();
-                        self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+                        self.upcast::<Node>().dirty(NodeDamage::Other);
                         event.mark_as_handled();
                     },
                     KeyReaction::RedrawSelection => {
-                        self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+                        self.upcast::<Node>().dirty(NodeDamage::Other);
                         event.mark_as_handled();
                     },
                     KeyReaction::Nothing => (),
                 }
             }
         } else if event.type_() == atom!("keypress") && !event.DefaultPrevented() {
-            if event.IsTrusted() {
-                self.owner_global()
-                    .task_manager()
-                    .user_interaction_task_source()
-                    .queue_event(
-                        self.upcast(),
-                        atom!("input"),
-                        EventBubbles::Bubbles,
-                        EventCancelable::NotCancelable,
-                    );
-            }
+            // keypress should be deprecated and replaced by beforeinput.
+            // keypress was supposed to fire "blur" and "focus" events
+            // but already done in `document.rs`
         } else if event.type_() == atom!("compositionstart") ||
             event.type_() == atom!("compositionupdate") ||
             event.type_() == atom!("compositionend")
@@ -677,19 +687,39 @@ impl VirtualMethods for HTMLTextAreaElement {
                         .textinput
                         .borrow_mut()
                         .handle_compositionend(compositionevent);
-                    self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+                    self.upcast::<Node>().dirty(NodeDamage::Other);
                 } else if event.type_() == atom!("compositionupdate") {
                     let _ = self
                         .textinput
                         .borrow_mut()
                         .handle_compositionupdate(compositionevent);
-                    self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+                    self.upcast::<Node>().dirty(NodeDamage::Other);
                 }
                 event.mark_as_handled();
             }
         } else if let Some(clipboard_event) = event.downcast::<ClipboardEvent>() {
-            if !event.DefaultPrevented() {
-                handle_text_clipboard_action(self, &self.textinput, clipboard_event, CanGc::note());
+            let reaction = self
+                .textinput
+                .borrow_mut()
+                .handle_clipboard_event(clipboard_event);
+            if reaction.contains(ClipboardEventReaction::FireClipboardChangedEvent) {
+                self.owner_document()
+                    .event_handler()
+                    .fire_clipboardchange_event(can_gc);
+            }
+            if reaction.contains(ClipboardEventReaction::QueueInputEvent) {
+                self.owner_global()
+                    .task_manager()
+                    .user_interaction_task_source()
+                    .queue_event(
+                        self.upcast(),
+                        atom!("input"),
+                        EventBubbles::Bubbles,
+                        EventCancelable::NotCancelable,
+                    );
+            }
+            if !reaction.is_empty() {
+                self.upcast::<Node>().dirty(NodeDamage::ContentOrHeritage);
             }
         }
 

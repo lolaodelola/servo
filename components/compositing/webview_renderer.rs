@@ -4,33 +4,32 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::collections::hash_map::Keys;
+use std::collections::hash_map::{Entry, Keys};
 use std::rc::Rc;
 
 use base::id::{PipelineId, WebViewId};
-use compositing_traits::{SendableFrameTree, WebViewTrait};
-use constellation_traits::{EmbedderToConstellationMessage, ScrollState, WindowSizeType};
+use compositing_traits::display_list::ScrollType;
+use compositing_traits::viewport_description::{
+    DEFAULT_PAGE_ZOOM, MAX_PAGE_ZOOM, MIN_PAGE_ZOOM, ViewportDescription,
+};
+use compositing_traits::{PipelineExitSource, SendableFrameTree, WebViewTrait};
+use constellation_traits::{EmbedderToConstellationMessage, WindowSizeType};
 use embedder_traits::{
     AnimationState, CompositorHitTestResult, InputEvent, MouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseMoveEvent, ShutdownState, TouchEvent, TouchEventResult, TouchEventType,
-    TouchId, ViewportDetails,
+    MouseButtonEvent, MouseMoveEvent, ScrollEvent as EmbedderScrollEvent, ShutdownState,
+    TouchEvent, TouchEventResult, TouchEventType, TouchId, ViewportDetails,
 };
-use euclid::{Box2D, Point2D, Scale, Size2D, Vector2D};
+use euclid::{Point2D, Scale, Vector2D};
 use fnv::FnvHashSet;
 use log::{debug, warn};
+use malloc_size_of::MallocSizeOf;
 use servo_geometry::DeviceIndependentPixel;
 use style_traits::{CSSPixel, PinchZoomFactor};
-use webrender_api::units::{
-    DeviceIntPoint, DeviceIntRect, DevicePixel, DevicePoint, DeviceRect, LayoutVector2D,
-};
+use webrender_api::units::{DeviceIntPoint, DevicePixel, DevicePoint, DeviceRect, LayoutVector2D};
 use webrender_api::{ExternalScrollId, HitTestFlags, ScrollLocation};
 
 use crate::compositor::{PipelineDetails, ServoRenderer};
 use crate::touch::{TouchHandler, TouchMoveAction, TouchMoveAllowed, TouchSequenceState};
-
-// Default viewport constraints
-const MAX_ZOOM: f32 = 8.0;
-const MIN_ZOOM: f32 = 0.1;
 
 #[derive(Clone, Copy)]
 struct ScrollEvent {
@@ -44,21 +43,23 @@ struct ScrollEvent {
 
 #[derive(Clone, Copy)]
 enum ScrollZoomEvent {
-    /// An pinch zoom event that magnifies the view by the given factor.
+    /// A pinch zoom event that magnifies the view by the given factor.
     PinchZoom(f32),
+    /// A zoom event that establishes the initial zoom from the viewport meta tag.
+    InitialViewportZoom(f32),
     /// A scroll event that scrolls the scroll node at the given location by the
     /// given amount.
     Scroll(ScrollEvent),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct ScrollResult {
-    pub pipeline_id: PipelineId,
+    pub hit_test_result: CompositorHitTestResult,
     pub external_scroll_id: ExternalScrollId,
     pub offset: LayoutVector2D,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum PinchZoomResult {
     DidPinchZoom,
     DidNotPinchZoom,
@@ -76,6 +77,7 @@ pub(crate) struct WebViewRenderer {
     pub webview: Box<dyn WebViewTrait>,
     /// The root [`PipelineId`] of the currently displayed page in this WebView.
     pub root_pipeline_id: Option<PipelineId>,
+    /// The rectangle of the [`WebView`] in device pixels, which is the viewport.
     pub rect: DeviceRect,
     /// Tracks details about each active pipeline that the compositor knows about.
     pub pipelines: HashMap<PipelineId, PipelineDetails>,
@@ -88,25 +90,16 @@ pub(crate) struct WebViewRenderer {
     /// "Desktop-style" zoom that resizes the viewport to fit the window.
     pub page_zoom: Scale<f32, CSSPixel, DeviceIndependentPixel>,
     /// "Mobile-style" zoom that does not reflow the page.
-    viewport_zoom: PinchZoomFactor,
-    /// Viewport zoom constraints provided by @viewport.
-    min_viewport_zoom: Option<PinchZoomFactor>,
-    max_viewport_zoom: Option<PinchZoomFactor>,
+    pinch_zoom: PinchZoomFactor,
     /// The HiDPI scale factor for the `WebView` associated with this renderer. This is controlled
     /// by the embedding layer.
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
     /// Whether or not this [`WebViewRenderer`] isn't throttled and has a pipeline with
     /// active animations or animation frame callbacks.
     animating: bool,
-}
-
-impl Drop for WebViewRenderer {
-    fn drop(&mut self) {
-        self.global
-            .borrow_mut()
-            .pipeline_to_webview_map
-            .retain(|_, webview_id| self.id != *webview_id);
-    }
+    /// A [`ViewportDescription`] for this [`WebViewRenderer`], which contains the limitations
+    /// and initial values for zoom derived from the `viewport` meta tag in web content.
+    viewport_description: Option<ViewportDescription>,
 }
 
 impl WebViewRenderer {
@@ -126,19 +119,12 @@ impl WebViewRenderer {
             touch_handler: TouchHandler::new(),
             global,
             pending_scroll_zoom_events: Default::default(),
-            page_zoom: Scale::new(1.0),
-            viewport_zoom: PinchZoomFactor::new(1.0),
-            min_viewport_zoom: Some(PinchZoomFactor::new(1.0)),
-            max_viewport_zoom: None,
+            page_zoom: DEFAULT_PAGE_ZOOM,
+            pinch_zoom: PinchZoomFactor::new(1.0),
             hidpi_scale_factor: Scale::new(hidpi_scale_factor.0),
             animating: false,
+            viewport_description: None,
         }
-    }
-
-    pub(crate) fn animations_or_animation_callbacks_running(&self) -> bool {
-        self.pipelines
-            .values()
-            .any(PipelineDetails::animations_or_animation_callbacks_running)
     }
 
     pub(crate) fn animation_callbacks_running(&self) -> bool {
@@ -160,26 +146,32 @@ impl WebViewRenderer {
         &mut self,
         pipeline_id: PipelineId,
     ) -> &mut PipelineDetails {
-        self.pipelines.entry(pipeline_id).or_insert_with(|| {
-            self.global
-                .borrow_mut()
-                .pipeline_to_webview_map
-                .insert(pipeline_id, self.id);
-            PipelineDetails::new()
-        })
+        self.pipelines
+            .entry(pipeline_id)
+            .or_insert_with(PipelineDetails::new)
     }
 
-    pub(crate) fn remove_pipeline(&mut self, pipeline_id: PipelineId) {
-        self.global
-            .borrow_mut()
-            .pipeline_to_webview_map
-            .remove(&pipeline_id);
-        self.pipelines.remove(&pipeline_id);
+    pub(crate) fn pipeline_exited(&mut self, pipeline_id: PipelineId, source: PipelineExitSource) {
+        let pipeline = self.pipelines.entry(pipeline_id);
+        let Entry::Occupied(mut pipeline) = pipeline else {
+            return;
+        };
+
+        pipeline.get_mut().exited.insert(source);
+
+        // Do not remove pipeline details until both the Constellation and Script have
+        // finished processing the pipeline shutdown. This prevents any followup messges
+        // from re-adding the pipeline details and creating a zombie.
+        if !pipeline.get().exited.is_all() {
+            return;
+        }
+
+        pipeline.remove_entry();
     }
 
     pub(crate) fn set_frame_tree(&mut self, frame_tree: &SendableFrameTree) {
         let pipeline_id = frame_tree.pipeline.id;
-        let old_pipeline_id = std::mem::replace(&mut self.root_pipeline_id, Some(pipeline_id));
+        let old_pipeline_id = self.root_pipeline_id.replace(pipeline_id);
 
         if old_pipeline_id != self.root_pipeline_id {
             debug!(
@@ -198,18 +190,18 @@ impl WebViewRenderer {
             return;
         };
 
-        let mut scroll_states = Vec::new();
-        details.scroll_tree.nodes.iter().for_each(|node| {
-            if let (Some(scroll_id), Some(scroll_offset)) = (node.external_id(), node.offset()) {
-                scroll_states.push(ScrollState {
-                    scroll_id,
-                    scroll_offset,
-                });
-            }
-        });
+        let scroll_offsets = details.scroll_tree.scroll_offsets();
+
+        // This might be true if we have not received a display list from the layout
+        // associated with this pipeline yet. In that case, the layout is not ready to
+        // receive scroll offsets anyway, so just save time and prevent other issues by
+        // not sending them.
+        if scroll_offsets.is_empty() {
+            return;
+        }
 
         let _ = self.global.borrow().constellation_sender.send(
-            EmbedderToConstellationMessage::SetScrollStates(pipeline_id, scroll_states),
+            EmbedderToConstellationMessage::SetScrollStates(pipeline_id, scroll_offsets),
         );
     }
 
@@ -251,21 +243,18 @@ impl WebViewRenderer {
         self.pipelines
             .iter_mut()
             .filter(|(id, _)| !attached_pipelines.contains(id))
-            .for_each(|(_, details)| {
-                details.scroll_tree.nodes.iter_mut().for_each(|node| {
-                    node.set_offset(LayoutVector2D::zero());
-                })
-            })
+            .for_each(|(_, details)| details.scroll_tree.reset_all_scroll_offsets());
     }
 
     /// Sets or unsets the animations-running flag for the given pipeline. Returns
-    /// true if the [`WebViewRenderer`]'s overall animating state changed.
+    /// true if the pipeline has started animating.
     pub(crate) fn change_pipeline_running_animations_state(
         &mut self,
         pipeline_id: PipelineId,
         animation_state: AnimationState,
     ) -> bool {
         let pipeline_details = self.ensure_pipeline_details(pipeline_id);
+        let was_animating = pipeline_details.animating();
         match animation_state {
             AnimationState::AnimationsPresent => {
                 pipeline_details.animations_running = true;
@@ -280,58 +269,90 @@ impl WebViewRenderer {
                 pipeline_details.animation_callbacks_running = false;
             },
         }
-        self.update_animation_state()
+        let started_animating = !was_animating && pipeline_details.animating();
+
+        self.update_animation_state();
+
+        // It's important that an animation tick is triggered even if the
+        // WebViewRenderer's overall animation state hasn't changed. It's possible that
+        // the WebView was animating, but not producing new display lists. In that case,
+        // no repaint will happen and thus no repaint will trigger the next animation tick.
+        started_animating
     }
 
     /// Sets or unsets the throttled flag for the given pipeline. Returns
-    /// true if the [`WebViewRenderer`]'s overall animating state changed.
+    /// true if the pipeline has started animating.
     pub(crate) fn set_throttled(&mut self, pipeline_id: PipelineId, throttled: bool) -> bool {
-        self.ensure_pipeline_details(pipeline_id).throttled = throttled;
+        let pipeline_details = self.ensure_pipeline_details(pipeline_id);
+        let was_animating = pipeline_details.animating();
+        pipeline_details.throttled = throttled;
+        let started_animating = !was_animating && pipeline_details.animating();
 
         // Throttling a pipeline can cause it to be taken into the "not-animating" state.
-        self.update_animation_state()
+        self.update_animation_state();
+
+        // It's important that an animation tick is triggered even if the
+        // WebViewRenderer's overall animation state hasn't changed. It's possible that
+        // the WebView was animating, but not producing new display lists. In that case,
+        // no repaint will happen and thus no repaint will trigger the next animation tick.
+        started_animating
     }
 
-    pub(crate) fn update_animation_state(&mut self) -> bool {
-        let animating = self.pipelines.values().any(PipelineDetails::animating);
-        let old_animating = std::mem::replace(&mut self.animating, animating);
-        self.webview.set_animating(self.animating);
-        old_animating != self.animating
+    fn update_animation_state(&mut self) {
+        self.animating = self.pipelines.values().any(PipelineDetails::animating);
+        self.webview.set_animating(self.animating());
     }
 
     /// On a Window refresh tick (e.g. vsync)
     pub(crate) fn on_vsync(&mut self) {
         if let Some(fling_action) = self.touch_handler.on_vsync() {
             self.on_scroll_window_event(
-                ScrollLocation::Delta(fling_action.delta),
+                ScrollLocation::Delta(-fling_action.delta),
                 fling_action.cursor,
             );
         }
     }
 
-    pub(crate) fn dispatch_input_event(&mut self, event: InputEvent) {
-        // Events that do not need to do hit testing are sent directly to the
-        // constellation to filter down.
-        let Some(point) = event.point() else {
-            return;
+    pub(crate) fn dispatch_input_event_with_hit_testing(&self, mut event: InputEvent) -> bool {
+        let event_point = event.point();
+        let hit_test_result = match event_point {
+            Some(point) => {
+                let hit_test_result = self
+                    .global
+                    .borrow()
+                    .hit_test_at_point(point)
+                    .into_iter()
+                    .nth(0);
+                if hit_test_result.is_none() {
+                    warn!("Empty hit test result for input event, ignoring.");
+                    return false;
+                }
+                hit_test_result
+            },
+            None => None,
         };
 
-        // If we can't find a pipeline to send this event to, we cannot continue.
-        let get_pipeline_details = |pipeline_id| self.pipelines.get(&pipeline_id);
-        let Some(result) = self
-            .global
-            .borrow()
-            .hit_test_at_point(point, get_pipeline_details)
-        else {
-            return;
-        };
-
-        self.global.borrow_mut().update_cursor(point, &result);
+        match event {
+            InputEvent::Touch(ref mut touch_event) => {
+                touch_event.init_sequence_id(self.touch_handler.current_sequence_id);
+            },
+            InputEvent::MouseMove(_) => {
+                self.global.borrow_mut().last_mouse_move_position = event_point;
+            },
+            InputEvent::MouseLeftViewport(_) => {
+                self.global.borrow_mut().last_mouse_move_position = None;
+            },
+            InputEvent::MouseButton(_) | InputEvent::Wheel(_) => {},
+            _ => unreachable!("Unexpected input event type: {event:?}"),
+        }
 
         if let Err(error) = self.global.borrow().constellation_sender.send(
-            EmbedderToConstellationMessage::ForwardInputEvent(self.id, event, Some(result)),
+            EmbedderToConstellationMessage::ForwardInputEvent(self.id, event, hit_test_result),
         ) {
             warn!("Sending event to constellation failed ({error:?}).");
+            false
+        } else {
+            true
         }
     }
 
@@ -401,29 +422,11 @@ impl WebViewRenderer {
             }
         }
 
-        self.dispatch_input_event(event);
+        self.dispatch_input_event_with_hit_testing(event);
     }
 
-    fn send_touch_event(&self, mut event: TouchEvent) -> bool {
-        let get_pipeline_details = |pipeline_id| self.pipelines.get(&pipeline_id);
-        let Some(result) = self
-            .global
-            .borrow()
-            .hit_test_at_point(event.point, get_pipeline_details)
-        else {
-            return false;
-        };
-
-        event.init_sequence_id(self.touch_handler.current_sequence_id);
-        let event = InputEvent::Touch(event);
-        if let Err(e) = self.global.borrow().constellation_sender.send(
-            EmbedderToConstellationMessage::ForwardInputEvent(self.id, event, Some(result)),
-        ) {
-            warn!("Sending event to constellation failed ({:?}).", e);
-            false
-        } else {
-            true
-        }
+    fn send_touch_event(&mut self, event: TouchEvent) -> bool {
+        self.dispatch_input_event_with_hit_testing(InputEvent::Touch(event))
     }
 
     pub(crate) fn on_touch_event(&mut self, event: TouchEvent) {
@@ -687,13 +690,15 @@ impl WebViewRenderer {
     /// <http://w3c.github.io/touch-events/#mouse-events>
     fn simulate_mouse_click(&mut self, point: DevicePoint) {
         let button = MouseButton::Left;
-        self.dispatch_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
-        self.dispatch_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+        self.dispatch_input_event_with_hit_testing(InputEvent::MouseMove(MouseMoveEvent::new(
+            point,
+        )));
+        self.dispatch_input_event_with_hit_testing(InputEvent::MouseButton(MouseButtonEvent::new(
             MouseButtonAction::Down,
             button,
             point,
         )));
-        self.dispatch_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
+        self.dispatch_input_event_with_hit_testing(InputEvent::MouseButton(MouseButtonEvent::new(
             MouseButtonAction::Up,
             button,
             point,
@@ -704,21 +709,11 @@ impl WebViewRenderer {
         &mut self,
         scroll_location: ScrollLocation,
         cursor: DeviceIntPoint,
-        event_type: TouchEventType,
     ) {
         if self.global.borrow().shutdown_state() != ShutdownState::NotShuttingDown {
             return;
         }
-
-        match event_type {
-            TouchEventType::Move => self.on_scroll_window_event(scroll_location, cursor),
-            TouchEventType::Up | TouchEventType::Cancel => {
-                self.on_scroll_window_event(scroll_location, cursor);
-            },
-            TouchEventType::Down => {
-                self.on_scroll_window_event(scroll_location, cursor);
-            },
-        }
+        self.on_scroll_window_event(scroll_location, cursor);
     }
 
     fn on_scroll_window_event(&mut self, scroll_location: ScrollLocation, cursor: DeviceIntPoint) {
@@ -728,22 +723,6 @@ impl WebViewRenderer {
                 cursor,
                 event_count: 1,
             }));
-    }
-
-    /// Push scroll pending event when receiving wheel action from webdriver
-    pub(crate) fn on_webdriver_wheel_action(
-        &mut self,
-        scroll_delta: Vector2D<f32, DevicePixel>,
-        point: Point2D<f32, DevicePixel>,
-    ) {
-        if self.global.borrow().shutdown_state() != ShutdownState::NotShuttingDown {
-            return;
-        }
-
-        let scroll_location =
-            ScrollLocation::Delta(LayoutVector2D::from_untyped(scroll_delta.to_untyped()));
-        let cursor = DeviceIntPoint::new(point.x as i32, point.y as i32);
-        self.on_scroll_window_event(scroll_location, cursor)
     }
 
     /// Process pending scroll events for this [`WebViewRenderer`]. Returns a tuple containing:
@@ -761,11 +740,15 @@ impl WebViewRenderer {
 
         // Batch up all scroll events into one, or else we'll do way too much painting.
         let mut combined_scroll_event: Option<ScrollEvent> = None;
+        let mut base_page_zoom = self.pinch_zoom_level().get();
         let mut combined_magnification = 1.0;
         for scroll_event in self.pending_scroll_zoom_events.drain(..) {
             match scroll_event {
                 ScrollZoomEvent::PinchZoom(magnification) => {
                     combined_magnification *= magnification
+                },
+                ScrollZoomEvent::InitialViewportZoom(magnification) => {
+                    base_page_zoom = magnification
                 },
                 ScrollZoomEvent::Scroll(scroll_event_info) => {
                     let combined_event = match combined_scroll_event.as_mut() {
@@ -813,24 +796,29 @@ impl WebViewRenderer {
                 combined_event.scroll_location,
             )
         });
-        if let Some(scroll_result) = scroll_result {
-            self.send_scroll_positions_to_layout_for_pipeline(scroll_result.pipeline_id);
+        if let Some(scroll_result) = scroll_result.clone() {
+            self.send_scroll_positions_to_layout_for_pipeline(
+                scroll_result.hit_test_result.pipeline_id,
+            );
+            self.dispatch_scroll_event(
+                scroll_result.external_scroll_id,
+                scroll_result.hit_test_result,
+            );
         }
 
-        let pinch_zoom_result = match self
-            .set_pinch_zoom_level(self.pinch_zoom_level().get() * combined_magnification)
-        {
-            true => PinchZoomResult::DidPinchZoom,
-            false => PinchZoomResult::DidNotPinchZoom,
-        };
+        let pinch_zoom_result =
+            match self.set_pinch_zoom_level(base_page_zoom * combined_magnification) {
+                true => PinchZoomResult::DidPinchZoom,
+                false => PinchZoomResult::DidNotPinchZoom,
+            };
 
         (pinch_zoom_result, scroll_result)
     }
 
     /// Perform a hit test at the given [`DevicePoint`] and apply the [`ScrollLocation`]
     /// scrolling to the applicable scroll node under that point. If a scroll was
-    /// performed, returns the [`PipelineId`] of the node scrolled, the id, and the final
-    /// scroll delta.
+    /// performed, returns the hit test result contains [`PipelineId`] of the node
+    /// scrolled, the id, and the final scroll delta.
     fn scroll_node_at_device_point(
         &mut self,
         cursor: DevicePoint,
@@ -849,35 +837,28 @@ impl WebViewRenderer {
             ScrollLocation::Start | ScrollLocation::End => scroll_location,
         };
 
-        let get_pipeline_details = |pipeline_id| self.pipelines.get(&pipeline_id);
         let hit_test_results = self
             .global
             .borrow()
-            .hit_test_at_point_with_flags_and_pipeline(
-                cursor,
-                HitTestFlags::FIND_ALL,
-                None,
-                get_pipeline_details,
-            );
+            .hit_test_at_point_with_flags(cursor, HitTestFlags::FIND_ALL);
 
         // Iterate through all hit test results, processing only the first node of each pipeline.
         // This is needed to propagate the scroll events from a pipeline representing an iframe to
         // its ancestor pipelines.
         let mut previous_pipeline_id = None;
-        for CompositorHitTestResult {
-            pipeline_id,
-            scroll_tree_node,
-            ..
-        } in hit_test_results.iter()
-        {
-            let pipeline_details = self.pipelines.get_mut(pipeline_id)?;
-            if previous_pipeline_id.replace(pipeline_id) != Some(pipeline_id) {
-                let scroll_result = pipeline_details
-                    .scroll_tree
-                    .scroll_node_or_ancestor(scroll_tree_node, scroll_location);
+        for hit_test_result in hit_test_results.iter() {
+            let pipeline_details = self.pipelines.get_mut(&hit_test_result.pipeline_id)?;
+            if previous_pipeline_id.replace(&hit_test_result.pipeline_id) !=
+                Some(&hit_test_result.pipeline_id)
+            {
+                let scroll_result = pipeline_details.scroll_tree.scroll_node_or_ancestor(
+                    &hit_test_result.external_scroll_id,
+                    scroll_location,
+                    ScrollType::InputEvents,
+                );
                 if let Some((external_scroll_id, offset)) = scroll_result {
                     return Some(ScrollResult {
-                        pipeline_id: *pipeline_id,
+                        hit_test_result: hit_test_result.clone(),
                         external_scroll_id,
                         offset,
                     });
@@ -887,31 +868,68 @@ impl WebViewRenderer {
         None
     }
 
+    fn dispatch_scroll_event(
+        &self,
+        external_id: ExternalScrollId,
+        hit_test_result: CompositorHitTestResult,
+    ) {
+        let event = InputEvent::Scroll(EmbedderScrollEvent { external_id });
+        let msg = EmbedderToConstellationMessage::ForwardInputEvent(
+            self.id,
+            event,
+            Some(hit_test_result),
+        );
+        if let Err(e) = self.global.borrow().constellation_sender.send(msg) {
+            warn!("Sending scroll event to constellation failed ({:?}).", e);
+        }
+    }
+
     pub(crate) fn pinch_zoom_level(&self) -> Scale<f32, DevicePixel, DevicePixel> {
-        Scale::new(self.viewport_zoom.get())
+        Scale::new(self.pinch_zoom.get())
     }
 
     fn set_pinch_zoom_level(&mut self, mut zoom: f32) -> bool {
-        if let Some(min) = self.min_viewport_zoom {
-            zoom = f32::max(min.get(), zoom);
-        }
-        if let Some(max) = self.max_viewport_zoom {
-            zoom = f32::min(max.get(), zoom);
+        if let Some(viewport) = self.viewport_description.as_ref() {
+            zoom = viewport.clamp_zoom(zoom);
         }
 
-        let old_zoom = std::mem::replace(&mut self.viewport_zoom, PinchZoomFactor::new(zoom));
-        old_zoom != self.viewport_zoom
+        let old_zoom = std::mem::replace(&mut self.pinch_zoom, PinchZoomFactor::new(zoom));
+        old_zoom != self.pinch_zoom
     }
 
-    pub(crate) fn set_page_zoom(&mut self, magnification: f32) {
-        self.page_zoom =
-            Scale::new((self.page_zoom.get() * magnification).clamp(MIN_ZOOM, MAX_ZOOM));
+    pub(crate) fn page_zoom(&mut self) -> Scale<f32, CSSPixel, DeviceIndependentPixel> {
+        self.page_zoom
     }
 
+    pub(crate) fn set_page_zoom(
+        &mut self,
+        new_page_zoom: Scale<f32, CSSPixel, DeviceIndependentPixel>,
+    ) {
+        let new_page_zoom = new_page_zoom.clamp(MIN_PAGE_ZOOM, MAX_PAGE_ZOOM);
+        let old_zoom = std::mem::replace(&mut self.page_zoom, new_page_zoom);
+        if old_zoom != self.page_zoom {
+            self.send_window_size_message();
+        }
+    }
+
+    /// The scale to use when displaying this [`WebViewRenderer`] in WebRender
+    /// including both viewport scale (page zoom and hidpi scale) as well as any
+    /// pinch zoom applied. This is based on the latest display list received,
+    /// as page zoom changes are applied asynchronously and the rendered view
+    /// should reflect the latest display list.
     pub(crate) fn device_pixels_per_page_pixel(&self) -> Scale<f32, CSSPixel, DevicePixel> {
-        self.page_zoom * self.hidpi_scale_factor * self.pinch_zoom_level()
+        let viewport_scale = self
+            .root_pipeline_id
+            .and_then(|pipeline_id| self.pipelines.get(&pipeline_id))
+            .and_then(|pipeline| pipeline.viewport_scale)
+            .unwrap_or_else(|| self.page_zoom * self.hidpi_scale_factor);
+        viewport_scale * self.pinch_zoom_level()
     }
 
+    /// The current viewport scale (hidpi scale and page zoom and not pinch
+    /// zoom) based on the current setting of the WebView. Note that this may
+    /// not be the rendered viewport zoom as that is based on the latest display
+    /// list and zoom changes are applied asynchronously.
     pub(crate) fn device_pixels_per_page_pixel_not_including_pinch_zoom(
         &self,
     ) -> Scale<f32, CSSPixel, DevicePixel> {
@@ -926,7 +944,12 @@ impl WebViewRenderer {
 
         // TODO: Scroll to keep the center in view?
         self.pending_scroll_zoom_events
-            .push(ScrollZoomEvent::PinchZoom(magnification));
+            .push(ScrollZoomEvent::PinchZoom(
+                self.viewport_description
+                    .clone()
+                    .unwrap_or_default()
+                    .clamp_zoom(magnification),
+            ));
     }
 
     fn send_window_size_message(&self) {
@@ -970,28 +993,24 @@ impl WebViewRenderer {
         old_rect != self.rect
     }
 
-    pub(crate) fn client_window_rect(
+    pub fn set_viewport_description(&mut self, viewport_description: ViewportDescription) {
+        self.pending_scroll_zoom_events
+            .push(ScrollZoomEvent::InitialViewportZoom(
+                viewport_description
+                    .clone()
+                    .clamp_zoom(viewport_description.initial_scale.get()),
+            ));
+        self.viewport_description = Some(viewport_description);
+    }
+
+    pub(crate) fn scroll_trees_memory_usage(
         &self,
-        rendering_context_size: Size2D<u32, DevicePixel>,
-    ) -> Box2D<i32, DeviceIndependentPixel> {
-        let screen_geometry = self.webview.screen_geometry().unwrap_or_default();
-        let rect = DeviceIntRect::from_origin_and_size(
-            screen_geometry.offset,
-            rendering_context_size.to_i32(),
-        )
-        .to_f32() /
-            self.hidpi_scale_factor;
-        rect.to_i32()
-    }
-
-    pub(crate) fn screen_size(&self) -> Size2D<i32, DeviceIndependentPixel> {
-        let screen_geometry = self.webview.screen_geometry().unwrap_or_default();
-        (screen_geometry.size.to_f32() / self.hidpi_scale_factor).to_i32()
-    }
-
-    pub(crate) fn available_screen_size(&self) -> Size2D<i32, DeviceIndependentPixel> {
-        let screen_geometry = self.webview.screen_geometry().unwrap_or_default();
-        (screen_geometry.available_size.to_f32() / self.hidpi_scale_factor).to_i32()
+        ops: &mut malloc_size_of::MallocSizeOfOps,
+    ) -> usize {
+        self.pipelines
+            .values()
+            .map(|pipeline| pipeline.scroll_tree.size_of(ops))
+            .sum::<usize>()
     }
 }
 

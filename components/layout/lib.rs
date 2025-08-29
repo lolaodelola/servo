@@ -8,9 +8,9 @@
 //! painted.
 
 mod cell;
-pub mod context;
-pub mod display_list;
-pub mod dom;
+mod context;
+mod display_list;
+mod dom;
 mod dom_traversal;
 mod flexbox;
 pub mod flow;
@@ -24,25 +24,26 @@ mod taffy;
 mod construct_modern;
 mod lists;
 mod positioned;
-pub mod query;
+mod query;
 mod quotes;
 mod replaced;
 mod sizing;
 mod style_ext;
 pub mod table;
-pub mod traversal;
+mod traversal;
 
 use app_units::Au;
 pub use cell::ArcRefCell;
-pub use flow::BoxTree;
-pub use fragment_tree::FragmentTree;
+pub(crate) use flow::BoxTree;
+pub(crate) use fragment_tree::FragmentTree;
 pub use layout_impl::LayoutFactoryImpl;
 use malloc_size_of_derive::MallocSizeOf;
 use servo_arc::Arc as ServoArc;
 use style::logical_geometry::WritingMode;
 use style::properties::ComputedValues;
 
-use crate::geom::{LogicalVec2, SizeConstraint};
+use crate::geom::LogicalVec2;
+use crate::sizing::SizeConstraint;
 use crate::style_ext::AspectRatio;
 
 /// At times, a style is "owned" by more than one layout object. For example, text

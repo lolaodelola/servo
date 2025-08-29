@@ -4,7 +4,6 @@
 
 use html5ever::{LocalName, Prefix, QualName, local_name, ns};
 use js::rust::HandleObject;
-use servo_config::pref;
 
 use crate::dom::bindings::error::{report_pending_exception, throw_dom_exception};
 use crate::dom::bindings::reflector::DomGlobal;
@@ -110,10 +109,6 @@ fn create_svg_element(
         })
     );
 
-    if !pref!(dom_svg_enabled) {
-        return Element::new(name.local, name.ns, prefix, document, proto, CanGc::note());
-    }
-
     match name.local {
         local_name!("image") => make!(SVGImageElement),
         local_name!("svg") => make!(SVGSVGElement),
@@ -174,7 +169,7 @@ fn create_html_element(
                 // steps while catching any exceptions:
                 CustomElementCreationMode::Synchronous => {
                     let local_name = name.local.clone();
-                    //TODO(jdm) Pass proto to create_element?
+                    // TODO(jdm) Pass proto to create_element?
                     // Steps 4.1.1-4.1.11
                     return match definition.create_element(document, prefix.clone(), can_gc) {
                         Ok(element) => {
@@ -344,7 +339,7 @@ pub(crate) fn create_native_html_element(
         local_name!("html") => make!(HTMLHtmlElement),
         local_name!("i") => make!(HTMLElement),
         local_name!("iframe") => make!(HTMLIFrameElement),
-        local_name!("img") => make!(HTMLImageElement),
+        local_name!("img") => make!(HTMLImageElement, creator),
         local_name!("input") => make!(HTMLInputElement),
         local_name!("ins") => make!(HTMLModElement),
         // https://html.spec.whatwg.org/multipage/#other-elements,-attributes-and-apis:isindex-2

@@ -2,14 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::net::TcpStream;
-
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use super::source::{Source, SourcesReply};
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
-use crate::protocol::JsonPacketStream;
+use super::source::{SourceManager, SourcesReply};
+use crate::actor::{Actor, ActorError, ActorRegistry};
+use crate::protocol::{ClientRequest, JsonPacketStream};
 use crate::{EmptyReplyMsg, StreamId};
 
 #[derive(Serialize)]
@@ -52,14 +50,14 @@ struct ThreadInterruptedReply {
 
 pub struct ThreadActor {
     pub name: String,
-    pub source_manager: Source,
+    pub source_manager: SourceManager,
 }
 
 impl ThreadActor {
     pub fn new(name: String) -> ThreadActor {
         ThreadActor {
             name: name.clone(),
-            source_manager: Source::new(name),
+            source_manager: SourceManager::new(),
         }
     }
 }
@@ -71,13 +69,13 @@ impl Actor for ThreadActor {
 
     fn handle_message(
         &self,
+        mut request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "attach" => {
                 let msg = ThreadAttached {
                     from: self.name(),
@@ -92,9 +90,8 @@ impl Actor for ThreadActor {
                         type_: "attached".to_owned(),
                     },
                 };
-                let _ = stream.write_json_packet(&msg);
-                let _ = stream.write_json_packet(&EmptyReplyMsg { from: self.name() });
-                ActorMessageStatus::Processed
+                request.write_json_packet(&msg)?;
+                request.reply_final(&EmptyReplyMsg { from: self.name() })?
             },
 
             "resume" => {
@@ -102,9 +99,8 @@ impl Actor for ThreadActor {
                     from: self.name(),
                     type_: "resumed".to_owned(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                let _ = stream.write_json_packet(&EmptyReplyMsg { from: self.name() });
-                ActorMessageStatus::Processed
+                request.write_json_packet(&msg)?;
+                request.reply_final(&EmptyReplyMsg { from: self.name() })?
             },
 
             "interrupt" => {
@@ -112,27 +108,23 @@ impl Actor for ThreadActor {
                     from: self.name(),
                     type_: "interrupted".to_owned(),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.write_json_packet(&msg)?;
+                request.reply_final(&EmptyReplyMsg { from: self.name() })?
             },
 
-            "reconfigure" => {
-                let _ = stream.write_json_packet(&EmptyReplyMsg { from: self.name() });
-                ActorMessageStatus::Processed
-            },
+            "reconfigure" => request.reply_final(&EmptyReplyMsg { from: self.name() })?,
 
             // Client has attached to the thread and wants to load script sources.
             // <https://firefox-source-docs.mozilla.org/devtools/backend/protocol.html#loading-script-sources>
             "sources" => {
                 let msg = SourcesReply {
                     from: self.name(),
-                    sources: vec![], // TODO: Add sources for the debugger here
+                    sources: self.source_manager.source_forms(registry),
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
-
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }

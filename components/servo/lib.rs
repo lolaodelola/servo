@@ -33,13 +33,13 @@ use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use base::generic_channel::RoutedReceiver;
 pub use base::id::WebViewId;
 use base::id::{PipelineNamespace, PipelineNamespaceId};
 #[cfg(feature = "bluetooth")]
 use bluetooth::BluetoothThreadFactory;
 #[cfg(feature = "bluetooth")]
 use bluetooth_traits::BluetoothRequest;
-use canvas::canvas_paint_thread::CanvasPaintThread;
 use canvas_traits::webgl::{GlType, WebGLThreads};
 use clipboard_delegate::StringRequest;
 pub use compositing::WebRenderDebugOption;
@@ -85,22 +85,30 @@ use gleam::gl::RENDERER;
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
 use javascript_evaluator::JavaScriptEvaluator;
-pub use keyboard_types::*;
+pub use keyboard_types::{
+    Code, CompositionEvent, CompositionState, Key, KeyState, Location, Modifiers, NamedKey,
+};
 use layout::LayoutFactoryImpl;
-use log::{Log, Metadata, Record, debug, warn};
+use log::{Log, Metadata, Record, debug, error, warn};
 use media::{GlApi, NativeDisplay, WindowGLContext};
 use net::protocols::ProtocolRegistry;
 use net::resource_thread::new_resource_threads;
+use net_traits::{exit_fetch_thread, start_fetch_thread};
 use profile::{mem as profile_mem, time as profile_time};
+use profile_traits::mem::MemoryReportResult;
 use profile_traits::{mem, time};
 use script::{JSEngineSetup, ServiceWorkerManager};
 use servo_config::opts::Opts;
 use servo_config::prefs::Preferences;
 use servo_config::{opts, pref, prefs};
 use servo_delegate::DefaultServoDelegate;
+use servo_geometry::{
+    DeviceIndependentIntRect, convert_rect_to_css_pixel, convert_size_to_css_pixel,
+};
 use servo_media::ServoMedia;
 use servo_media::player::context::GlContext;
 use servo_url::ServoUrl;
+use style::global_style_data::StyleThreadPool;
 use webgl::WebGLComm;
 #[cfg(feature = "webgpu")]
 pub use webgpu;
@@ -112,8 +120,8 @@ use webview::WebViewInner;
 #[cfg(feature = "webxr")]
 pub use webxr;
 pub use {
-    background_hang_monitor, base, canvas, canvas_traits, devtools, devtools_traits, euclid, fonts,
-    ipc_channel, media, net, net_traits, profile, profile_traits, script, script_layout_interface,
+    background_hang_monitor, base, canvas_traits, devtools, devtools_traits, euclid, fonts,
+    ipc_channel, layout_api, media, net, net_traits, profile, profile_traits, script,
     script_traits, servo_config as config, servo_config, servo_geometry, servo_url, style,
     style_traits, webrender_api,
 };
@@ -129,14 +137,6 @@ pub use crate::webview_delegate::{
     AllowOrDenyRequest, AuthenticationRequest, ColorPicker, FormControl, NavigationRequest,
     PermissionRequest, SelectElement, WebResourceLoad, WebViewDelegate,
 };
-
-#[cfg(feature = "webdriver")]
-fn webdriver(port: u16, constellation: Sender<EmbedderToConstellationMessage>) {
-    webdriver_server::start_server(port, constellation);
-}
-
-#[cfg(not(feature = "webdriver"))]
-fn webdriver(_port: u16, _constellation: Sender<EmbedderToConstellationMessage>) {}
 
 #[cfg(feature = "media-gstreamer")]
 mod media_platform {
@@ -256,7 +256,7 @@ impl Servo {
     fn new(builder: ServoBuilder) -> Self {
         // Global configuration options, parsed from the command line.
         let opts = builder.opts.map(|opts| *opts);
-        opts::set_options(opts.unwrap_or_default());
+        opts::initialize_options(opts.unwrap_or_default());
         let opts = opts::get();
 
         // Set the preferences globally.
@@ -405,8 +405,8 @@ impl Servo {
             image_handler,
         } = WebGLComm::new(
             rendering_context.clone(),
+            compositor_proxy.cross_process_compositor_api.clone(),
             webrender_api.create_sender(),
-            webrender_document,
             external_images.clone(),
             gl_type,
         );
@@ -417,7 +417,7 @@ impl Servo {
         // Create the WebXR main thread
         #[cfg(feature = "webxr")]
         let mut webxr_main_thread =
-            webxr::MainThreadRegistry::new(event_loop_waker, webxr_layer_grand_manager)
+            webxr::MainThreadRegistry::new(event_loop_waker.clone(), webxr_layer_grand_manager)
                 .expect("Failed to create WebXR device registry");
         #[cfg(feature = "webxr")]
         if pref!(dom_webxr_enabled) {
@@ -465,12 +465,6 @@ impl Servo {
             builder.user_content_manager,
         );
 
-        if cfg!(feature = "webdriver") {
-            if let Some(port) = opts.webdriver_port {
-                webdriver(port, constellation_chan.clone());
-            }
-        }
-
         // The compositor coordinates with the client window to create the final
         // rendered page and display it somewhere.
         let shutdown_state = Rc::new(Cell::new(ShutdownState::NotShuttingDown));
@@ -489,6 +483,7 @@ impl Servo {
                 #[cfg(feature = "webxr")]
                 webxr_main_thread,
                 shutdown_state: shutdown_state.clone(),
+                event_loop_waker,
             },
             opts.debug.convert_mouse_to_touch,
         );
@@ -546,7 +541,19 @@ impl Servo {
             return false;
         }
 
-        self.compositor.borrow_mut().receive_messages();
+        {
+            let mut compositor = self.compositor.borrow_mut();
+            let mut messages = Vec::new();
+            while let Ok(message) = compositor.receiver().try_recv() {
+                match message {
+                    Ok(message) => messages.push(message),
+                    Err(error) => {
+                        warn!("Router deserialization error: {error}. Ignoring this CompositorMsg.")
+                    },
+                }
+            }
+            compositor.handle_messages(messages);
+        }
 
         // Only handle incoming embedder messages if the compositor hasn't already started shutting down.
         while let Ok(message) = self.embedder_receiver.try_recv() {
@@ -630,6 +637,11 @@ impl Servo {
 
         log::set_boxed_logger(Box::new(logger)).expect("Failed to set logger.");
         log::set_max_level(filter);
+    }
+
+    pub fn create_memory_report(&self, snd: IpcSender<MemoryReportResult>) {
+        self.constellation_proxy
+            .send(EmbedderToConstellationMessage::CreateMemoryReport(snd));
     }
 
     pub fn start_shutting_down(&self) {
@@ -723,12 +735,17 @@ impl Servo {
                     webview.delegate().notify_closed(webview);
                 }
             },
-            EmbedderMsg::WebViewFocused(webview_id) => {
-                for id in self.webviews.borrow().keys() {
-                    if let Some(webview) = self.get_webview_handle(*id) {
-                        let focused = webview.id() == webview_id;
-                        webview.set_focused(focused);
+            EmbedderMsg::WebViewFocused(webview_id, focus_id, focus_result) => {
+                if focus_result {
+                    for id in self.webviews.borrow().keys() {
+                        if let Some(webview) = self.get_webview_handle(*id) {
+                            let focused = webview.id() == webview_id;
+                            webview.set_focused(focused);
+                        }
                     }
+                }
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    webview.complete_focus(focus_id);
                 }
             },
             EmbedderMsg::WebViewBlurred => {
@@ -782,14 +799,21 @@ impl Servo {
                     webview.set_cursor(cursor);
                 }
             },
-            EmbedderMsg::NewFavicon(webview_id, url) => {
+            EmbedderMsg::NewFavicon(webview_id, image) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
-                    webview.set_favicon_url(url.into_url());
+                    webview.set_favicon(image);
                 }
             },
             EmbedderMsg::NotifyLoadStatusChanged(webview_id, load_status) => {
                 if let Some(webview) = self.get_webview_handle(webview_id) {
                     webview.set_load_status(load_status);
+                }
+            },
+            EmbedderMsg::HistoryTraversalComplete(webview_id, traversal_id) => {
+                if let Some(webview) = self.get_webview_handle(webview_id) {
+                    webview
+                        .delegate()
+                        .notify_traversal_complete(webview.clone(), traversal_id);
                 }
             },
             EmbedderMsg::HistoryChanged(webview_id, urls, current_index) => {
@@ -992,6 +1016,72 @@ impl Servo {
                     webview.delegate().show_form_control(webview, form_control);
                 }
             },
+            EmbedderMsg::GetWindowRect(webview_id, response_sender) => {
+                let window_rect = || {
+                    let Some(webview) = self.get_webview_handle(webview_id) else {
+                        return DeviceIndependentIntRect::default();
+                    };
+                    let hidpi_scale_factor = webview.hidpi_scale_factor();
+                    let Some(screen_geometry) = webview.delegate().screen_geometry(webview) else {
+                        return DeviceIndependentIntRect::default();
+                    };
+
+                    convert_rect_to_css_pixel(screen_geometry.window_rect, hidpi_scale_factor)
+                };
+
+                if let Err(error) = response_sender.send(window_rect()) {
+                    warn!("Failed to respond to GetWindowRect: {error}");
+                }
+            },
+            EmbedderMsg::GetScreenMetrics(webview_id, response_sender) => {
+                let screen_metrics = || {
+                    let Some(webview) = self.get_webview_handle(webview_id) else {
+                        return ScreenMetrics::default();
+                    };
+                    let hidpi_scale_factor = webview.hidpi_scale_factor();
+                    let Some(screen_geometry) = webview.delegate().screen_geometry(webview) else {
+                        return ScreenMetrics::default();
+                    };
+
+                    ScreenMetrics {
+                        screen_size: convert_size_to_css_pixel(
+                            screen_geometry.size,
+                            hidpi_scale_factor,
+                        ),
+                        available_size: convert_size_to_css_pixel(
+                            screen_geometry.available_size,
+                            hidpi_scale_factor,
+                        ),
+                    }
+                };
+                if let Err(error) = response_sender.send(screen_metrics()) {
+                    warn!("Failed to respond to GetScreenMetrics: {error}");
+                }
+            },
+        }
+    }
+
+    pub fn constellation_sender(&self) -> Sender<EmbedderToConstellationMessage> {
+        self.constellation_proxy.sender()
+    }
+
+    pub fn execute_webdriver_command(&self, command: WebDriverCommandMsg) {
+        if let WebDriverCommandMsg::TakeScreenshot(webview_id, page_rect, response_sender) = command
+        {
+            let res = self
+                .compositor
+                .borrow_mut()
+                .render_to_shared_memory(webview_id, page_rect);
+            if let Err(ref e) = res {
+                error!("Error retrieving PNG: {:?}", e);
+            }
+            let img = res.unwrap_or(None);
+            if let Err(e) = response_sender.send(img) {
+                error!("Sending reply to create png failed ({:?}).", e);
+            }
+        } else {
+            self.constellation_proxy
+                .send(EmbedderToConstellationMessage::WebDriverCommand(command));
         }
     }
 }
@@ -1011,13 +1101,13 @@ fn create_embedder_channel(
 
 fn create_compositor_channel(
     event_loop_waker: Box<dyn EventLoopWaker>,
-) -> (CompositorProxy, Receiver<CompositorMsg>) {
+) -> (CompositorProxy, RoutedReceiver<CompositorMsg>) {
     let (sender, receiver) = unbounded();
 
     let (compositor_ipc_sender, compositor_ipc_receiver) =
         ipc::channel().expect("ipc channel failure");
 
-    let cross_process_compositor_api = CrossProcessCompositorApi(compositor_ipc_sender);
+    let cross_process_compositor_api = CrossProcessCompositorApi::new(compositor_ipc_sender);
     let compositor_proxy = CompositorProxy {
         sender,
         cross_process_compositor_api,
@@ -1028,7 +1118,7 @@ fn create_compositor_channel(
     ROUTER.add_typed_route(
         compositor_ipc_receiver,
         Box::new(move |message| {
-            compositor_proxy_clone.send(message.expect("Could not convert Compositor message"));
+            compositor_proxy_clone.route_msg(message);
         }),
     );
 
@@ -1059,7 +1149,7 @@ fn create_constellation(
     let bluetooth_thread: IpcSender<BluetoothRequest> =
         BluetoothThreadFactory::new(embedder_proxy.clone());
 
-    let (public_resource_threads, private_resource_threads) = new_resource_threads(
+    let (public_resource_threads, private_resource_threads, async_runtime) = new_resource_threads(
         devtools_sender.clone(),
         time_profiler_chan.clone(),
         mem_profiler_chan.clone(),
@@ -1076,12 +1166,6 @@ fn create_constellation(
             mem_profiler_chan.clone(),
         )
         .to_proxy(),
-    );
-
-    let (canvas_create_sender, canvas_ipc_sender) = CanvasPaintThread::start(
-        compositor_proxy.cross_process_compositor_api.clone(),
-        system_font_service.clone(),
-        public_resource_threads.clone(),
     );
 
     let initial_state = InitialConstellationState {
@@ -1106,6 +1190,7 @@ fn create_constellation(
         #[cfg(feature = "webgpu")]
         wgpu_image_map,
         user_content_manager,
+        async_runtime,
     };
 
     let layout_factory = Arc::new(LayoutFactoryImpl());
@@ -1116,8 +1201,6 @@ fn create_constellation(
         opts.random_pipeline_closure_probability,
         opts.random_pipeline_closure_seed,
         opts.hard_fail,
-        canvas_create_sender,
-        canvas_ipc_sender,
     )
 }
 
@@ -1168,7 +1251,7 @@ pub fn run_content_process(token: String) {
         .unwrap();
 
     let unprivileged_content = unprivileged_content_receiver.recv().unwrap();
-    opts::set_options(unprivileged_content.opts());
+    opts::initialize_options(unprivileged_content.opts());
     prefs::set(unprivileged_content.prefs().clone());
 
     // Enter the sandbox if necessary.
@@ -1182,18 +1265,41 @@ pub fn run_content_process(token: String) {
         UnprivilegedContent::Pipeline(mut content) => {
             media_platform::init();
 
+            // Start the fetch thread for this content process.
+            let fetch_thread_join_handle = start_fetch_thread();
+
             set_logger(content.script_to_constellation_chan().clone());
 
-            let background_hang_monitor_register = content.register_with_background_hang_monitor();
+            let (background_hang_monitor_register, join_handle) =
+                content.register_with_background_hang_monitor();
             let layout_factory = Arc::new(LayoutFactoryImpl());
 
             content.register_system_memory_reporter();
 
-            content.start_all::<script::ScriptThread>(
+            let script_join_handle = content.start_all::<script::ScriptThread>(
                 true,
                 layout_factory,
                 background_hang_monitor_register,
             );
+
+            // Since wait_for_completion is true,
+            // here we know that the script-thread
+            // will exit(or already has),
+            // and so we can join first on the script, and then on the BHM worker, threads.
+            script_join_handle
+                .join()
+                .expect("Failed to join on the script thread.");
+            join_handle
+                .join()
+                .expect("Failed to join on the BHM background thread.");
+
+            StyleThreadPool::shutdown();
+
+            // Shut down the fetch thread started above.
+            exit_fetch_thread();
+            fetch_thread_join_handle
+                .join()
+                .expect("Failed to join on the fetch thread in the constellation");
         },
         UnprivilegedContent::ServiceWorker(content) => {
             content.start::<ServiceWorkerManager>();

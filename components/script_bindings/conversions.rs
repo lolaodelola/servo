@@ -5,7 +5,7 @@
 use std::{ptr, slice};
 
 use js::conversions::{
-    ConversionResult, FromJSValConvertible, ToJSValConvertible, latin1_to_string,
+    ConversionResult, FromJSValConvertible, ToJSValConvertible, jsstr_to_string,
 };
 use js::error::throw_type_error;
 use js::glue::{
@@ -14,7 +14,7 @@ use js::glue::{
 };
 use js::jsapi::{
     Heap, IsWindowProxy, JS_DeprecatedStringHasLatin1Chars, JS_GetLatin1StringCharsAndLength,
-    JS_GetTwoByteStringCharsAndLength, JS_NewStringCopyN, JSContext, JSObject, JSString,
+    JS_GetTwoByteStringCharsAndLength, JS_NewStringCopyN, JSContext, JSObject,
 };
 use js::jsval::{ObjectValue, StringValue, UndefinedValue};
 use js::rust::wrappers::IsArrayObject;
@@ -22,16 +22,30 @@ use js::rust::{
     HandleId, HandleValue, MutableHandleValue, ToString, get_object_class, is_dom_class,
     is_dom_object, maybe_wrap_value,
 };
+use keyboard_types::Modifiers;
 use num_traits::Float;
 
 use crate::JSTraceable;
+use crate::codegen::GenericBindings::EventModifierInitBinding::EventModifierInit;
 use crate::inheritance::Castable;
 use crate::num::Finite;
 use crate::reflector::{DomObject, Reflector};
 use crate::root::DomRoot;
+use crate::script_runtime::JSContext as SafeJSContext;
 use crate::str::{ByteString, DOMString, USVString};
 use crate::trace::RootedTraceableBox;
 use crate::utils::{DOMClass, DOMJSClass};
+
+/// A safe wrapper for `ToJSValConvertible`.
+pub trait SafeToJSValConvertible {
+    fn safe_to_jsval(&self, cx: SafeJSContext, rval: MutableHandleValue);
+}
+
+impl<T: ToJSValConvertible + ?Sized> SafeToJSValConvertible for T {
+    fn safe_to_jsval(&self, cx: SafeJSContext, rval: MutableHandleValue) {
+        unsafe { self.to_jsval(*cx, rval) };
+    }
+}
 
 /// A trait to check whether a given `JSObject` implements an IDL interface.
 pub trait IDLInterface {
@@ -65,6 +79,30 @@ impl ToJSValConvertible for DOMString {
     }
 }
 
+/// A safe wrapper for `FromJSValConvertible`.
+pub trait SafeFromJSValConvertible: Sized {
+    type Config;
+
+    #[allow(clippy::result_unit_err)] // Type definition depends on mozjs
+    fn safe_from_jsval(
+        cx: SafeJSContext,
+        value: HandleValue,
+        option: Self::Config,
+    ) -> Result<ConversionResult<Self>, ()>;
+}
+
+impl<T: FromJSValConvertible> SafeFromJSValConvertible for T {
+    type Config = <T as FromJSValConvertible>::Config;
+
+    fn safe_from_jsval(
+        cx: SafeJSContext,
+        value: HandleValue,
+        option: Self::Config,
+    ) -> Result<ConversionResult<Self>, ()> {
+        unsafe { T::from_jsval(*cx, value, option) }
+    }
+}
+
 // https://heycam.github.io/webidl/#es-DOMString
 impl FromJSValConvertible for DOMString {
     type Config = StringificationBehavior;
@@ -77,7 +115,9 @@ impl FromJSValConvertible for DOMString {
             Ok(ConversionResult::Success(DOMString::new()))
         } else {
             match ptr::NonNull::new(ToString(cx, value)) {
-                Some(jsstr) => Ok(ConversionResult::Success(jsstring_to_str(cx, jsstr))),
+                Some(jsstr) => Ok(ConversionResult::Success(DOMString::from_string(
+                    jsstr_to_string(cx, jsstr),
+                ))),
                 None => {
                     debug!("ToString failed");
                     Err(())
@@ -85,34 +125,6 @@ impl FromJSValConvertible for DOMString {
             }
         }
     }
-}
-
-/// Convert the given `JSString` to a `DOMString`. Fails if the string does not
-/// contain valid UTF-16.
-///
-/// # Safety
-/// cx and s must point to valid values.
-pub unsafe fn jsstring_to_str(cx: *mut JSContext, s: ptr::NonNull<JSString>) -> DOMString {
-    let latin1 = JS_DeprecatedStringHasLatin1Chars(s.as_ptr());
-    DOMString::from_string(if latin1 {
-        latin1_to_string(cx, s.as_ptr())
-    } else {
-        let mut length = 0;
-        let chars = JS_GetTwoByteStringCharsAndLength(cx, ptr::null(), s.as_ptr(), &mut length);
-        assert!(!chars.is_null());
-        let potentially_ill_formed_utf16 = slice::from_raw_parts(chars, length);
-        let mut s = String::with_capacity(length);
-        for item in char::decode_utf16(potentially_ill_formed_utf16.iter().cloned()) {
-            match item {
-                Ok(c) => s.push(c),
-                Err(_) => {
-                    error!("Found an unpaired surrogate in a DOM string.");
-                    s.push('\u{FFFD}');
-                },
-            }
-        }
-        s
-    })
 }
 
 // http://heycam.github.io/webidl/#es-USVString
@@ -130,8 +142,8 @@ impl FromJSValConvertible for USVString {
         let latin1 = JS_DeprecatedStringHasLatin1Chars(jsstr.as_ptr());
         if latin1 {
             // FIXME(ajeffrey): Convert directly from DOMString to USVString
-            return Ok(ConversionResult::Success(USVString(String::from(
-                jsstring_to_str(cx, jsstr),
+            return Ok(ConversionResult::Success(USVString(jsstr_to_string(
+                cx, jsstr,
             ))));
         }
         let mut length = 0;
@@ -407,7 +419,7 @@ pub unsafe fn jsid_to_string(cx: *mut JSContext, id: HandleId) -> Option<DOMStri
     let id_raw = *id;
     if id_raw.is_string() {
         let jsstr = std::ptr::NonNull::new(id_raw.to_string()).unwrap();
-        return Some(jsstring_to_str(cx, jsstr));
+        return Some(DOMString::from_string(jsstr_to_string(cx, jsstr)));
     }
 
     if id_raw.is_int() {
@@ -588,4 +600,54 @@ pub(crate) unsafe fn windowproxy_from_handlevalue<D: crate::DomTypes>(
     GetProxyReservedSlot(object, 0, &mut value);
     let ptr = value.to_private() as *const D::WindowProxy;
     Ok(DomRoot::from_ref(&*ptr))
+}
+
+#[allow(deprecated)]
+impl<D: crate::DomTypes> EventModifierInit<D> {
+    pub fn modifiers(&self) -> Modifiers {
+        let mut modifiers = Modifiers::empty();
+        if self.altKey {
+            modifiers.insert(Modifiers::ALT);
+        }
+        if self.ctrlKey {
+            modifiers.insert(Modifiers::CONTROL);
+        }
+        if self.shiftKey {
+            modifiers.insert(Modifiers::SHIFT);
+        }
+        if self.metaKey {
+            modifiers.insert(Modifiers::META);
+        }
+        if self.keyModifierStateAltGraph {
+            modifiers.insert(Modifiers::ALT_GRAPH);
+        }
+        if self.keyModifierStateCapsLock {
+            modifiers.insert(Modifiers::CAPS_LOCK);
+        }
+        if self.keyModifierStateFn {
+            modifiers.insert(Modifiers::FN);
+        }
+        if self.keyModifierStateFnLock {
+            modifiers.insert(Modifiers::FN_LOCK);
+        }
+        if self.keyModifierStateHyper {
+            modifiers.insert(Modifiers::HYPER);
+        }
+        if self.keyModifierStateNumLock {
+            modifiers.insert(Modifiers::NUM_LOCK);
+        }
+        if self.keyModifierStateScrollLock {
+            modifiers.insert(Modifiers::SCROLL_LOCK);
+        }
+        if self.keyModifierStateSuper {
+            modifiers.insert(Modifiers::SUPER);
+        }
+        if self.keyModifierStateSymbol {
+            modifiers.insert(Modifiers::SYMBOL);
+        }
+        if self.keyModifierStateSymbolLock {
+            modifiers.insert(Modifiers::SYMBOL_LOCK);
+        }
+        modifiers
+    }
 }

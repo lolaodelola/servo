@@ -6,7 +6,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::TcpStream;
 
 use devtools_traits::DevtoolScriptControlMsg;
 use devtools_traits::DevtoolScriptControlMsg::GetRootNode;
@@ -15,13 +14,13 @@ use serde::Serialize;
 use serde_json::{self, Map, Value};
 
 use crate::StreamId;
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::actor::{Actor, ActorError, ActorRegistry};
 use crate::actors::browsing_context::BrowsingContextActor;
 use crate::actors::inspector::highlighter::{HighlighterActor, HighlighterMsg};
 use crate::actors::inspector::node::NodeInfoToProtocol;
 use crate::actors::inspector::page_style::{PageStyleActor, PageStyleMsg};
 use crate::actors::inspector::walker::{WalkerActor, WalkerMsg};
-use crate::protocol::JsonPacketStream;
+use crate::protocol::ClientRequest;
 
 pub mod accessibility;
 pub mod css_properties;
@@ -73,19 +72,19 @@ impl Actor for InspectorActor {
 
     fn handle_message(
         &self,
+        request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         _msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
+    ) -> Result<(), ActorError> {
         let browsing_context = registry.find::<BrowsingContextActor>(&self.browsing_context);
         let pipeline = browsing_context.active_pipeline_id.get();
-        Ok(match msg_type {
+        match msg_type {
             "getWalker" => {
                 let (tx, rx) = ipc::channel().unwrap();
                 self.script_chan.send(GetRootNode(pipeline, tx)).unwrap();
-                let root_info = rx.recv().unwrap().ok_or(())?;
+                let root_info = rx.recv().unwrap().ok_or(ActorError::Internal)?;
 
                 let name = self
                     .walker
@@ -93,13 +92,8 @@ impl Actor for InspectorActor {
                     .clone()
                     .unwrap_or_else(|| registry.new_name("walker"));
 
-                let root = root_info.encode(
-                    registry,
-                    false,
-                    self.script_chan.clone(),
-                    pipeline,
-                    name.clone(),
-                );
+                let root =
+                    root_info.encode(registry, self.script_chan.clone(), pipeline, name.clone());
 
                 if self.walker.borrow().is_none() {
                     let walker = WalkerActor {
@@ -121,8 +115,7 @@ impl Actor for InspectorActor {
                         root,
                     },
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
             "getPageStyle" => {
@@ -149,8 +142,7 @@ impl Actor for InspectorActor {
                         ]),
                     },
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
             "supportsHighlighters" => {
@@ -158,8 +150,7 @@ impl Actor for InspectorActor {
                     from: self.name(),
                     value: true,
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
             "getHighlighterByType" => {
@@ -180,11 +171,10 @@ impl Actor for InspectorActor {
                         actor: self.highlighter.borrow().clone().unwrap(),
                     },
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
-
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }

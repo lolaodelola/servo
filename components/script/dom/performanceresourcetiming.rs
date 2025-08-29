@@ -23,9 +23,10 @@ use crate::script_runtime::CanGc;
 // TODO Cross origin resources MUST BE INCLUDED as PerformanceResourceTiming objects
 // https://w3c.github.io/resource-timing/#sec-cross-origin-resources
 
-// TODO CSS, Beacon
+// TODO CSS
 #[derive(Debug, JSTraceable, MallocSizeOf, PartialEq)]
 pub(crate) enum InitiatorType {
+    Beacon,
     LocalName(String),
     Navigation,
     XMLHttpRequest,
@@ -62,9 +63,9 @@ pub(crate) struct PerformanceResourceTiming {
     response_start: Option<CrossProcessInstant>,
     #[no_trace]
     response_end: Option<CrossProcessInstant>,
-    transfer_size: u64,     //size in octets
-    encoded_body_size: u64, //size in octets
-    decoded_body_size: u64, //size in octets
+    transfer_size: u64,     // size in octets
+    encoded_body_size: u64, // size in octets
+    decoded_body_size: u64, // size in octets
 }
 
 // TODO(#21269): next_hop
@@ -113,7 +114,7 @@ impl PerformanceResourceTiming {
         }
     }
 
-    //TODO fetch start should be in RFT
+    // TODO fetch start should be in RFT
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn from_resource_timing(
         url: ServoUrl,
@@ -139,7 +140,7 @@ impl PerformanceResourceTiming {
             redirect_end: resource_timing.redirect_end,
             fetch_start: resource_timing.fetch_start,
             domain_lookup_start: resource_timing.domain_lookup_start,
-            //TODO (#21260)
+            // TODO (#21260)
             domain_lookup_end: None,
             connect_start: resource_timing.connect_start,
             connect_end: resource_timing.connect_end,
@@ -191,6 +192,7 @@ impl PerformanceResourceTimingMethods<crate::DomTypeHolder> for PerformanceResou
     // https://w3c.github.io/resource-timing/#dom-performanceresourcetiming-initiatortype
     fn InitiatorType(&self) -> DOMString {
         match self.initiator_type {
+            InitiatorType::Beacon => DOMString::from("beacon"),
             InitiatorType::LocalName(ref n) => DOMString::from(n.clone()),
             InitiatorType::Navigation => DOMString::from("navigation"),
             InitiatorType::XMLHttpRequest => DOMString::from("xmlhttprequest"),

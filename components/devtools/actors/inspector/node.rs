@@ -7,7 +7,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::net::TcpStream;
 
 use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg::{GetChildren, GetDocumentElement, ModifyAttribute};
@@ -16,9 +15,9 @@ use ipc_channel::ipc::{self, IpcSender};
 use serde::Serialize;
 use serde_json::{self, Map, Value};
 
-use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
+use crate::actor::{Actor, ActorError, ActorRegistry};
 use crate::actors::inspector::walker::WalkerActor;
-use crate::protocol::JsonPacketStream;
+use crate::protocol::ClientRequest;
 use crate::{EmptyReplyMsg, StreamId};
 
 /// Text node type constant. This is defined again to avoid depending on `script`, where it is defined originally.
@@ -60,6 +59,9 @@ pub struct NodeActorMsg {
     is_anonymous: bool,
     is_before_pseudo_element: bool,
     is_direct_shadow_host_child: Option<bool>,
+    /// Whether or not this node is displayed.
+    ///
+    /// Setting this value to `false` will cause the devtools to render the node name in gray.
     is_displayed: bool,
     #[serde(rename = "isInHTMLDocument")]
     is_in_html_document: Option<bool>,
@@ -113,15 +115,19 @@ impl Actor for NodeActor {
     /// - `getUniqueSelector`: Returns the display name of this node
     fn handle_message(
         &self,
+        mut request: ClientRequest,
         registry: &ActorRegistry,
         msg_type: &str,
         msg: &Map<String, Value>,
-        stream: &mut TcpStream,
         _id: StreamId,
-    ) -> Result<ActorMessageStatus, ()> {
-        Ok(match msg_type {
+    ) -> Result<(), ActorError> {
+        match msg_type {
             "modifyAttributes" => {
-                let mods = msg.get("modifications").ok_or(())?.as_array().ok_or(())?;
+                let mods = msg
+                    .get("modifications")
+                    .ok_or(ActorError::MissingParameter)?
+                    .as_array()
+                    .ok_or(ActorError::BadParameterType)?;
                 let modifications: Vec<_> = mods
                     .iter()
                     .filter_map(|json_mod| {
@@ -130,7 +136,7 @@ impl Actor for NodeActor {
                     .collect();
 
                 let walker = registry.find::<WalkerActor>(&self.walker);
-                walker.new_mutations(stream, &self.name, &modifications);
+                walker.new_mutations(&mut request, &self.name, &modifications);
 
                 self.script_chan
                     .send(ModifyAttribute(
@@ -138,11 +144,10 @@ impl Actor for NodeActor {
                         registry.actor_to_script(self.name()),
                         modifications,
                     ))
-                    .map_err(|_| ())?;
+                    .map_err(|_| ActorError::Internal)?;
 
                 let reply = EmptyReplyMsg { from: self.name() };
-                let _ = stream.write_json_packet(&reply);
-                ActorMessageStatus::Processed
+                request.reply_final(&reply)?
             },
 
             "getUniqueSelector" => {
@@ -150,10 +155,12 @@ impl Actor for NodeActor {
                 self.script_chan
                     .send(GetDocumentElement(self.pipeline, tx))
                     .unwrap();
-                let doc_elem_info = rx.recv().map_err(|_| ())?.ok_or(())?;
+                let doc_elem_info = rx
+                    .recv()
+                    .map_err(|_| ActorError::Internal)?
+                    .ok_or(ActorError::Internal)?;
                 let node = doc_elem_info.encode(
                     registry,
-                    true,
                     self.script_chan.clone(),
                     self.pipeline,
                     self.walker.clone(),
@@ -163,12 +170,12 @@ impl Actor for NodeActor {
                     from: self.name(),
                     value: node.display_name,
                 };
-                let _ = stream.write_json_packet(&msg);
-                ActorMessageStatus::Processed
+                request.reply_final(&msg)?
             },
 
-            _ => ActorMessageStatus::Ignored,
-        })
+            _ => return Err(ActorError::UnrecognizedPacketType),
+        };
+        Ok(())
     }
 }
 
@@ -176,7 +183,6 @@ pub trait NodeInfoToProtocol {
     fn encode(
         self,
         actors: &ActorRegistry,
-        display: bool,
         script_chan: IpcSender<DevtoolScriptControlMsg>,
         pipeline: PipelineId,
         walker: String,
@@ -187,7 +193,6 @@ impl NodeInfoToProtocol for NodeInfo {
     fn encode(
         self,
         actors: &ActorRegistry,
-        display: bool,
         script_chan: IpcSender<DevtoolScriptControlMsg>,
         pipeline: PipelineId,
         walker: String,
@@ -234,7 +239,7 @@ impl NodeInfoToProtocol for NodeInfo {
             let mut children = rx.recv().ok()??;
 
             let child = children.pop()?;
-            let msg = child.encode(actors, true, script_chan.clone(), pipeline, walker);
+            let msg = child.encode(actors, script_chan.clone(), pipeline, walker);
 
             // If the node child is not a text node, do not represent it inline.
             if msg.node_type != TEXT_NODE {
@@ -262,7 +267,7 @@ impl NodeInfoToProtocol for NodeInfo {
             is_anonymous: false,
             is_before_pseudo_element: false,
             is_direct_shadow_host_child: None,
-            is_displayed: display,
+            is_displayed: self.is_displayed,
             is_in_html_document: Some(true),
             is_marker_pseudo_element: false,
             is_native_anonymous: false,

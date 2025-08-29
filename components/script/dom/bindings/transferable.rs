@@ -9,12 +9,15 @@ use std::collections::HashMap;
 use std::hash::Hash;
 
 use base::id::NamespaceIndex;
+use script_bindings::structuredclone::MarkedAsTransferableInIdl;
 
+use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::structuredclone::StructuredData;
 use crate::dom::globalscope::GlobalScope;
-pub(crate) trait Transferable: DomObject
+
+pub(crate) trait Transferable: DomObject + MarkedAsTransferableInIdl
 where
     Self: Sized,
 {
@@ -25,7 +28,10 @@ where
         true
     }
 
-    fn transfer(&self) -> Result<(NamespaceIndex<Self::Index>, Self::Data), ()>;
+    /// <https://html.spec.whatwg.org/multipage/#transfer-steps>
+    fn transfer(&self) -> Fallible<(NamespaceIndex<Self::Index>, Self::Data)>;
+
+    /// <https://html.spec.whatwg.org/multipage/#transfer-receiving-steps>
     fn transfer_receive(
         owner: &GlobalScope,
         id: NamespaceIndex<Self::Index>,
@@ -36,3 +42,5 @@ where
         data: StructuredData<'a, '_>,
     ) -> &'a mut Option<HashMap<NamespaceIndex<Self::Index>, Self::Data>>;
 }
+
+pub(crate) fn assert_transferable<T: Transferable>() {}

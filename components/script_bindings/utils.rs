@@ -7,7 +7,7 @@ use std::os::raw::{c_char, c_void};
 use std::ptr::{self, NonNull};
 use std::slice;
 
-use js::conversions::ToJSValConvertible;
+use js::conversions::{ToJSValConvertible, jsstr_to_string};
 use js::gc::Handle;
 use js::glue::{
     AppendToIdVector, CallJitGetterOp, CallJitMethodOp, CallJitSetterOp, JS_GetReservedSlot,
@@ -40,7 +40,7 @@ use crate::DomTypes;
 use crate::codegen::Globals::Globals;
 use crate::codegen::InheritTypes::TopTypeId;
 use crate::codegen::PrototypeList::{self, MAX_PROTO_CHAIN_LENGTH, PROTO_OR_IFACE_LENGTH};
-use crate::conversions::{PrototypeCheck, jsstring_to_str, private_from_proto_check};
+use crate::conversions::{PrototypeCheck, private_from_proto_check};
 use crate::error::throw_invalid_this;
 use crate::interfaces::DomHelpers;
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
@@ -222,7 +222,7 @@ pub(crate) unsafe fn find_enum_value<'a, T>(
 ) -> Result<(Option<&'a T>, DOMString), ()> {
     match ptr::NonNull::new(ToString(cx, v)) {
         Some(jsstr) => {
-            let search = jsstring_to_str(cx, jsstr);
+            let search = DOMString::from_string(jsstr_to_string(cx, jsstr));
             Ok((
                 pairs
                     .iter()
@@ -312,7 +312,11 @@ pub unsafe fn set_dictionary_property(
     Ok(())
 }
 
-/// Returns whether `proxy` has a property `id` on its prototype.
+/// Computes whether `proxy` has a property `id` on its prototype and stores
+/// the result in `found`.
+///
+/// Returns a boolean indicating whether the check succeeded.
+/// If `false` is returned then the value of `found` is unspecified.
 ///
 /// # Safety
 /// `cx` must point to a valid, non-null JSContext.
@@ -503,7 +507,7 @@ pub(crate) unsafe extern "C" fn generic_static_promise_method(
     let info = RUST_FUNCTION_VALUE_TO_JITINFO(JS_CALLEE(cx, vp));
     assert!(!info.is_null());
     // TODO: we need safe wrappers for this in mozjs!
-    //assert_eq!((*info)._bitfield_1, JSJitInfo_OpType::StaticMethod as u8)
+    // assert_eq!((*info)._bitfield_1, JSJitInfo_OpType::StaticMethod as u8)
     let static_fn = (*info).__bindgen_anon_1.staticMethod.unwrap();
     if static_fn(cx, argc, vp) {
         return true;

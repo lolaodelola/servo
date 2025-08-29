@@ -55,11 +55,13 @@ pub enum ExceptionHandling {
 
 /// A common base class for representing IDL callback function and
 /// callback interface types.
-#[derive(JSTraceable)]
+#[derive(JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub struct CallbackObject<D: DomTypes> {
     /// The underlying `JSObject`.
+    #[ignore_malloc_size_of = "measured by mozjs"]
     callback: Heap<*mut JSObject>,
+    #[ignore_malloc_size_of = "measured by mozjs"]
     permanent_js_root: Heap<JSVal>,
 
     /// The ["callback context"], that is, the global to use as incumbent
@@ -96,11 +98,13 @@ impl<D: DomTypes> CallbackObject<D> {
     unsafe fn init(&mut self, cx: JSContext, callback: *mut JSObject) {
         self.callback.set(callback);
         self.permanent_js_root.set(ObjectValue(callback));
-        assert!(AddRawValueRoot(
-            *cx,
-            self.permanent_js_root.get_unsafe(),
-            b"CallbackObject::root\n".as_c_char_ptr()
-        ));
+        unsafe {
+            assert!(AddRawValueRoot(
+                *cx,
+                self.permanent_js_root.get_unsafe(),
+                b"CallbackObject::root\n".as_c_char_ptr()
+            ));
+        }
     }
 }
 
@@ -145,7 +149,7 @@ pub trait CallbackContainer<D: DomTypes> {
 }
 
 /// A common base class for representing IDL callback function types.
-#[derive(JSTraceable, PartialEq)]
+#[derive(JSTraceable, MallocSizeOf, PartialEq)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub struct CallbackFunction<D: DomTypes> {
     object: CallbackObject<D>,
@@ -173,12 +177,12 @@ impl<D: DomTypes> CallbackFunction<D> {
     /// # Safety
     /// `callback` must point to a valid, non-null JSObject.
     pub unsafe fn init(&mut self, cx: JSContext, callback: *mut JSObject) {
-        self.object.init(cx, callback);
+        unsafe { self.object.init(cx, callback) };
     }
 }
 
 /// A common base class for representing IDL callback interface types.
-#[derive(JSTraceable, PartialEq)]
+#[derive(JSTraceable, MallocSizeOf, PartialEq)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub struct CallbackInterface<D: DomTypes> {
     object: CallbackObject<D>,
@@ -205,7 +209,7 @@ impl<D: DomTypes> CallbackInterface<D> {
     /// # Safety
     /// `callback` must point to a valid, non-null JSObject.
     pub unsafe fn init(&mut self, cx: JSContext, callback: *mut JSObject) {
-        self.object.init(cx, callback);
+        unsafe { self.object.init(cx, callback) };
     }
 
     /// Returns the property with the given `name`, if it is a callable object,

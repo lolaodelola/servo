@@ -37,10 +37,11 @@ use crate::dom::bindings::codegen::Bindings::WorkletBinding::{WorkletMethods, Wo
 use crate::dom::bindings::error::Error;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::TrustedPromise;
-use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
+use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot, RootCollection, ThreadLocalStackRoots};
 use crate::dom::bindings::str::USVString;
 use crate::dom::bindings::trace::{CustomTraceable, JSTraceable, RootedTraceableBox};
+use crate::dom::csp::Violation;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 #[cfg(feature = "testbinding")]
@@ -49,7 +50,7 @@ use crate::dom::window::Window;
 use crate::dom::workletglobalscope::{
     WorkletGlobalScope, WorkletGlobalScopeInit, WorkletGlobalScopeType, WorkletTask,
 };
-use crate::fetch::load_whole_resource;
+use crate::fetch::{CspViolationsProcessor, load_whole_resource};
 use crate::messaging::{CommonScriptMsg, MainThreadScriptMsg};
 use crate::realms::InRealm;
 use crate::script_runtime::{CanGc, Runtime, ScriptThreadEventCategory};
@@ -153,7 +154,7 @@ impl WorkletMethods<crate::DomTypeHolder> for Worklet {
 
         self.droppable_field
             .thread_pool
-            .get_or_init(ScriptThread::worklet_thread_pool)
+            .get_or_init(|| ScriptThread::worklet_thread_pool(self.global().image_cache()))
             .fetch_and_invoke_a_worklet_script(
                 self.window.pipeline_id(),
                 self.droppable_field.worklet_id,
@@ -433,6 +434,12 @@ struct WorkletThreadInit {
     global_init: WorkletGlobalScopeInit,
 }
 
+struct WorkletCspProcessor {}
+
+impl CspViolationsProcessor for WorkletCspProcessor {
+    fn process_csp_violations(&self, _violations: Vec<Violation>) {}
+}
+
 /// A thread for executing worklets.
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct WorkletThread {
@@ -622,7 +629,6 @@ impl WorkletThread {
                 let executor = WorkletExecutor::new(worklet_id, self.primary_sender.clone());
                 let result = WorkletGlobalScope::new(
                     global_type,
-                    &self.runtime,
                     pipeline_id,
                     base_url,
                     executor,
@@ -671,6 +677,7 @@ impl WorkletThread {
             request,
             &resource_fetcher,
             global_scope.upcast::<GlobalScope>(),
+            &WorkletCspProcessor {},
             can_gc,
         )
         .ok()
@@ -683,7 +690,7 @@ impl WorkletThread {
         // to the main script thread.
         // https://github.com/w3c/css-houdini-drafts/issues/407
         let ok = script
-            .map(|script| global_scope.evaluate_js(&script, can_gc))
+            .map(|s| global_scope.evaluate_js(&s, can_gc).is_ok())
             .unwrap_or(false);
 
         if !ok {

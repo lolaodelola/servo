@@ -11,10 +11,13 @@ use devtools_traits::{
     AttrModification, AutoMargins, ComputedNodeLayout, CssDatabaseProperty, EvaluateJSReply,
     NodeInfo, NodeStyle, RuleModification, TimelineMarker, TimelineMarkerType,
 };
+use html5ever::LocalName;
 use ipc_channel::ipc::IpcSender;
+use js::conversions::jsstr_to_string;
 use js::jsval::UndefinedValue;
 use js::rust::ToString;
 use servo_config::pref;
+use style::attr::AttrValue;
 use uuid::Uuid;
 
 use crate::document_collection::DocumentCollection;
@@ -28,7 +31,7 @@ use crate::dom::bindings::codegen::Bindings::ElementBinding::ElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::HTMLElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeConstants;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
-use crate::dom::bindings::conversions::{ConversionResult, FromJSValConvertible, jsstring_to_str};
+use crate::dom::bindings::conversions::{ConversionResult, FromJSValConvertible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
@@ -42,7 +45,7 @@ use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
 use crate::dom::types::HTMLElement;
 use crate::realms::enter_realm;
 use crate::script_module::ScriptFetchOptions;
-use crate::script_runtime::CanGc;
+use crate::script_runtime::{CanGc, IntroductionType};
 
 #[allow(unsafe_code)]
 pub(crate) fn handle_evaluate_js(
@@ -57,7 +60,9 @@ pub(crate) fn handle_evaluate_js(
         let _ac = enter_realm(global);
         rooted!(in(*cx) let mut rval = UndefinedValue());
         let source_code = SourceCode::Text(Rc::new(DOMString::from_string(eval)));
-        global.evaluate_script_on_global_with_result(
+        // TODO: run code with SpiderMonkey Debugger API, like Firefox does
+        // <https://searchfox.org/mozilla-central/rev/f6a806c38c459e0e0d797d264ca0e8ad46005105/devtools/server/actors/webconsole/eval-with-debugger.js#270>
+        _ = global.evaluate_script_on_global_with_result(
             &source_code,
             "<eval>",
             rval.handle_mut(),
@@ -65,6 +70,7 @@ pub(crate) fn handle_evaluate_js(
             ScriptFetchOptions::default_classic_script(global),
             global.api_base_url(),
             can_gc,
+            Some(IntroductionType::DEBUGGER_EVAL),
         );
 
         if rval.is_undefined() {
@@ -80,17 +86,17 @@ pub(crate) fn handle_evaluate_js(
             )
         } else if rval.is_string() {
             let jsstr = std::ptr::NonNull::new(rval.to_string()).unwrap();
-            EvaluateJSReply::StringValue(String::from(jsstring_to_str(*cx, jsstr)))
+            EvaluateJSReply::StringValue(jsstr_to_string(*cx, jsstr))
         } else if rval.is_null() {
             EvaluateJSReply::NullValue
         } else {
             assert!(rval.is_object());
 
             let jsstr = std::ptr::NonNull::new(ToString(*cx, rval.handle())).unwrap();
-            let class_name = jsstring_to_str(*cx, jsstr);
+            let class_name = jsstr_to_string(*cx, jsstr);
 
             EvaluateJSReply::ActorValue {
-                class: class_name.to_string(),
+                class: class_name,
                 uuid: Uuid::new_v4().to_string(),
             }
         }
@@ -132,7 +138,7 @@ fn find_node_by_unique_id(
         document
             .upcast::<Node>()
             .traverse_preorder(ShadowIncluding::Yes)
-            .find(|candidate| candidate.unique_id() == node_id)
+            .find(|candidate| candidate.unique_id(pipeline) == node_id)
     })
 }
 
@@ -216,7 +222,7 @@ pub(crate) fn handle_get_attribute_style(
             let name = style.Item(i);
             NodeStyle {
                 name: name.to_string(),
-                value: style.GetPropertyValue(name.clone(), can_gc).to_string(),
+                value: style.GetPropertyValue(name.clone()).to_string(),
                 priority: style.GetPropertyPriority(name).to_string(),
             }
         })
@@ -259,7 +265,7 @@ pub(crate) fn handle_get_stylesheet_style(
                     let name = style.Item(i);
                     NodeStyle {
                         name: name.to_string(),
-                        value: style.GetPropertyValue(name.clone(), can_gc).to_string(),
+                        value: style.GetPropertyValue(name.clone()).to_string(),
                         priority: style.GetPropertyPriority(name).to_string(),
                     }
                 })
@@ -315,7 +321,6 @@ pub(crate) fn handle_get_computed_style(
     pipeline: PipelineId,
     node_id: String,
     reply: IpcSender<Option<Vec<NodeStyle>>>,
-    can_gc: CanGc,
 ) {
     let node = match find_node_by_unique_id(documents, pipeline, &node_id) {
         None => return reply.send(None).unwrap(),
@@ -333,9 +338,7 @@ pub(crate) fn handle_get_computed_style(
             let name = computed_style.Item(i);
             NodeStyle {
                 name: name.to_string(),
-                value: computed_style
-                    .GetPropertyValue(name.clone(), can_gc)
-                    .to_string(),
+                value: computed_style.GetPropertyValue(name.clone()).to_string(),
                 priority: computed_style.GetPropertyPriority(name).to_string(),
             }
         })
@@ -375,7 +378,7 @@ pub(crate) fn handle_get_layout(
             position: String::from(computed_style.Position()),
             z_index: String::from(computed_style.ZIndex()),
             box_sizing: String::from(computed_style.BoxSizing()),
-            auto_margins: determine_auto_margins(&node, can_gc),
+            auto_margins: determine_auto_margins(&node),
             margin_top: String::from(computed_style.MarginTop()),
             margin_right: String::from(computed_style.MarginRight()),
             margin_bottom: String::from(computed_style.MarginBottom()),
@@ -394,8 +397,8 @@ pub(crate) fn handle_get_layout(
         .unwrap();
 }
 
-fn determine_auto_margins(node: &Node, can_gc: CanGc) -> AutoMargins {
-    let style = node.style(can_gc).unwrap();
+fn determine_auto_margins(node: &Node) -> AutoMargins {
+    let style = node.style().unwrap();
     let margin = style.get_margin();
     AutoMargins {
         top: margin.margin_top.is_auto(),
@@ -434,9 +437,9 @@ pub(crate) fn handle_modify_attribute(
     for modification in modifications {
         match modification.new_value {
             Some(string) => {
-                let _ = elem.SetAttribute(
-                    DOMString::from(modification.attribute_name),
-                    DOMString::from(string),
+                elem.set_attribute(
+                    &LocalName::from(modification.attribute_name),
+                    AttrValue::String(string),
                     can_gc,
                 );
             },

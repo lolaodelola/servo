@@ -5,12 +5,8 @@
 #![cfg_attr(crown, feature(register_tool))]
 #![deny(unsafe_code)]
 #![doc = "The script crate contains all matters DOM."]
-// Register the linter `crown`, which is the Servo-specific linter for the script
-// crate. Issue a warning if `crown` is not being used to compile, but not when
-// building rustdoc or running clippy.
+// Register the linter `crown`, which is the Servo-specific linter for the script crate.
 #![cfg_attr(crown, register_tool(crown))]
-#![cfg_attr(any(doc, clippy), allow(unknown_lints))]
-#![deny(crown_is_not_used)]
 
 // These are used a lot so let's keep them for now
 #[macro_use]
@@ -38,6 +34,7 @@ mod dom;
 mod canvas_context;
 mod canvas_state;
 pub(crate) mod fetch;
+pub(crate) mod indexed_db;
 mod init;
 mod layout_image;
 
@@ -77,8 +74,6 @@ mod unminify;
 mod drag_data_store;
 mod links;
 mod xpath;
-
-mod svgpath;
 
 pub use init::init;
 pub(crate) use script_bindings::DomTypes;

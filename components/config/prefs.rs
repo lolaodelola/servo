@@ -11,10 +11,20 @@ pub use crate::pref_util::PrefValue;
 
 static PREFERENCES: RwLock<Preferences> = RwLock::new(Preferences::const_default());
 
+pub trait Observer: Send + Sync {
+    fn prefs_changed(&self, _changes: &[(&'static str, PrefValue)]) {}
+}
+
+static OBSERVERS: RwLock<Vec<Box<dyn Observer>>> = RwLock::new(Vec::new());
+
 #[inline]
 /// Get the current set of global preferences for Servo.
 pub fn get() -> RwLockReadGuard<'static, Preferences> {
     PREFERENCES.read().unwrap()
+}
+
+pub fn add_observer(observer: Box<dyn Observer>) {
+    OBSERVERS.write().unwrap().push(observer);
 }
 
 pub fn set(preferences: Preferences) {
@@ -38,8 +48,18 @@ pub fn set(preferences: Preferences) {
         "layout.container-queries.enabled",
         preferences.layout_container_queries_enabled,
     );
+    stylo_config::set_bool(
+        "layout.variable_fonts.enabled",
+        preferences.layout_variable_fonts_enabled,
+    );
+
+    let changed = preferences.diff(&PREFERENCES.read().unwrap());
 
     *PREFERENCES.write().unwrap() = preferences;
+
+    for observer in &*OBSERVERS.read().unwrap() {
+        observer.prefs_changed(&changed);
+    }
 }
 
 /// A convenience macro for accessing a preference value using its static path.
@@ -69,14 +89,23 @@ pub struct Preferences {
     /// List of comma-separated backends to be used by wgpu.
     pub dom_webgpu_wgpu_backend: String,
     pub dom_abort_controller_enabled: bool,
+    pub dom_adoptedstylesheet_enabled: bool,
     pub dom_async_clipboard_enabled: bool,
     pub dom_bluetooth_enabled: bool,
     pub dom_bluetooth_testing_enabled: bool,
     pub dom_allow_scripts_to_close_windows: bool,
     pub dom_canvas_capture_enabled: bool,
     pub dom_canvas_text_enabled: bool,
+    /// Selects canvas backend
+    ///
+    /// Available values:
+    /// - ` `/`auto`
+    /// - vello
+    /// - vello_cpu
+    pub dom_canvas_backend: String,
     pub dom_clipboardevent_enabled: bool,
     pub dom_composition_event_enabled: bool,
+    pub dom_cookiestore_enabled: bool,
     pub dom_crypto_subtle_enabled: bool,
     pub dom_customelements_enabled: bool,
     pub dom_document_dblclick_timeout: i64,
@@ -84,11 +113,12 @@ pub struct Preferences {
     pub dom_fontface_enabled: bool,
     pub dom_fullscreen_test: bool,
     pub dom_gamepad_enabled: bool,
-    pub dom_imagebitmap_enabled: bool,
+    pub dom_indexeddb_enabled: bool,
     pub dom_intersection_observer_enabled: bool,
     pub dom_microdata_testing_enabled: bool,
     pub dom_mouse_event_which_enabled: bool,
     pub dom_mutation_observer_enabled: bool,
+    pub dom_navigator_sendbeacon_enabled: bool,
     pub dom_notification_enabled: bool,
     pub dom_offscreen_canvas_enabled: bool,
     pub dom_permissions_enabled: bool,
@@ -99,7 +129,6 @@ pub struct Preferences {
     pub dom_serviceworker_timeout_seconds: i64,
     pub dom_servo_helpers_enabled: bool,
     pub dom_servoparser_async_html_tokenizer_enabled: bool,
-    pub dom_svg_enabled: bool,
     pub dom_testable_crash_enabled: bool,
     pub dom_testbinding_enabled: bool,
     pub dom_testbinding_prefcontrolled_enabled: bool,
@@ -116,10 +145,6 @@ pub struct Preferences {
     // https://testutils.spec.whatwg.org#availability
     pub dom_testutils_enabled: bool,
     pub dom_trusted_types_enabled: bool,
-    /// Enable the [URLPattern] API.
-    ///
-    /// [URLPattern]: https://developer.mozilla.org/en-US/docs/Web/API/URLPattern
-    pub dom_urlpattern_enabled: bool,
     pub dom_xpath_enabled: bool,
     /// Enable WebGL2 APIs.
     pub dom_webgl2_enabled: bool,
@@ -152,6 +177,8 @@ pub struct Preferences {
     /// Whether or not subpixel antialiasing is enabled for text rendering.
     pub gfx_subpixel_text_antialiasing_enabled: bool,
     pub gfx_texture_swizzling_enabled: bool,
+    /// The amount of image keys we request per batch for the image cache.
+    pub image_key_batch_size: i64,
     /// Whether or not the DOM inspector should show shadow roots of user-agent shadow trees
     pub inspector_show_servo_internal_shadow_roots: bool,
     pub js_asmjs_enabled: bool,
@@ -173,7 +200,6 @@ pub struct Preferences {
     pub js_mem_gc_decommit_threshold_mb: i64,
     pub js_mem_gc_dynamic_heap_growth_enabled: bool,
     pub js_mem_gc_dynamic_mark_slice_enabled: bool,
-    pub js_mem_gc_empty_chunk_count_max: i64,
     pub js_mem_gc_empty_chunk_count_min: i64,
     pub js_mem_gc_high_frequency_heap_growth_max: i64,
     pub js_mem_gc_high_frequency_heap_growth_min: i64,
@@ -189,7 +215,6 @@ pub struct Preferences {
     pub js_mem_max: i64,
     pub js_native_regex_enabled: bool,
     pub js_offthread_compilation_enabled: bool,
-    pub js_parallel_parsing_enabled: bool,
     pub js_shared_memory: bool,
     pub js_throw_on_asmjs_validation_failure: bool,
     pub js_throw_on_debuggee_would_run: bool,
@@ -206,6 +231,7 @@ pub struct Preferences {
     pub layout_flexbox_enabled: bool,
     pub layout_threads: i64,
     pub layout_unimplemented: bool,
+    pub layout_variable_fonts_enabled: bool,
     pub layout_writing_mode_enabled: bool,
     /// Enable hardware acceleration for video playback.
     pub media_glvideo_enabled: bool,
@@ -226,6 +252,8 @@ pub struct Preferences {
     pub threadpools_fallback_worker_num: i64,
     /// Maximum number of workers for the Image Cache thread pool
     pub threadpools_image_cache_workers_max: i64,
+    /// Maximum number of workers for the IndexedDB thread pool
+    pub threadpools_indexeddb_workers_max: i64,
     /// Maximum number of workers for the Networking async runtime thread pool
     pub threadpools_async_runtime_workers_max: i64,
     /// Maximum number of workers for the Core Resource Manager
@@ -246,14 +274,17 @@ impl Preferences {
             devtools_server_enabled: false,
             devtools_server_port: 0,
             dom_abort_controller_enabled: false,
+            dom_adoptedstylesheet_enabled: false,
             dom_allow_scripts_to_close_windows: false,
             dom_async_clipboard_enabled: false,
             dom_bluetooth_enabled: false,
             dom_bluetooth_testing_enabled: false,
             dom_canvas_capture_enabled: false,
             dom_canvas_text_enabled: true,
+            dom_canvas_backend: String::new(),
             dom_clipboardevent_enabled: true,
             dom_composition_event_enabled: false,
+            dom_cookiestore_enabled: false,
             dom_crypto_subtle_enabled: true,
             dom_customelements_enabled: true,
             dom_document_dblclick_dist: 1,
@@ -261,11 +292,12 @@ impl Preferences {
             dom_fontface_enabled: false,
             dom_fullscreen_test: false,
             dom_gamepad_enabled: true,
-            dom_imagebitmap_enabled: false,
+            dom_indexeddb_enabled: false,
             dom_intersection_observer_enabled: false,
             dom_microdata_testing_enabled: false,
             dom_mouse_event_which_enabled: false,
             dom_mutation_observer_enabled: true,
+            dom_navigator_sendbeacon_enabled: false,
             dom_notification_enabled: false,
             dom_offscreen_canvas_enabled: false,
             dom_permissions_enabled: false,
@@ -276,7 +308,6 @@ impl Preferences {
             dom_serviceworker_timeout_seconds: 60,
             dom_servo_helpers_enabled: false,
             dom_servoparser_async_html_tokenizer_enabled: false,
-            dom_svg_enabled: false,
             dom_testable_crash_enabled: false,
             dom_testbinding_enabled: false,
             dom_testbinding_prefcontrolled2_enabled: false,
@@ -292,7 +323,6 @@ impl Preferences {
             dom_testperf_enabled: false,
             dom_testutils_enabled: false,
             dom_trusted_types_enabled: false,
-            dom_urlpattern_enabled: false,
             dom_webgl2_enabled: false,
             dom_webgpu_enabled: false,
             dom_webgpu_wgpu_backend: String::new(),
@@ -327,6 +357,7 @@ impl Preferences {
             gfx_text_antialiasing_enabled: true,
             gfx_subpixel_text_antialiasing_enabled: true,
             gfx_texture_swizzling_enabled: true,
+            image_key_batch_size: 10,
             inspector_show_servo_internal_shadow_roots: false,
             js_asmjs_enabled: true,
             js_asyncstack: false,
@@ -346,7 +377,6 @@ impl Preferences {
             js_mem_gc_decommit_threshold_mb: 32,
             js_mem_gc_dynamic_heap_growth_enabled: true,
             js_mem_gc_dynamic_mark_slice_enabled: true,
-            js_mem_gc_empty_chunk_count_max: 30,
             js_mem_gc_empty_chunk_count_min: 1,
             js_mem_gc_high_frequency_heap_growth_max: 300,
             js_mem_gc_high_frequency_heap_growth_min: 150,
@@ -362,7 +392,6 @@ impl Preferences {
             js_mem_max: -1,
             js_native_regex_enabled: true,
             js_offthread_compilation_enabled: true,
-            js_parallel_parsing_enabled: true,
             js_shared_memory: true,
             js_throw_on_asmjs_validation_failure: false,
             js_throw_on_debuggee_would_run: false,
@@ -380,6 +409,7 @@ impl Preferences {
             // TODO(mrobinson): This should likely be based on the number of processors.
             layout_threads: 3,
             layout_unimplemented: false,
+            layout_variable_fonts_enabled: false,
             layout_writing_mode_enabled: false,
             media_glvideo_enabled: false,
             media_testing_enabled: false,
@@ -394,6 +424,7 @@ impl Preferences {
             threadpools_async_runtime_workers_max: 6,
             threadpools_fallback_worker_num: 3,
             threadpools_image_cache_workers_max: 4,
+            threadpools_indexeddb_workers_max: 4,
             threadpools_resource_workers_max: 4,
             threadpools_webrender_workers_max: 4,
             webgl_testing_context_creation_error: false,
@@ -449,12 +480,12 @@ impl UserAgentPlatform {
                 const ARCHITECTURE: &str = "";
 
                 format!(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; {ARCHITECTURE}rv:128.0) Servo/{SERVO_VERSION} Firefox/128.0"
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; {ARCHITECTURE}rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
                 )
             },
             UserAgentPlatform::Desktop if cfg!(target_os = "macos") => {
                 format!(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Servo/{SERVO_VERSION} Firefox/128.0"
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
                 )
             },
             UserAgentPlatform::Desktop => {
@@ -465,19 +496,19 @@ impl UserAgentPlatform {
                 const ARCHITECTURE: &str = "i686";
 
                 format!(
-                    "Mozilla/5.0 (X11; Linux {ARCHITECTURE}; rv:128.0) Servo/{SERVO_VERSION} Firefox/128.0"
+                    "Mozilla/5.0 (X11; Linux {ARCHITECTURE}; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
                 )
             },
             UserAgentPlatform::Android => {
                 format!(
-                    "Mozilla/5.0 (Android; Mobile; rv:128.0) Servo/{SERVO_VERSION} Firefox/128.0"
+                    "Mozilla/5.0 (Android 10; Mobile; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
                 )
             },
             UserAgentPlatform::OpenHarmony => format!(
-                "Mozilla/5.0 (OpenHarmony; Mobile; rv:128.0) Servo/{SERVO_VERSION} Firefox/128.0"
+                "Mozilla/5.0 (OpenHarmony; Mobile; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
             ),
             UserAgentPlatform::Ios => format!(
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X; rv:128.0) Servo/{SERVO_VERSION} Firefox/128.0"
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
             ),
         }
     }

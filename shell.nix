@@ -10,7 +10,7 @@ with import (builtins.fetchTarball {
   overlays = [
     (import (builtins.fetchTarball {
       # Bumped the channel in rust-toolchain.toml? Bump this commit too!
-      url = "https://github.com/oxalica/rust-overlay/archive/7c5892ad87b90d72668964975eebd4e174ff6204.tar.gz";
+      url = "https://github.com/oxalica/rust-overlay/archive/95487740bb7ac11553445e9249041a6fa4b5eccf.tar.gz";
     }))
   ];
   config = {
@@ -89,7 +89,6 @@ stdenv.mkDerivation (androidEnvironment // {
     # Ensure the Python version is same as the one in `.python-version` file so
     # that `uv` will just symlink to the one in nix store. Otherwise `uv` will
     # download a pre-built binary that won't work on nix.
-    # FIXME: dbus python module needs to be installed into the virtual environment.
     python311
     uv
 

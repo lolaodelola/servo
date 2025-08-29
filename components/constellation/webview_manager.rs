@@ -67,11 +67,14 @@ impl<WebView> WebViewManager<WebView> {
         }
     }
 
-    pub fn focus(&mut self, webview_id: WebViewId) {
-        debug_assert!(self.webviews.contains_key(&webview_id));
+    pub fn focus(&mut self, webview_id: WebViewId) -> Result<(), ()> {
+        if !self.webviews.contains_key(&webview_id) {
+            return Err(());
+        }
         self.focus_order.retain(|b| *b != webview_id);
         self.focus_order.push(webview_id);
         self.is_focused = true;
+        Ok(())
     }
 
     pub fn unfocus(&mut self) {
@@ -96,7 +99,7 @@ mod test {
         webviews: &WebViewManager<WebView>,
     ) -> Vec<(WebViewId, WebView)> {
         let mut keys = webviews.webviews.keys().collect::<Vec<_>>();
-        keys.sort();
+        keys.sort_unstable();
         keys.iter()
             .map(|&id| {
                 (
@@ -128,13 +131,13 @@ mod test {
         assert_eq!(webviews.is_focused, false);
 
         // focus() makes the given webview the latest in focus order.
-        webviews.focus(id(0, 2));
+        let _ = webviews.focus(id(0, 2));
         assert_eq!(webviews.focus_order, vec![id(0, 2)]);
         assert_eq!(webviews.is_focused, true);
-        webviews.focus(id(0, 1));
+        let _ = webviews.focus(id(0, 1));
         assert_eq!(webviews.focus_order, vec![id(0, 2), id(0, 1)]);
         assert_eq!(webviews.is_focused, true);
-        webviews.focus(id(0, 3));
+        let _ = webviews.focus(id(0, 3));
         assert_eq!(webviews.focus_order, vec![id(0, 2), id(0, 1), id(0, 3)]);
         assert_eq!(webviews.is_focused, true);
 
@@ -144,7 +147,7 @@ mod test {
         assert_eq!(webviews.is_focused, false);
 
         // focus() avoids duplicates in focus order, when the given webview has been focused before.
-        webviews.focus(id(0, 1));
+        let _ = webviews.focus(id(0, 1));
         assert_eq!(webviews.focus_order, vec![id(0, 2), id(0, 3), id(0, 1)]);
         assert_eq!(webviews.is_focused, true);
 

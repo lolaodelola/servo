@@ -76,10 +76,6 @@ impl Animations {
         self.pending_events.borrow_mut().clear();
     }
 
-    pub(crate) fn animations_present(&self) -> bool {
-        self.has_running_animations.get() || !self.pending_events.borrow().is_empty()
-    }
-
     // Mark all animations dirty, if they haven't been marked dirty since the
     // specified `current_timeline_value`. Returns true if animations were marked
     // dirty or false otherwise.
@@ -96,7 +92,7 @@ impl Animations {
             .keys()
             .filter_map(|key| rooted_nodes.get(&NoTrace(key.node)))
         {
-            node.dirty(NodeDamage::NodeStyleDamaged);
+            node.dirty(NodeDamage::Style);
         }
 
         true

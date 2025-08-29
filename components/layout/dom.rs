@@ -2,26 +2,24 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::any::Any;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
 use atomic_refcell::{AtomicRef, AtomicRefCell, AtomicRefMut};
 use base::id::{BrowsingContextId, PipelineId};
 use html5ever::{local_name, ns};
+use layout_api::wrapper_traits::{LayoutDataTrait, ThreadSafeLayoutElement, ThreadSafeLayoutNode};
+use layout_api::{
+    GenericLayoutDataTrait, LayoutDamage, LayoutElementType,
+    LayoutNodeType as ScriptLayoutNodeType, SVGElementData,
+};
 use malloc_size_of_derive::MallocSizeOf;
-use pixels::Image;
-use script::layout_dom::ServoLayoutNode;
-use script_layout_interface::wrapper_traits::{
-    LayoutDataTrait, LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
-};
-use script_layout_interface::{
-    GenericLayoutDataTrait, LayoutElementType, LayoutNodeType as ScriptLayoutNodeType,
-};
+use net_traits::image_cache::Image;
+use script::layout_dom::ServoThreadSafeLayoutNode;
 use servo_arc::Arc as ServoArc;
+use smallvec::SmallVec;
 use style::context::SharedStyleContext;
 use style::properties::ComputedValues;
-use style::selector_parser::PseudoElement;
+use style::selector_parser::{PseudoElement, RestyleDamage};
 
 use crate::cell::ArcRefCell;
 use crate::flexbox::FlexLevelBox;
@@ -29,29 +27,82 @@ use crate::flow::BlockLevelBox;
 use crate::flow::inline::{InlineItem, SharedInlineStyles};
 use crate::fragment_tree::Fragment;
 use crate::geom::PhysicalSize;
+use crate::layout_box_base::LayoutBoxBase;
 use crate::replaced::CanvasInfo;
 use crate::table::TableLevelBox;
 use crate::taffy::TaffyItemBox;
+
+#[derive(MallocSizeOf)]
+pub struct PseudoLayoutData {
+    pseudo: PseudoElement,
+    data: ArcRefCell<InnerDOMLayoutData>,
+}
 
 /// The data that is stored in each DOM node that is used by layout.
 #[derive(Default, MallocSizeOf)]
 pub struct InnerDOMLayoutData {
     pub(super) self_box: ArcRefCell<Option<LayoutBox>>,
-    pub(super) pseudo_before_box: ArcRefCell<Option<LayoutBox>>,
-    pub(super) pseudo_after_box: ArcRefCell<Option<LayoutBox>>,
-    pub(super) pseudo_marker_box: ArcRefCell<Option<LayoutBox>>,
+    pub(super) pseudo_boxes: SmallVec<[PseudoLayoutData; 2]>,
 }
 
 impl InnerDOMLayoutData {
-    pub(crate) fn for_pseudo(
+    fn pseudo_layout_data(
         &self,
-        pseudo_element: Option<PseudoElement>,
-    ) -> AtomicRef<Option<LayoutBox>> {
-        match pseudo_element {
-            Some(PseudoElement::Before) => self.pseudo_before_box.borrow(),
-            Some(PseudoElement::After) => self.pseudo_after_box.borrow(),
-            Some(PseudoElement::Marker) => self.pseudo_marker_box.borrow(),
-            _ => self.self_box.borrow(),
+        pseudo_element: PseudoElement,
+    ) -> Option<ArcRefCell<InnerDOMLayoutData>> {
+        for pseudo_layout_data in self.pseudo_boxes.iter() {
+            if pseudo_element == pseudo_layout_data.pseudo {
+                return Some(pseudo_layout_data.data.clone());
+            }
+        }
+        None
+    }
+
+    fn create_pseudo_layout_data(
+        &mut self,
+        pseudo_element: PseudoElement,
+    ) -> ArcRefCell<InnerDOMLayoutData> {
+        let data: ArcRefCell<InnerDOMLayoutData> = Default::default();
+        self.pseudo_boxes.push(PseudoLayoutData {
+            pseudo: pseudo_element,
+            data: data.clone(),
+        });
+        data
+    }
+
+    fn fragments(&self) -> Vec<Fragment> {
+        self.self_box
+            .borrow()
+            .as_ref()
+            .map(|layout_box| layout_box.with_base_flat(LayoutBoxBase::fragments))
+            .unwrap_or_default()
+    }
+
+    fn repair_style(&self, node: &ServoThreadSafeLayoutNode, context: &SharedStyleContext) {
+        if let Some(layout_object) = &*self.self_box.borrow() {
+            layout_object.repair_style(context, node, &node.style(context));
+        }
+
+        for pseudo_layout_data in self.pseudo_boxes.iter() {
+            let Some(node_with_pseudo) = node.with_pseudo(pseudo_layout_data.pseudo) else {
+                continue;
+            };
+            pseudo_layout_data
+                .data
+                .borrow()
+                .repair_style(&node_with_pseudo, context);
+        }
+    }
+
+    fn clear_fragment_layout_cache(&self) {
+        if let Some(data) = self.self_box.borrow().as_ref() {
+            data.clear_fragment_layout_cache();
+        }
+        for pseudo_layout_data in self.pseudo_boxes.iter() {
+            pseudo_layout_data
+                .data
+                .borrow()
+                .clear_fragment_layout_cache();
         }
     }
 }
@@ -68,51 +119,72 @@ pub(super) enum LayoutBox {
 }
 
 impl LayoutBox {
-    fn invalidate_cached_fragment(&self) {
+    fn clear_fragment_layout_cache(&self) {
         match self {
             LayoutBox::DisplayContents(..) => {},
             LayoutBox::BlockLevel(block_level_box) => {
-                block_level_box.borrow().invalidate_cached_fragment()
+                block_level_box.borrow().clear_fragment_layout_cache()
             },
             LayoutBox::InlineLevel(inline_items) => {
                 for inline_item in inline_items.iter() {
-                    inline_item.borrow().invalidate_cached_fragment()
+                    inline_item.borrow().clear_fragment_layout_cache()
                 }
             },
             LayoutBox::FlexLevel(flex_level_box) => {
-                flex_level_box.borrow().invalidate_cached_fragment()
+                flex_level_box.borrow().clear_fragment_layout_cache()
             },
             LayoutBox::TaffyItemBox(taffy_item_box) => {
-                taffy_item_box.borrow_mut().invalidate_cached_fragment()
+                taffy_item_box.borrow_mut().clear_fragment_layout_cache()
             },
-            LayoutBox::TableLevelBox(table_box) => table_box.invalidate_cached_fragment(),
+            LayoutBox::TableLevelBox(table_box) => table_box.clear_fragment_layout_cache(),
         }
     }
 
-    pub(crate) fn fragments(&self) -> Vec<Fragment> {
+    pub(crate) fn with_base_flat<T>(&self, callback: impl Fn(&LayoutBoxBase) -> Vec<T>) -> Vec<T> {
         match self {
             LayoutBox::DisplayContents(..) => vec![],
-            LayoutBox::BlockLevel(block_level_box) => block_level_box.borrow().fragments(),
+            LayoutBox::BlockLevel(block_level_box) => block_level_box.borrow().with_base(callback),
             LayoutBox::InlineLevel(inline_items) => inline_items
                 .iter()
-                .flat_map(|inline_item| inline_item.borrow().fragments())
+                .flat_map(|inline_item| inline_item.borrow().with_base(&callback))
                 .collect(),
-            LayoutBox::FlexLevel(flex_level_box) => flex_level_box.borrow().fragments(),
-            LayoutBox::TaffyItemBox(taffy_item_box) => taffy_item_box.borrow().fragments(),
-            LayoutBox::TableLevelBox(table_box) => table_box.fragments(),
+            LayoutBox::FlexLevel(flex_level_box) => flex_level_box.borrow().with_base(callback),
+            LayoutBox::TaffyItemBox(taffy_item_box) => taffy_item_box.borrow().with_base(callback),
+            LayoutBox::TableLevelBox(table_box) => table_box.with_base(callback),
+        }
+    }
+
+    pub(crate) fn with_base_mut(&mut self, callback: impl Fn(&mut LayoutBoxBase)) {
+        match self {
+            LayoutBox::DisplayContents(..) => {},
+            LayoutBox::BlockLevel(block_level_box) => {
+                block_level_box.borrow_mut().with_base_mut(callback);
+            },
+            LayoutBox::InlineLevel(inline_items) => {
+                for inline_item in inline_items {
+                    inline_item.borrow_mut().with_base_mut(&callback);
+                }
+            },
+            LayoutBox::FlexLevel(flex_level_box) => {
+                flex_level_box.borrow_mut().with_base_mut(callback)
+            },
+            LayoutBox::TableLevelBox(table_level_box) => table_level_box.with_base_mut(callback),
+            LayoutBox::TaffyItemBox(taffy_item_box) => {
+                taffy_item_box.borrow_mut().with_base_mut(callback)
+            },
         }
     }
 
     fn repair_style(
         &self,
         context: &SharedStyleContext,
-        node: &ServoLayoutNode,
+        node: &ServoThreadSafeLayoutNode,
         new_style: &ServoArc<ComputedValues>,
     ) {
         match self {
             LayoutBox::DisplayContents(inline_shared_styles) => {
                 *inline_shared_styles.style.borrow_mut() = new_style.clone();
-                *inline_shared_styles.selected.borrow_mut() = node.to_threadsafe().selected_style();
+                *inline_shared_styles.selected.borrow_mut() = node.selected_style();
             },
             LayoutBox::BlockLevel(block_level_box) => {
                 block_level_box
@@ -137,6 +209,20 @@ impl LayoutBox {
                 .repair_style(context, node, new_style),
         }
     }
+
+    /// If this [`LayoutBox`] represents an unsplit (due to inline-block splits) inline
+    /// level item, unwrap and return it. If not, return `None`.
+    pub(crate) fn unsplit_inline_level_layout_box(self) -> Option<ArcRefCell<InlineItem>> {
+        let LayoutBox::InlineLevel(inline_level_boxes) = self else {
+            return None;
+        };
+        // If this element box has been subject to inline-block splitting, ignore it. It's
+        // not useful currently for incremental box tree construction.
+        if inline_level_boxes.len() != 1 {
+            return None;
+        }
+        inline_level_boxes.into_iter().next()
+    }
 }
 
 /// A wrapper for [`InnerDOMLayoutData`]. This is necessary to give the entire data
@@ -148,7 +234,7 @@ pub struct DOMLayoutData(AtomicRefCell<InnerDOMLayoutData>);
 // The implementation of this trait allows the data to be stored in the DOM.
 impl LayoutDataTrait for DOMLayoutData {}
 impl GenericLayoutDataTrait for DOMLayoutData {
-    fn as_any(&self) -> &dyn Any {
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }
@@ -158,29 +244,29 @@ pub struct BoxSlot<'dom> {
     pub(crate) marker: PhantomData<&'dom ()>,
 }
 
+impl From<ArcRefCell<Option<LayoutBox>>> for BoxSlot<'_> {
+    fn from(layout_box_slot: ArcRefCell<Option<LayoutBox>>) -> Self {
+        let slot = Some(layout_box_slot);
+        Self {
+            slot,
+            marker: PhantomData,
+        }
+    }
+}
+
 /// A mutable reference to a `LayoutBox` stored in a DOM element.
 impl BoxSlot<'_> {
-    pub(crate) fn new(slot: ArcRefCell<Option<LayoutBox>>) -> Self {
-        *slot.borrow_mut() = None;
-        let slot = Some(slot);
-        Self {
-            slot,
-            marker: PhantomData,
-        }
-    }
-
-    pub(crate) fn dummy() -> Self {
-        let slot = None;
-        Self {
-            slot,
-            marker: PhantomData,
-        }
-    }
-
     pub(crate) fn set(mut self, box_: LayoutBox) {
         if let Some(slot) = &mut self.slot {
             *slot.borrow_mut() = Some(box_);
         }
+    }
+
+    pub(crate) fn take_layout_box_if_undamaged(&self, damage: LayoutDamage) -> Option<LayoutBox> {
+        if damage.has_box_damage() {
+            return None;
+        }
+        self.slot.as_ref().and_then(|slot| slot.borrow_mut().take())
     }
 }
 
@@ -197,48 +283,55 @@ impl Drop for BoxSlot<'_> {
 pub(crate) trait NodeExt<'dom> {
     /// Returns the image if it’s loaded, and its size in image pixels
     /// adjusted for `image_density`.
-    fn as_image(&self) -> Option<(Option<Arc<Image>>, PhysicalSize<f64>)>;
+    fn as_image(&self) -> Option<(Option<Image>, PhysicalSize<f64>)>;
     fn as_canvas(&self) -> Option<(CanvasInfo, PhysicalSize<f64>)>;
     fn as_iframe(&self) -> Option<(PipelineId, BrowsingContextId)>;
     fn as_video(&self) -> Option<(Option<webrender_api::ImageKey>, Option<PhysicalSize<f64>>)>;
+    fn as_svg(&self) -> Option<SVGElementData>;
     fn as_typeless_object_with_data_attribute(&self) -> Option<String>;
-    fn style(&self, context: &SharedStyleContext) -> ServoArc<ComputedValues>;
 
-    fn layout_data_mut(&self) -> AtomicRefMut<'dom, InnerDOMLayoutData>;
-    fn layout_data(&self) -> Option<AtomicRef<'dom, InnerDOMLayoutData>>;
-    fn element_box_slot(&self) -> BoxSlot<'dom>;
-    fn pseudo_element_box_slot(&self, which: PseudoElement) -> BoxSlot<'dom>;
-    fn unset_pseudo_element_box(&self, which: PseudoElement);
+    fn ensure_inner_layout_data(&self) -> AtomicRefMut<'dom, InnerDOMLayoutData>;
+    fn inner_layout_data(&self) -> Option<AtomicRef<'dom, InnerDOMLayoutData>>;
+    fn box_slot(&self) -> BoxSlot<'dom>;
 
-    /// Remove boxes for the element itself, and its `:before` and `:after` if any.
+    /// Remove boxes for the element itself, and all of its pseudo-element boxes.
     fn unset_all_boxes(&self);
 
+    /// Remove all pseudo-element boxes for this element.
+    fn unset_all_pseudo_boxes(&self);
+
     fn fragments_for_pseudo(&self, pseudo_element: Option<PseudoElement>) -> Vec<Fragment>;
-    fn invalidate_cached_fragment(&self);
+    fn clear_fragment_layout_cache(&self);
 
     fn repair_style(&self, context: &SharedStyleContext);
+    fn take_restyle_damage(&self) -> LayoutDamage;
 }
 
-impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
-    fn as_image(&self) -> Option<(Option<Arc<Image>>, PhysicalSize<f64>)> {
-        let node = self.to_threadsafe();
-        let (resource, metadata) = node.image_data()?;
+impl<'dom> NodeExt<'dom> for ServoThreadSafeLayoutNode<'dom> {
+    fn as_image(&self) -> Option<(Option<Image>, PhysicalSize<f64>)> {
+        let (resource, metadata) = self.image_data()?;
         let (width, height) = resource
             .as_ref()
-            .map(|image| (image.width, image.height))
+            .map(|image| {
+                let image_metadata = image.metadata();
+                (image_metadata.width, image_metadata.height)
+            })
             .or_else(|| metadata.map(|metadata| (metadata.width, metadata.height)))
             .unwrap_or((0, 0));
         let (mut width, mut height) = (width as f64, height as f64);
-        if let Some(density) = node.image_density().filter(|density| *density != 1.) {
+        if let Some(density) = self.image_density().filter(|density| *density != 1.) {
             width /= density;
             height /= density;
         }
         Some((resource, PhysicalSize::new(width, height)))
     }
 
+    fn as_svg(&self) -> Option<SVGElementData> {
+        self.svg_data()
+    }
+
     fn as_video(&self) -> Option<(Option<webrender_api::ImageKey>, Option<PhysicalSize<f64>>)> {
-        let node = self.to_threadsafe();
-        let data = node.media_data()?;
+        let data = self.media_data()?;
         let natural_size = if let Some(frame) = data.current_frame {
             Some(PhysicalSize::new(frame.width.into(), frame.height.into()))
         } else {
@@ -252,8 +345,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
     }
 
     fn as_canvas(&self) -> Option<(CanvasInfo, PhysicalSize<f64>)> {
-        let node = self.to_threadsafe();
-        let canvas_data = node.canvas_data()?;
+        let canvas_data = self.canvas_data()?;
         let source = canvas_data.source;
         Some((
             CanvasInfo { source },
@@ -262,8 +354,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
     }
 
     fn as_iframe(&self) -> Option<(PipelineId, BrowsingContextId)> {
-        let node = self.to_threadsafe();
-        match (node.iframe_pipeline_id(), node.iframe_browsing_context_id()) {
+        match (self.iframe_pipeline_id(), self.iframe_browsing_context_id()) {
             (Some(pipeline_id), Some(browsing_context_id)) => {
                 Some((pipeline_id, browsing_context_id))
             },
@@ -272,8 +363,10 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
     }
 
     fn as_typeless_object_with_data_attribute(&self) -> Option<String> {
-        if LayoutNode::type_id(self) !=
-            ScriptLayoutNodeType::Element(LayoutElementType::HTMLObjectElement)
+        if self.type_id() !=
+            Some(ScriptLayoutNodeType::Element(
+                LayoutElementType::HTMLObjectElement,
+            ))
         {
             return None;
         }
@@ -281,7 +374,7 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
         // TODO: This is the what the legacy layout system did, but really if Servo
         // supports any `<object>` that's an image, it should support those with URLs
         // and `type` attributes with image mime types.
-        let element = self.to_threadsafe().as_element()?;
+        let element = self.as_element()?;
         if element.get_attr(&ns!(), &local_name!("type")).is_some() {
             return None;
         }
@@ -290,15 +383,11 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
             .map(|string| string.to_owned())
     }
 
-    fn style(&self, context: &SharedStyleContext) -> ServoArc<ComputedValues> {
-        self.to_threadsafe().style(context)
-    }
-
-    fn layout_data_mut(&self) -> AtomicRefMut<'dom, InnerDOMLayoutData> {
-        if LayoutNode::layout_data(self).is_none() {
+    fn ensure_inner_layout_data(&self) -> AtomicRefMut<'dom, InnerDOMLayoutData> {
+        if self.layout_data().is_none() {
             self.initialize_layout_data::<DOMLayoutData>();
         }
-        LayoutNode::layout_data(self)
+        self.layout_data()
             .unwrap()
             .as_any()
             .downcast_ref::<DOMLayoutData>()
@@ -307,8 +396,8 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
             .borrow_mut()
     }
 
-    fn layout_data(&self) -> Option<AtomicRef<'dom, InnerDOMLayoutData>> {
-        LayoutNode::layout_data(self).map(|data| {
+    fn inner_layout_data(&self) -> Option<AtomicRef<'dom, InnerDOMLayoutData>> {
+        self.layout_data().map(|data| {
             data.as_any()
                 .downcast_ref::<DOMLayoutData>()
                 .unwrap()
@@ -317,89 +406,79 @@ impl<'dom> NodeExt<'dom> for ServoLayoutNode<'dom> {
         })
     }
 
-    fn element_box_slot(&self) -> BoxSlot<'dom> {
-        BoxSlot::new(self.layout_data_mut().self_box.clone())
-    }
-
-    fn pseudo_element_box_slot(&self, pseudo_element_type: PseudoElement) -> BoxSlot<'dom> {
-        let data = self.layout_data_mut();
-        let cell = match pseudo_element_type {
-            PseudoElement::Before => &data.pseudo_before_box,
-            PseudoElement::After => &data.pseudo_after_box,
-            PseudoElement::Marker => &data.pseudo_marker_box,
-            _ => unreachable!(
-                "Asked for box slot for unsupported pseudo-element: {:?}",
-                pseudo_element_type
-            ),
+    fn box_slot(&self) -> BoxSlot<'dom> {
+        let pseudo_element_chain = self.pseudo_element_chain();
+        let Some(primary) = pseudo_element_chain.primary else {
+            return self.ensure_inner_layout_data().self_box.clone().into();
         };
-        BoxSlot::new(cell.clone())
-    }
 
-    fn unset_pseudo_element_box(&self, pseudo_element_type: PseudoElement) {
-        let data = self.layout_data_mut();
-        let cell = match pseudo_element_type {
-            PseudoElement::Before => &data.pseudo_before_box,
-            PseudoElement::After => &data.pseudo_after_box,
-            PseudoElement::Marker => &data.pseudo_marker_box,
-            _ => unreachable!(
-                "Asked for box slot for unsupported pseudo-element: {:?}",
-                pseudo_element_type
-            ),
+        let Some(secondary) = pseudo_element_chain.secondary else {
+            let primary_layout_data = self
+                .ensure_inner_layout_data()
+                .create_pseudo_layout_data(primary);
+            return primary_layout_data.borrow().self_box.clone().into();
         };
-        *cell.borrow_mut() = None;
+
+        // It's *very* important that this not borrow the element's main
+        // `InnerLayoutData`. Primary pseudo-elements are processed at the same recursion
+        // level as the main data, so the `BoxSlot` is created sequentially with other
+        // primary pseudo-elements and the element itself. The secondary pseudo-element is
+        // one level deep, so could be happening in parallel with the primary
+        // pseudo-elements or main element layout.
+        let primary_layout_data = self
+            .inner_layout_data()
+            .expect("Should already have element InnerLayoutData here.")
+            .pseudo_layout_data(primary)
+            .expect("Should already have primary pseudo-element InnerLayoutData here");
+        let secondary_layout_data = primary_layout_data
+            .borrow_mut()
+            .create_pseudo_layout_data(secondary);
+        secondary_layout_data.borrow().self_box.clone().into()
     }
 
     fn unset_all_boxes(&self) {
-        let data = self.layout_data_mut();
-        *data.self_box.borrow_mut() = None;
-        *data.pseudo_before_box.borrow_mut() = None;
-        *data.pseudo_after_box.borrow_mut() = None;
-        *data.pseudo_marker_box.borrow_mut() = None;
+        let mut layout_data = self.ensure_inner_layout_data();
+        *layout_data.self_box.borrow_mut() = None;
+        layout_data.pseudo_boxes.clear();
+
         // Stylo already takes care of removing all layout data
         // for DOM descendants of elements with `display: none`.
     }
 
-    fn invalidate_cached_fragment(&self) {
-        let data = self.layout_data_mut();
-        if let Some(data) = data.self_box.borrow_mut().as_mut() {
-            data.invalidate_cached_fragment();
+    fn unset_all_pseudo_boxes(&self) {
+        self.ensure_inner_layout_data().pseudo_boxes.clear();
+    }
+
+    fn clear_fragment_layout_cache(&self) {
+        if let Some(inner_layout_data) = self.inner_layout_data() {
+            inner_layout_data.clear_fragment_layout_cache();
         }
     }
 
     fn fragments_for_pseudo(&self, pseudo_element: Option<PseudoElement>) -> Vec<Fragment> {
-        NodeExt::layout_data(self)
-            .and_then(|layout_data| {
-                layout_data
-                    .for_pseudo(pseudo_element)
-                    .as_ref()
-                    .map(LayoutBox::fragments)
-            })
-            .unwrap_or_default()
+        let Some(layout_data) = self.inner_layout_data() else {
+            return vec![];
+        };
+        match pseudo_element {
+            Some(pseudo_element) => layout_data
+                .pseudo_layout_data(pseudo_element)
+                .map(|pseudo_layout_data| pseudo_layout_data.borrow().fragments())
+                .unwrap_or_default(),
+            None => layout_data.fragments(),
+        }
     }
 
     fn repair_style(&self, context: &SharedStyleContext) {
-        let data = self.layout_data_mut();
-        if let Some(layout_object) = &*data.self_box.borrow() {
-            let style = self.to_threadsafe().style(context);
-            layout_object.repair_style(context, self, &style);
+        if let Some(layout_data) = self.inner_layout_data() {
+            layout_data.repair_style(self, context);
         }
+    }
 
-        if let Some(layout_object) = &*data.pseudo_before_box.borrow() {
-            if let Some(node) = self.to_threadsafe().with_pseudo(PseudoElement::Before) {
-                layout_object.repair_style(context, self, &node.style(context));
-            }
-        }
-
-        if let Some(layout_object) = &*data.pseudo_after_box.borrow() {
-            if let Some(node) = self.to_threadsafe().with_pseudo(PseudoElement::After) {
-                layout_object.repair_style(context, self, &node.style(context));
-            }
-        }
-
-        if let Some(layout_object) = &*data.pseudo_marker_box.borrow() {
-            if let Some(node) = self.to_threadsafe().with_pseudo(PseudoElement::Marker) {
-                layout_object.repair_style(context, self, &node.style(context));
-            }
-        }
+    fn take_restyle_damage(&self) -> LayoutDamage {
+        let damage = self
+            .style_data()
+            .map(|style_data| std::mem::take(&mut style_data.element_data.borrow_mut().damage))
+            .unwrap_or_else(RestyleDamage::reconstruct);
+        LayoutDamage::from_bits_retain(damage.bits())
     }
 }

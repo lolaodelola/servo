@@ -30,10 +30,11 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::{mem, ptr};
 
-use js::jsapi::{JSObject, JSTracer};
+use js::jsapi::{Heap, JSObject, JSTracer, Value};
+use js::rust::HandleValue;
+use layout_api::TrustedNodeAddress;
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 pub(crate) use script_bindings::root::*;
-use script_layout_interface::TrustedNodeAddress;
 use style::thread_state;
 
 use crate::dom::bindings::conversions::DerivedFrom;
@@ -63,14 +64,14 @@ pub(crate) trait ToLayout<T> {
     /// # Safety
     ///
     /// The `self` parameter to this method must meet all the requirements of [`ptr::NonNull::as_ref`].
-    unsafe fn to_layout(&self) -> LayoutDom<T>;
+    unsafe fn to_layout(&self) -> LayoutDom<'_, T>;
 }
 
 impl<T: DomObject> ToLayout<T> for Dom<T> {
-    unsafe fn to_layout(&self) -> LayoutDom<T> {
+    unsafe fn to_layout(&self) -> LayoutDom<'_, T> {
         assert_in_layout();
         LayoutDom {
-            value: self.as_ptr().as_ref().unwrap(),
+            value: unsafe { self.as_ptr().as_ref().unwrap() },
         }
     }
 }
@@ -161,7 +162,7 @@ impl LayoutDom<'_, Node> {
         assert_in_layout();
         let TrustedNodeAddress(addr) = inner;
         LayoutDom {
-            value: &*(addr as *const Node),
+            value: unsafe { &*(addr as *const Node) },
         }
     }
 }
@@ -265,9 +266,9 @@ impl<T: DomObject> MutNullableDom<T> {
     /// Retrieve a copy of the inner optional `Dom<T>` as `LayoutDom<T>`.
     /// For use by layout, which can't use safe types like Temporary.
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    pub(crate) unsafe fn get_inner_as_layout(&self) -> Option<LayoutDom<T>> {
+    pub(crate) unsafe fn get_inner_as_layout(&self) -> Option<LayoutDom<'_, T>> {
         assert_in_layout();
-        (*self.ptr.get()).as_ref().map(|js| js.to_layout())
+        unsafe { (*self.ptr.get()).as_ref().map(|js| js.to_layout()) }
     }
 
     /// Get a rooted value out of this object
@@ -290,6 +291,20 @@ impl<T: DomObject> MutNullableDom<T> {
         let value = self.get();
         self.set(None);
         value
+    }
+
+    /// Runs the given callback on the object if it's not null.
+    pub(crate) fn if_is_some<F, R>(&self, cb: F) -> Option<&R>
+    where
+        F: FnOnce(&T) -> &R,
+    {
+        unsafe {
+            if let Some(ref value) = *self.ptr.get() {
+                Some(cb(value))
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -370,7 +385,7 @@ impl<T: DomObject> MallocSizeOf for DomOnceCell<T> {
 unsafe impl<T: DomObject> JSTraceable for DomOnceCell<T> {
     unsafe fn trace(&self, trc: *mut JSTracer) {
         if let Some(ptr) = self.ptr.get() {
-            ptr.trace(trc);
+            unsafe { ptr.trace(trc) };
         }
     }
 }
@@ -392,6 +407,24 @@ where
         // This doesn't compile if Dom and LayoutDom don't have the same
         // representation.
         let _ = mem::transmute::<Dom<T>, LayoutDom<T>>;
-        &*(slice as *const [Dom<T>] as *const [LayoutDom<T>])
+        unsafe { &*(slice as *const [Dom<T>] as *const [LayoutDom<T>]) }
+    }
+}
+
+/// Converts a rooted `Heap<Value>` into a `HandleValue`.
+///
+/// This is only safe if the `Heap` is rooted (e.g., held inside a `Dom`-managed struct),
+/// and the `#[must_root]` crown lint is active to enforce rooting at compile time.
+/// Avoids repeating unsafe `from_raw` calls at each usage site.
+pub trait AsHandleValue<'a> {
+    fn as_handle_value(&'a self) -> HandleValue<'a>;
+}
+
+impl<'a> AsHandleValue<'a> for Heap<Value> {
+    #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+    fn as_handle_value(&'a self) -> HandleValue<'a> {
+        // SAFETY: `self` is assumed to be rooted, and `handle()` ties
+        // the lifetime to `&self`, which the compiler can enforce.
+        unsafe { HandleValue::from_marked_location(self.ptr.get() as *const _) }
     }
 }

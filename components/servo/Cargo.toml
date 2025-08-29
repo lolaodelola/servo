@@ -21,7 +21,7 @@ bluetooth = [
     "script/bluetooth",
     "script_traits/bluetooth",
 ]
-default = ["clipboard"]
+default = ["clipboard", "vello_cpu"]
 clipboard = ["dep:arboard"]
 crown = ["script/crown"]
 debugmozjs = ["script/debugmozjs"]
@@ -44,7 +44,6 @@ tracing = [
     "profile_traits/tracing",
     "script/tracing",
 ]
-webdriver = ["webdriver_server"]
 webgl_backtrace = [
     "script/webgl_backtrace",
     "webgl/webgl_backtrace",
@@ -62,6 +61,8 @@ webgpu = [
     "constellation/webgpu",
     "constellation_traits/webgpu",
 ]
+vello = ["constellation/vello"]
+vello_cpu = ["constellation/vello_cpu"]
 
 [dependencies]
 background_hang_monitor = { path = "../background_hang_monitor" }
@@ -69,10 +70,8 @@ base = { workspace = true }
 bincode = { workspace = true }
 bluetooth = { path = "../bluetooth", optional = true }
 bluetooth_traits = { workspace = true, optional = true }
-canvas = { path = "../canvas" }
 webgl = { path = "../webgl", default-features = false }
 canvas_traits = { workspace = true }
-cfg-if = { workspace = true }
 compositing = { path = "../compositing" }
 compositing_traits = { workspace = true }
 constellation = { path = "../constellation" }
@@ -90,6 +89,7 @@ gstreamer = { workspace = true, optional = true }
 ipc-channel = { workspace = true }
 keyboard-types = { workspace = true }
 layout = { path = "../layout" }
+layout_api = { workspace = true }
 log = { workspace = true }
 media = { path = "../media" }
 mozangle = { workspace = true }
@@ -100,7 +100,6 @@ profile = { path = "../profile" }
 profile_traits = { workspace = true }
 rayon = { workspace = true }
 script = { path = "../script" }
-script_layout_interface = { workspace = true }
 script_traits = { workspace = true }
 serde = { workspace = true }
 servo-media = { workspace = true }
@@ -116,7 +115,6 @@ stylo_traits = { workspace = true }
 surfman = { workspace = true }
 tracing = { workspace = true, optional = true }
 url = { workspace = true }
-webdriver_server = { path = "../webdriver_server", optional = true }
 webgpu = { path = "../webgpu" }
 webrender = { workspace = true }
 webrender_api = { workspace = true }
@@ -141,8 +139,7 @@ http = { workspace = true }
 libservo = { path = ".", features = ["tracing"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 tracing = { workspace = true }
-winit = "0.30.8"
-
+winit = { workspace = true }
 
 [[test]]
 name = "webview"
@@ -150,4 +147,8 @@ harness = false
 
 [[test]]
 name = "servo"
+harness = false
+
+[[test]]
+name = "multiprocess"
 harness = false

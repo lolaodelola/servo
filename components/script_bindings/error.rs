@@ -6,9 +6,11 @@ use js::error::throw_type_error;
 use js::jsapi::JS_IsExceptionPending;
 
 use crate::codegen::PrototypeList::proto_id_to_name;
+use crate::num::Finite;
 use crate::script_runtime::JSContext as SafeJSContext;
 
 /// DOM exceptions that can be thrown by a native DOM method.
+/// <https://webidl.spec.whatwg.org/#dfn-error-names-table>
 #[derive(Clone, Debug, MallocSizeOf)]
 pub enum Error {
     /// IndexSizeError DOMException
@@ -45,10 +47,19 @@ pub enum Error {
     InvalidNodeType,
     /// DataCloneError DOMException
     DataClone(Option<String>),
+    /// TransactionInactiveError DOMException
+    TransactionInactive,
+    /// ReadOnlyError DOMException
+    ReadOnly,
+    /// VersionError DOMException
+    Version,
     /// NoModificationAllowedError DOMException
     NoModificationAllowed,
     /// QuotaExceededError DOMException
-    QuotaExceeded,
+    QuotaExceeded {
+        quota: Option<Finite<f64>>,
+        requested: Option<Finite<f64>>,
+    },
     /// TypeMismatchError DOMException
     TypeMismatch,
     /// InvalidModificationError DOMException
@@ -61,6 +72,10 @@ pub enum Error {
     Operation,
     /// NotAllowedError DOMException
     NotAllowed,
+    /// EncodingError DOMException
+    Encoding,
+    /// ConstraintError DOMException
+    Constraint,
 
     /// TypeError JavaScript Error
     Type(String),

@@ -6,10 +6,10 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while1};
 use nom::character::complete::{alpha1, alphanumeric1, char, digit1, multispace0};
 use nom::combinator::{map, opt, recognize, value};
-use nom::error::{Error as NomError, ErrorKind as NomErrorKind};
+use nom::error::{Error as NomError, ErrorKind as NomErrorKind, ParseError as NomParseError};
 use nom::multi::{many0, separated_list0};
-use nom::sequence::{delimited, pair, preceded, tuple};
-use nom::{Finish, IResult};
+use nom::sequence::{delimited, pair, preceded};
+use nom::{Finish, IResult, Parser};
 
 pub(crate) fn parse(input: &str) -> Result<Expr, OwnedParserError> {
     let (_, ast) = expr(input).finish().map_err(OwnedParserError::from)?;
@@ -390,7 +390,7 @@ fn expr_single(input: &str) -> IResult<&str, Expr> {
 
 fn or_expr(input: &str) -> IResult<&str, Expr> {
     let (input, first) = and_expr(input)?;
-    let (input, rest) = many0(preceded(ws(tag("or")), and_expr))(input)?;
+    let (input, rest) = many0(preceded(ws(tag("or")), and_expr)).parse(input)?;
 
     Ok((
         input,
@@ -401,7 +401,7 @@ fn or_expr(input: &str) -> IResult<&str, Expr> {
 
 fn and_expr(input: &str) -> IResult<&str, Expr> {
     let (input, first) = equality_expr(input)?;
-    let (input, rest) = many0(preceded(ws(tag("and")), equality_expr))(input)?;
+    let (input, rest) = many0(preceded(ws(tag("and")), equality_expr)).parse(input)?;
 
     Ok((
         input,
@@ -412,13 +412,14 @@ fn and_expr(input: &str) -> IResult<&str, Expr> {
 
 fn equality_expr(input: &str) -> IResult<&str, Expr> {
     let (input, first) = relational_expr(input)?;
-    let (input, rest) = many0(tuple((
+    let (input, rest) = many0((
         ws(alt((
             map(tag("="), |_| EqualityOp::Eq),
             map(tag("!="), |_| EqualityOp::NotEq),
         ))),
         relational_expr,
-    )))(input)?;
+    ))
+    .parse(input)?;
 
     Ok((
         input,
@@ -430,7 +431,7 @@ fn equality_expr(input: &str) -> IResult<&str, Expr> {
 
 fn relational_expr(input: &str) -> IResult<&str, Expr> {
     let (input, first) = additive_expr(input)?;
-    let (input, rest) = many0(tuple((
+    let (input, rest) = many0((
         ws(alt((
             map(tag("<="), |_| RelationalOp::LtEq),
             map(tag(">="), |_| RelationalOp::GtEq),
@@ -438,7 +439,8 @@ fn relational_expr(input: &str) -> IResult<&str, Expr> {
             map(tag(">"), |_| RelationalOp::Gt),
         ))),
         additive_expr,
-    )))(input)?;
+    ))
+    .parse(input)?;
 
     Ok((
         input,
@@ -450,13 +452,14 @@ fn relational_expr(input: &str) -> IResult<&str, Expr> {
 
 fn additive_expr(input: &str) -> IResult<&str, Expr> {
     let (input, first) = multiplicative_expr(input)?;
-    let (input, rest) = many0(tuple((
+    let (input, rest) = many0((
         ws(alt((
             map(tag("+"), |_| AdditiveOp::Add),
             map(tag("-"), |_| AdditiveOp::Sub),
         ))),
         multiplicative_expr,
-    )))(input)?;
+    ))
+    .parse(input)?;
 
     Ok((
         input,
@@ -468,14 +471,15 @@ fn additive_expr(input: &str) -> IResult<&str, Expr> {
 
 fn multiplicative_expr(input: &str) -> IResult<&str, Expr> {
     let (input, first) = unary_expr(input)?;
-    let (input, rest) = many0(tuple((
+    let (input, rest) = many0((
         ws(alt((
             map(tag("*"), |_| MultiplicativeOp::Mul),
             map(tag("div"), |_| MultiplicativeOp::Div),
             map(tag("mod"), |_| MultiplicativeOp::Mod),
         ))),
         unary_expr,
-    )))(input)?;
+    ))
+    .parse(input)?;
 
     Ok((
         input,
@@ -486,7 +490,7 @@ fn multiplicative_expr(input: &str) -> IResult<&str, Expr> {
 }
 
 fn unary_expr(input: &str) -> IResult<&str, Expr> {
-    let (input, minus_count) = many0(ws(char('-')))(input)?;
+    let (input, minus_count) = many0(ws(char('-'))).parse(input)?;
     let (input, expr) = union_expr(input)?;
 
     Ok((
@@ -497,7 +501,7 @@ fn unary_expr(input: &str) -> IResult<&str, Expr> {
 
 fn union_expr(input: &str) -> IResult<&str, Expr> {
     let (input, first) = path_expr(input)?;
-    let (input, rest) = many0(preceded(ws(char('|')), path_expr))(input)?;
+    let (input, rest) = many0(preceded(ws(char('|')), path_expr)).parse(input)?;
 
     Ok((
         input,
@@ -510,41 +514,48 @@ fn union_expr(input: &str) -> IResult<&str, Expr> {
 fn path_expr(input: &str) -> IResult<&str, Expr> {
     alt((
         // "//" RelativePathExpr
-        map(pair(tag("//"), relative_path_expr), |(_, rel_path)| {
-            Expr::Path(PathExpr {
-                is_absolute: true,
-                is_descendant: true,
-                steps: match rel_path {
-                    Expr::Path(p) => p.steps,
-                    _ => unreachable!(),
-                },
-            })
-        }),
-        // "/" RelativePathExpr?
-        map(pair(char('/'), opt(relative_path_expr)), |(_, rel_path)| {
-            Expr::Path(PathExpr {
-                is_absolute: true,
-                is_descendant: false,
-                steps: rel_path
-                    .map(|p| match p {
+        map(
+            pair(tag("//"), move |i| relative_path_expr(true, i)),
+            |(_, rel_path)| {
+                Expr::Path(PathExpr {
+                    is_absolute: true,
+                    is_descendant: true,
+                    steps: match rel_path {
                         Expr::Path(p) => p.steps,
                         _ => unreachable!(),
-                    })
-                    .unwrap_or_default(),
-            })
-        }),
+                    },
+                })
+            },
+        ),
+        // "/" RelativePathExpr?
+        map(
+            pair(char('/'), opt(move |i| relative_path_expr(false, i))),
+            |(_, rel_path)| {
+                Expr::Path(PathExpr {
+                    is_absolute: true,
+                    is_descendant: false,
+                    steps: rel_path
+                        .map(|p| match p {
+                            Expr::Path(p) => p.steps,
+                            _ => unreachable!(),
+                        })
+                        .unwrap_or_default(),
+                })
+            },
+        ),
         // RelativePathExpr
-        relative_path_expr,
-    ))(input)
+        move |i| relative_path_expr(false, i),
+    ))
+    .parse(input)
 }
 
-fn relative_path_expr(input: &str) -> IResult<&str, Expr> {
-    let (input, first) = step_expr(input)?;
+fn relative_path_expr(is_descendant: bool, input: &str) -> IResult<&str, Expr> {
+    let (input, first) = step_expr(is_descendant, input)?;
     let (input, steps) = many0(pair(
-        // ("/" | "//")
-        ws(alt((value(false, char('/')), value(true, tag("//"))))),
-        step_expr,
-    ))(input)?;
+        ws(alt((value(true, tag("//")), value(false, char('/'))))),
+        move |i| step_expr(is_descendant, i),
+    ))
+    .parse(input)?;
 
     let mut all_steps = vec![first];
     for (is_descendant, step) in steps {
@@ -569,16 +580,20 @@ fn relative_path_expr(input: &str) -> IResult<&str, Expr> {
     ))
 }
 
-fn step_expr(input: &str) -> IResult<&str, StepExpr> {
+fn step_expr(is_descendant: bool, input: &str) -> IResult<&str, StepExpr> {
     alt((
         map(filter_expr, StepExpr::Filter),
-        map(axis_step, StepExpr::Axis),
-    ))(input)
+        map(|i| axis_step(is_descendant, i), StepExpr::Axis),
+    ))
+    .parse(input)
 }
 
-fn axis_step(input: &str) -> IResult<&str, AxisStep> {
-    let (input, (step, predicates)) =
-        pair(alt((forward_step, reverse_step)), predicate_list)(input)?;
+fn axis_step(is_descendant: bool, input: &str) -> IResult<&str, AxisStep> {
+    let (input, (step, predicates)) = pair(
+        alt((move |i| forward_step(is_descendant, i), reverse_step)),
+        predicate_list,
+    )
+    .parse(input)?;
 
     let (axis, node_test) = step;
     Ok((
@@ -591,13 +606,11 @@ fn axis_step(input: &str) -> IResult<&str, AxisStep> {
     ))
 }
 
-fn forward_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
-    alt((
-        // ForwardAxis NodeTest
-        pair(forward_axis, node_test),
-        // AbbrevForwardStep
-        abbrev_forward_step,
-    ))(input)
+fn forward_step(is_descendant: bool, input: &str) -> IResult<&str, (Axis, NodeTest)> {
+    alt((pair(forward_axis, node_test), move |i| {
+        abbrev_forward_step(is_descendant, i)
+    }))
+    .parse(input)
 }
 
 fn forward_axis(input: &str) -> IResult<&str, Axis> {
@@ -610,13 +623,14 @@ fn forward_axis(input: &str) -> IResult<&str, Axis> {
         value(Axis::FollowingSibling, tag("following-sibling::")),
         value(Axis::Following, tag("following::")),
         value(Axis::Namespace, tag("namespace::")),
-    ))(input)?;
+    ))
+    .parse(input)?;
 
     Ok((input, axis))
 }
 
-fn abbrev_forward_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
-    let (input, attr) = opt(char('@'))(input)?;
+fn abbrev_forward_step(is_descendant: bool, input: &str) -> IResult<&str, (Axis, NodeTest)> {
+    let (input, attr) = opt(char('@')).parse(input)?;
     let (input, test) = node_test(input)?;
 
     Ok((
@@ -624,6 +638,8 @@ fn abbrev_forward_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
         (
             if attr.is_some() {
                 Axis::Attribute
+            } else if is_descendant {
+                Axis::DescendantOrSelf
             } else {
                 Axis::Child
             },
@@ -638,7 +654,8 @@ fn reverse_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
         pair(reverse_axis, node_test),
         // AbbrevReverseStep
         abbrev_reverse_step,
-    ))(input)
+    ))
+    .parse(input)
 }
 
 fn reverse_axis(input: &str) -> IResult<&str, Axis> {
@@ -648,13 +665,15 @@ fn reverse_axis(input: &str) -> IResult<&str, Axis> {
         value(Axis::PrecedingSibling, tag("preceding-sibling::")),
         value(Axis::Preceding, tag("preceding::")),
         value(Axis::AncestorOrSelf, tag("ancestor-or-self::")),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 fn abbrev_reverse_step(input: &str) -> IResult<&str, (Axis, NodeTest)> {
     map(tag(".."), |_| {
         (Axis::Parent, NodeTest::Kind(KindTest::Node))
-    })(input)
+    })
+    .parse(input)
 }
 
 fn node_test(input: &str) -> IResult<&str, NodeTest> {
@@ -664,7 +683,8 @@ fn node_test(input: &str) -> IResult<&str, NodeTest> {
             NameTest::Wildcard => NodeTest::Wildcard,
             NameTest::QName(qname) => NodeTest::Name(qname),
         }),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -676,7 +696,7 @@ enum NameTest {
 fn name_test(input: &str) -> IResult<&str, NameTest> {
     alt((
         // NCName ":" "*"
-        map(tuple((ncname, char(':'), char('*'))), |(prefix, _, _)| {
+        map((ncname, char(':'), char('*')), |(prefix, _, _)| {
             NameTest::QName(QName {
                 prefix: Some(prefix.to_string()),
                 local_part: "*".to_string(),
@@ -686,7 +706,8 @@ fn name_test(input: &str) -> IResult<&str, NameTest> {
         value(NameTest::Wildcard, char('*')),
         // QName
         map(qname, NameTest::QName),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 fn filter_expr(input: &str) -> IResult<&str, FilterExpr> {
@@ -703,12 +724,13 @@ fn filter_expr(input: &str) -> IResult<&str, FilterExpr> {
 }
 
 fn predicate_list(input: &str) -> IResult<&str, PredicateListExpr> {
-    let (input, predicates) = many0(predicate)(input)?;
+    let (input, predicates) = many0(predicate).parse(input)?;
+
     Ok((input, PredicateListExpr { predicates }))
 }
 
 fn predicate(input: &str) -> IResult<&str, PredicateExpr> {
-    let (input, expr) = delimited(ws(char('[')), expr, ws(char(']')))(input)?;
+    let (input, expr) = delimited(ws(char('[')), expr, ws(char(']'))).parse(input)?;
     Ok((input, PredicateExpr { expr }))
 }
 
@@ -721,31 +743,33 @@ fn primary_expr(input: &str) -> IResult<&str, PrimaryExpr> {
         }),
         context_item_expr,
         function_call,
-    ))(input)
+    ))
+    .parse(input)
 }
 
 fn literal(input: &str) -> IResult<&str, PrimaryExpr> {
     map(alt((numeric_literal, string_literal)), |lit| {
         PrimaryExpr::Literal(lit)
-    })(input)
+    })
+    .parse(input)
 }
 
 fn numeric_literal(input: &str) -> IResult<&str, Literal> {
-    alt((decimal_literal, integer_literal))(input)
+    alt((decimal_literal, integer_literal)).parse(input)
 }
 
 fn var_ref(input: &str) -> IResult<&str, PrimaryExpr> {
-    let (input, _) = char('$')(input)?;
+    let (input, _) = char('$').parse(input)?;
     let (input, name) = qname(input)?;
     Ok((input, PrimaryExpr::Variable(name)))
 }
 
 fn parenthesized_expr(input: &str) -> IResult<&str, Expr> {
-    delimited(ws(char('(')), expr, ws(char(')')))(input)
+    delimited(ws(char('(')), expr, ws(char(')'))).parse(input)
 }
 
 fn context_item_expr(input: &str) -> IResult<&str, PrimaryExpr> {
-    map(char('.'), |_| PrimaryExpr::ContextItem)(input)
+    map(char('.'), |_| PrimaryExpr::ContextItem).parse(input)
 }
 
 fn function_call(input: &str) -> IResult<&str, PrimaryExpr> {
@@ -754,7 +778,8 @@ fn function_call(input: &str) -> IResult<&str, PrimaryExpr> {
         ws(char('(')),
         separated_list0(ws(char(',')), expr_single),
         ws(char(')')),
-    )(input)?;
+    )
+    .parse(input)?;
 
     // Helper to create error
     let arity_error = || nom::Err::Error(NomError::new(input, NomErrorKind::Verify));
@@ -845,63 +870,69 @@ fn function_call(input: &str) -> IResult<&str, PrimaryExpr> {
 }
 
 fn kind_test(input: &str) -> IResult<&str, KindTest> {
-    alt((pi_test, comment_test, text_test, any_kind_test))(input)
+    alt((pi_test, comment_test, text_test, any_kind_test)).parse(input)
 }
 
 fn any_kind_test(input: &str) -> IResult<&str, KindTest> {
-    map(tuple((tag("node"), ws(char('(')), ws(char(')')))), |_| {
+    map((tag("node"), ws(char('(')), ws(char(')'))), |_| {
         KindTest::Node
-    })(input)
+    })
+    .parse(input)
 }
 
 fn text_test(input: &str) -> IResult<&str, KindTest> {
-    map(tuple((tag("text"), ws(char('(')), ws(char(')')))), |_| {
+    map((tag("text"), ws(char('(')), ws(char(')'))), |_| {
         KindTest::Text
-    })(input)
+    })
+    .parse(input)
 }
 
 fn comment_test(input: &str) -> IResult<&str, KindTest> {
-    map(
-        tuple((tag("comment"), ws(char('(')), ws(char(')')))),
-        |_| KindTest::Comment,
-    )(input)
+    map((tag("comment"), ws(char('(')), ws(char(')'))), |_| {
+        KindTest::Comment
+    })
+    .parse(input)
 }
 
 fn pi_test(input: &str) -> IResult<&str, KindTest> {
     map(
-        tuple((
+        (
             tag("processing-instruction"),
             ws(char('(')),
             opt(ws(string_literal)),
             ws(char(')')),
-        )),
+        ),
         |(_, _, literal, _)| {
             KindTest::PI(literal.map(|l| match l {
                 Literal::String(s) => s,
                 _ => unreachable!(),
             }))
         },
-    )(input)
+    )
+    .parse(input)
 }
 
-fn ws<'a, F, O>(inner: F) -> impl FnMut(&'a str) -> IResult<&'a str, O>
+fn ws<'a, F, O, E>(inner: F) -> impl Parser<&'a str, Output = O, Error = E>
 where
-    F: FnMut(&'a str) -> IResult<&'a str, O>,
+    E: NomParseError<&'a str>,
+    F: Parser<&'a str, Output = O, Error = E>,
 {
     delimited(multispace0, inner, multispace0)
 }
 
 fn integer_literal(input: &str) -> IResult<&str, Literal> {
-    map(recognize(tuple((opt(char('-')), digit1))), |s: &str| {
+    map(recognize((opt(char('-')), digit1)), |s: &str| {
         Literal::Numeric(NumericLiteral::Integer(s.parse().unwrap()))
-    })(input)
+    })
+    .parse(input)
 }
 
 fn decimal_literal(input: &str) -> IResult<&str, Literal> {
     map(
-        recognize(tuple((opt(char('-')), opt(digit1), char('.'), digit1))),
+        recognize((opt(char('-')), opt(digit1), char('.'), digit1)),
         |s: &str| Literal::Numeric(NumericLiteral::Decimal(s.parse().unwrap())),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn string_literal(input: &str) -> IResult<&str, Literal> {
@@ -920,12 +951,13 @@ fn string_literal(input: &str) -> IResult<&str, Literal> {
             }),
             char('\''),
         ),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 // QName parser
 fn qname(input: &str) -> IResult<&str, QName> {
-    let (input, prefix) = opt(tuple((ncname, char(':'))))(input)?;
+    let (input, prefix) = opt((ncname, char(':'))).parse(input)?;
     let (input, local) = ncname(input)?;
 
     Ok((
@@ -942,7 +974,8 @@ fn ncname(input: &str) -> IResult<&str, &str> {
     recognize(pair(
         alpha1,
         many0(alt((alphanumeric1, tag("-"), tag("_")))),
-    ))(input)
+    ))
+    .parse(input)
 }
 
 // Test functions to verify the parsers:
@@ -1190,6 +1223,118 @@ mod tests {
                                         })],
                                     }),
                                 }],
+                            },
+                        }),
+                    ],
+                }),
+            ),
+            (
+                "//mu[@xml:id=\"id1\"]//rho[@title][@xml:lang=\"en-GB\"]",
+                Expr::Path(PathExpr {
+                    is_absolute: true,
+                    is_descendant: true,
+                    steps: vec![
+                        StepExpr::Axis(AxisStep {
+                            axis: Axis::Child,
+                            node_test: NodeTest::Name(QName {
+                                prefix: None,
+                                local_part: "mu".to_string(),
+                            }),
+                            predicates: PredicateListExpr {
+                                predicates: vec![PredicateExpr {
+                                    expr: Expr::Equality(
+                                        Box::new(Expr::Path(PathExpr {
+                                            is_absolute: false,
+                                            is_descendant: false,
+                                            steps: vec![StepExpr::Axis(AxisStep {
+                                                axis: Axis::Attribute,
+                                                node_test: NodeTest::Name(QName {
+                                                    prefix: Some("xml".to_string()),
+                                                    local_part: "id".to_string(),
+                                                }),
+                                                predicates: PredicateListExpr {
+                                                    predicates: vec![],
+                                                },
+                                            })],
+                                        })),
+                                        EqualityOp::Eq,
+                                        Box::new(Expr::Path(PathExpr {
+                                            is_absolute: false,
+                                            is_descendant: false,
+                                            steps: vec![StepExpr::Filter(FilterExpr {
+                                                primary: PrimaryExpr::Literal(Literal::String(
+                                                    "id1".to_string(),
+                                                )),
+                                                predicates: PredicateListExpr {
+                                                    predicates: vec![],
+                                                },
+                                            })],
+                                        })),
+                                    ),
+                                }],
+                            },
+                        }),
+                        StepExpr::Axis(AxisStep {
+                            axis: Axis::DescendantOrSelf, // Represents the second '//'
+                            node_test: NodeTest::Kind(KindTest::Node),
+                            predicates: PredicateListExpr { predicates: vec![] },
+                        }),
+                        StepExpr::Axis(AxisStep {
+                            axis: Axis::Child,
+                            node_test: NodeTest::Name(QName {
+                                prefix: None,
+                                local_part: "rho".to_string(),
+                            }),
+                            predicates: PredicateListExpr {
+                                predicates: vec![
+                                    PredicateExpr {
+                                        expr: Expr::Path(PathExpr {
+                                            is_absolute: false,
+                                            is_descendant: false,
+                                            steps: vec![StepExpr::Axis(AxisStep {
+                                                axis: Axis::Attribute,
+                                                node_test: NodeTest::Name(QName {
+                                                    prefix: None,
+                                                    local_part: "title".to_string(),
+                                                }),
+                                                predicates: PredicateListExpr {
+                                                    predicates: vec![],
+                                                },
+                                            })],
+                                        }),
+                                    },
+                                    PredicateExpr {
+                                        expr: Expr::Equality(
+                                            Box::new(Expr::Path(PathExpr {
+                                                is_absolute: false,
+                                                is_descendant: false,
+                                                steps: vec![StepExpr::Axis(AxisStep {
+                                                    axis: Axis::Attribute,
+                                                    node_test: NodeTest::Name(QName {
+                                                        prefix: Some("xml".to_string()),
+                                                        local_part: "lang".to_string(),
+                                                    }),
+                                                    predicates: PredicateListExpr {
+                                                        predicates: vec![],
+                                                    },
+                                                })],
+                                            })),
+                                            EqualityOp::Eq,
+                                            Box::new(Expr::Path(PathExpr {
+                                                is_absolute: false,
+                                                is_descendant: false,
+                                                steps: vec![StepExpr::Filter(FilterExpr {
+                                                    primary: PrimaryExpr::Literal(Literal::String(
+                                                        "en-GB".to_string(),
+                                                    )),
+                                                    predicates: PredicateListExpr {
+                                                        predicates: vec![],
+                                                    },
+                                                })],
+                                            })),
+                                        ),
+                                    },
+                                ],
                             },
                         }),
                     ],

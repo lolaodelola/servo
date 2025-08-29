@@ -8,7 +8,7 @@ use js::jsapi::{GetScriptedCallerGlobal, JSTracer};
 use js::rust::Runtime;
 use script_bindings::settings_stack::*;
 
-//use script_bindings::interfaces::{DomHelpers, GlobalScopeHelpers};
+// use script_bindings::interfaces::{DomHelpers, GlobalScopeHelpers};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::trace::JSTraceable;
 use crate::dom::globalscope::GlobalScope;
@@ -20,7 +20,7 @@ thread_local!(pub(super) static STACK: RefCell<Vec<StackEntry<crate::DomTypeHold
 /// Traces the script settings stack.
 pub(crate) unsafe fn trace(tracer: *mut JSTracer) {
     STACK.with(|stack| {
-        stack.borrow().trace(tracer);
+        unsafe { stack.borrow().trace(tracer) };
     })
 }
 

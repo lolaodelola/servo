@@ -292,6 +292,10 @@ impl TouchHandler {
             .expect("Current Touch sequence does not exist")
     }
 
+    fn try_get_current_touch_sequence_mut(&mut self) -> Option<&mut TouchSequenceInfo> {
+        self.touch_sequence_map.get_mut(&self.current_sequence_id)
+    }
+
     pub(crate) fn get_touch_sequence(&self, sequence_id: TouchSequenceId) -> &TouchSequenceInfo {
         self.touch_sequence_map
             .get(&sequence_id)
@@ -374,7 +378,12 @@ impl TouchHandler {
         id: TouchId,
         point: Point2D<f32, DevicePixel>,
     ) -> TouchMoveAction {
-        let touch_sequence = self.get_current_touch_sequence_mut();
+        // As `TouchHandler` is per `WebViewRenderer` which is per `WebView` we might get a Touch Sequence Move that
+        // started with a down on a different webview. As the touch_sequence id is only changed on touch_down this
+        // move event gets a touch id which is already cleaned up.
+        let Some(touch_sequence) = self.try_get_current_touch_sequence_mut() else {
+            return TouchMoveAction::NoAction;
+        };
         let idx = match touch_sequence
             .active_touch_points
             .iter_mut()
@@ -397,7 +406,9 @@ impl TouchHandler {
                     *velocity /= 2.0;
                     // update the touch point every time when panning.
                     touch_sequence.active_touch_points[idx].point = point;
-                    TouchMoveAction::Scroll(delta, point)
+
+                    // Scroll offsets are opposite to the direction of finger motion.
+                    TouchMoveAction::Scroll(-delta, point)
                 } else if delta.x.abs() > TOUCH_PAN_MIN_SCREEN_PX ||
                     delta.y.abs() > TOUCH_PAN_MIN_SCREEN_PX
                 {
@@ -408,7 +419,9 @@ impl TouchHandler {
                     touch_sequence.prevent_click = true;
                     // update the touch point
                     touch_sequence.active_touch_points[idx].point = point;
-                    TouchMoveAction::Scroll(delta, point)
+
+                    // Scroll offsets are opposite to the direction of finger motion.
+                    TouchMoveAction::Scroll(-delta, point)
                 } else {
                     // We don't update the touchpoint, so multiple small moves can
                     // accumulate and merge into a larger move.
@@ -426,8 +439,11 @@ impl TouchHandler {
                     touch_sequence.active_touch_points[idx].point = point;
                     let (d1, c1) = touch_sequence.pinch_distance_and_center();
                     let magnification = d1 / d0;
+
                     let scroll_delta = c1 - c0 * Scale::new(magnification);
-                    TouchMoveAction::Zoom(magnification, scroll_delta)
+
+                    // Scroll offsets are opposite to the direction of finger motion.
+                    TouchMoveAction::Zoom(magnification, -scroll_delta)
                 } else {
                     // We don't update the touchpoint, so multiple small moves can
                     // accumulate and merge into a larger move.
@@ -529,7 +545,10 @@ impl TouchHandler {
     }
 
     pub fn on_touch_cancel(&mut self, id: TouchId, _point: Point2D<f32, DevicePixel>) {
-        let touch_sequence = self.get_current_touch_sequence_mut();
+        // A similar thing with touch move can happen here where the event is coming from a different webview.
+        let Some(touch_sequence) = self.try_get_current_touch_sequence_mut() else {
+            return;
+        };
         match touch_sequence
             .active_touch_points
             .iter()

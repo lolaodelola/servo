@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
-use base::id::TEST_PIPELINE_ID;
+use base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
 use content_security_policy as csp;
 use crossbeam_channel::{Sender, unbounded};
 use devtools_traits::{HttpRequest as DevtoolsHttpRequest, HttpResponse as DevtoolsHttpResponse};
@@ -26,6 +26,7 @@ use http_body_util::combinators::BoxBody;
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use mime::{self, Mime};
+use net::async_runtime::spawn_blocking_task;
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, FetchContext};
 use net::filemanager_thread::FileManager;
@@ -47,7 +48,7 @@ use servo_arc::Arc as ServoArc;
 use servo_url::ServoUrl;
 use uuid::Uuid;
 
-use crate::http_loader::{expect_devtools_http_request, expect_devtools_http_response};
+use crate::http_loader::{devtools_response_with_body, expect_devtools_http_request};
 use crate::{
     DEFAULT_USER_AGENT, create_embedder_proxy, create_embedder_proxy_and_receiver,
     create_http_state, fetch, fetch_with_context, fetch_with_cors_cache, make_body, make_server,
@@ -66,7 +67,7 @@ fn test_fetch_response_is_not_network_error() {
         };
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     let fetch_response = fetch(request, None);
@@ -80,7 +81,7 @@ fn test_fetch_response_is_not_network_error() {
 #[test]
 fn test_fetch_on_bad_port_is_network_error() {
     let url = ServoUrl::parse("http://www.example.org:6667").unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     let fetch_response = fetch(request, None);
@@ -102,7 +103,7 @@ fn test_fetch_response_body_matches_const_message() {
         };
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     let fetch_response = fetch(request, None);
@@ -122,7 +123,7 @@ fn test_fetch_response_body_matches_const_message() {
 #[test]
 fn test_fetch_aboutblank() {
     let url = ServoUrl::parse("about:blank").unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
 
@@ -188,7 +189,7 @@ fn test_fetch_blob() {
     );
     let url = ServoUrl::parse(&format!("blob:{}{}", origin.as_str(), id.simple())).unwrap();
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(origin.origin())
         .build();
 
@@ -200,7 +201,7 @@ fn test_fetch_blob() {
         expected: bytes.to_vec(),
     };
 
-    crate::HANDLE.block_on(methods::fetch(request, &mut target, &context));
+    spawn_blocking_task::<_, Response>(methods::fetch(request, &mut target, &context));
 
     let fetch_response = receiver.recv().unwrap();
     assert!(!fetch_response.is_network_error());
@@ -225,12 +226,12 @@ fn test_fetch_blob() {
 
 #[test]
 fn test_file() {
-    let path = Path::new("../../resources/ahem.css")
+    let path = Path::new("../../components/net/tests/test.css")
         .canonicalize()
         .unwrap();
     let url = ServoUrl::from_file_path(path.clone()).unwrap();
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
 
@@ -273,7 +274,7 @@ fn test_file() {
 #[test]
 fn test_fetch_ftp() {
     let url = ServoUrl::parse("ftp://not-supported").unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     let fetch_response = fetch(request, None);
@@ -283,7 +284,7 @@ fn test_fetch_ftp() {
 #[test]
 fn test_fetch_bogus_scheme() {
     let url = ServoUrl::parse("bogus://whatever").unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     let fetch_response = fetch(request, None);
@@ -338,7 +339,12 @@ fn test_cors_preflight_fetch() {
     let (server, url) = make_server(handler);
 
     let target_url = url.clone().join("a.html").unwrap();
-    let mut request = RequestBuilder::new(None, url, Referrer::ReferrerUrl(target_url)).build();
+    let mut request = RequestBuilder::new(
+        Some(TEST_WEBVIEW_ID),
+        url,
+        Referrer::ReferrerUrl(target_url),
+    )
+    .build();
     request.referrer_policy = ReferrerPolicy::Origin;
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
@@ -395,7 +401,7 @@ fn test_cors_preflight_cache_fetch() {
         };
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(None, url, Referrer::NoReferrer).build();
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer).build();
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
     let wrapped_request0 = request.clone();
@@ -464,7 +470,7 @@ fn test_cors_preflight_fetch_network_error() {
         };
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(None, url, Referrer::NoReferrer).build();
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer).build();
     request.method = Method::from_bytes(b"CHICKEN").unwrap();
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
@@ -493,7 +499,7 @@ fn test_fetch_response_is_basic_filtered() {
         };
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     let fetch_response = fetch(request, None);
@@ -560,7 +566,7 @@ fn test_fetch_response_is_cors_filtered() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will stop it from defaulting to a basic filtered response
-    let mut request = RequestBuilder::new(None, url, Referrer::NoReferrer).build();
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer).build();
     request.mode = RequestMode::CorsMode;
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -596,7 +602,7 @@ fn test_fetch_response_is_opaque_filtered() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will fall through to an Opaque filtered response
-    let request = RequestBuilder::new(None, url, Referrer::NoReferrer).build();
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer).build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
 
@@ -644,7 +650,7 @@ fn test_fetch_response_is_opaque_redirect_filtered() {
 
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     request.redirect_mode = RedirectMode::Manual;
@@ -680,9 +686,10 @@ fn test_fetch_with_local_urls_only() {
     let (server, server_url) = make_server(handler);
 
     let do_fetch = |url: ServoUrl| {
-        let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
-            .origin(url.origin())
-            .build();
+        let mut request =
+            RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+                .origin(url.origin())
+                .build();
 
         // Set the flag.
         request.local_urls_only = true;
@@ -748,7 +755,7 @@ fn test_fetch_with_hsts() {
             HstsEntry::new("localhost".to_owned(), IncludeSubdomains::NotIncluded, None).unwrap(),
         );
     }
-    let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     // Set the flag.
@@ -802,7 +809,7 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         context.state.override_manager.add_override(certificate);
     }
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .method(Method::GET)
         .body(None)
         .destination(Destination::Document)
@@ -862,7 +869,7 @@ fn test_fetch_self_signed() {
         protocols: Arc::new(ProtocolRegistry::default()),
     };
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .method(Method::GET)
         .body(None)
         .destination(Destination::Document)
@@ -883,7 +890,7 @@ fn test_fetch_self_signed() {
         context.state.override_manager.add_override(certificate);
     }
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .method(Method::GET)
         .body(None)
         .destination(Destination::Document)
@@ -908,7 +915,7 @@ fn test_fetch_with_sri_network_error() {
         };
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     // To calulate hash use :
@@ -934,7 +941,7 @@ fn test_fetch_with_sri_sucess() {
         };
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     // To calulate hash use :
@@ -976,7 +983,7 @@ fn test_fetch_blocked_nosniff() {
 
         let (server, url) = make_server(handler);
 
-        let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+        let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
             .origin(url.origin())
             .destination(destination)
             .build();
@@ -1023,7 +1030,7 @@ fn setup_server_and_fetch(message: &'static [u8], redirect_cap: u32) -> Response
 
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     let fetch_response = fetch(request, None);
@@ -1113,7 +1120,7 @@ fn test_fetch_redirect_updates_method_runner(
 
     let (server, url) = crate::make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .method(method)
         .build();
@@ -1198,7 +1205,7 @@ fn test_fetch_async_returns_complete_response() {
         };
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     let fetch_response = fetch(request, None);
@@ -1218,7 +1225,7 @@ fn test_opaque_filtered_fetch_async_returns_complete_response() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will fall through to an Opaque filtered response
-    let request = RequestBuilder::new(None, url, Referrer::NoReferrer).build();
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer).build();
     let fetch_response = fetch(request, None);
 
     let _ = server.close();
@@ -1252,7 +1259,7 @@ fn test_opaque_redirect_filtered_fetch_async_returns_complete_response() {
         };
 
     let (server, url) = make_server(handler);
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .redirect_mode(RedirectMode::Manual)
         .build();
@@ -1277,7 +1284,7 @@ fn test_fetch_with_devtools() {
 
     let (server, url) = make_server(handler);
 
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .redirect_mode(RedirectMode::Manual)
         .pipeline_id(Some(TEST_PIPELINE_ID))
@@ -1289,10 +1296,10 @@ fn test_fetch_with_devtools() {
     let _ = server.close();
 
     // notification received from devtools
-    let devhttprequest = expect_devtools_http_request(&devtools_port);
-    let mut devhttpresponse = expect_devtools_http_response(&devtools_port);
+    let devhttprequests = expect_devtools_http_request(&devtools_port);
+    let mut devhttpresponse = devtools_response_with_body(&devtools_port);
 
-    //Creating default headers for request
+    // Creating default headers for request
     let mut headers = HeaderMap::new();
 
     headers.insert(header::ACCEPT, HeaderValue::from_static("*/*"));
@@ -1329,11 +1336,13 @@ fn test_fetch_with_devtools() {
         headers: headers,
         body: Some(vec![]),
         pipeline_id: TEST_PIPELINE_ID,
-        started_date_time: devhttprequest.started_date_time,
-        time_stamp: devhttprequest.time_stamp,
-        connect_time: devhttprequest.connect_time,
-        send_time: devhttprequest.send_time,
+        started_date_time: devhttprequests.1.started_date_time,
+        time_stamp: devhttprequests.1.time_stamp,
+        connect_time: devhttprequests.1.connect_time,
+        send_time: devhttprequests.1.send_time,
+        destination: Destination::None,
         is_xhr: true,
+        browsing_context_id: TEST_WEBVIEW_ID.0,
     };
 
     let content = "Yay!";
@@ -1348,11 +1357,12 @@ fn test_fetch_with_devtools() {
     let httpresponse = DevtoolsHttpResponse {
         headers: Some(response_headers),
         status: HttpStatus::default(),
-        body: None,
+        body: Some(content.as_bytes().to_vec()),
         pipeline_id: TEST_PIPELINE_ID,
+        browsing_context_id: TEST_WEBVIEW_ID.0,
     };
 
-    assert_eq!(devhttprequest, httprequest);
+    assert_eq!(devhttprequests.1, httprequest);
     assert_eq!(devhttpresponse, httpresponse);
 }
 
@@ -1417,7 +1427,7 @@ fn test_fetch_request_intercepted() {
     };
 
     let url = ServoUrl::parse("http://www.example.org").unwrap();
-    let request = RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .build();
     let response = fetch_with_context(request, &mut context);

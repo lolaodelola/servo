@@ -17,6 +17,7 @@ use crate::canvas_state::CanvasState;
 use crate::dom::bindings::codegen::Bindings::CanvasRenderingContext2DBinding::{
     CanvasFillRule, CanvasImageSource, CanvasLineCap, CanvasLineJoin,
 };
+use crate::dom::bindings::codegen::Bindings::DOMMatrixBinding::DOMMatrix2DInit;
 use crate::dom::bindings::codegen::Bindings::PaintRenderingContext2DBinding::PaintRenderingContext2DMethods;
 use crate::dom::bindings::codegen::UnionTypes::StringOrCanvasGradientOrCanvasPattern;
 use crate::dom::bindings::error::{ErrorResult, Fallible};
@@ -41,23 +42,25 @@ pub(crate) struct PaintRenderingContext2D {
 }
 
 impl PaintRenderingContext2D {
-    fn new_inherited(global: &PaintWorkletGlobalScope) -> PaintRenderingContext2D {
-        PaintRenderingContext2D {
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    fn new_inherited(global: &PaintWorkletGlobalScope) -> Option<PaintRenderingContext2D> {
+        Some(PaintRenderingContext2D {
             reflector_: Reflector::new(),
-            canvas_state: CanvasState::new(global.upcast(), Size2D::zero()),
+            canvas_state: CanvasState::new(global.upcast(), Size2D::zero())?,
             device_pixel_ratio: Cell::new(Scale::new(1.0)),
-        }
+        })
     }
 
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         global: &PaintWorkletGlobalScope,
         can_gc: CanGc,
-    ) -> DomRoot<PaintRenderingContext2D> {
-        reflect_dom_object(
-            Box::new(PaintRenderingContext2D::new_inherited(global)),
+    ) -> Option<DomRoot<PaintRenderingContext2D>> {
+        Some(reflect_dom_object(
+            Box::new(PaintRenderingContext2D::new_inherited(global)?),
             global,
             can_gc,
-        )
+        ))
     }
 
     /// Send update to canvas paint thread and returns [`ImageKey`]
@@ -131,10 +134,18 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
         self.canvas_state.get_transform(&self.global(), can_gc)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-context-2d-settransform
-    fn SetTransform(&self, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) {
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-settransform>
+    fn SetTransform(&self, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> ErrorResult {
         self.canvas_state.set_transform(a, b, c, d, e, f);
         self.scale_by_device_pixel_ratio();
+        Ok(())
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-context-2d-settransform-matrix>
+    fn SetTransform_(&self, transform: &DOMMatrix2DInit) -> ErrorResult {
+        self.canvas_state.set_transform_(transform)?;
+        self.scale_by_device_pixel_ratio();
+        Ok(())
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-resettransform
@@ -332,8 +343,8 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle
-    fn SetStrokeStyle(&self, value: StringOrCanvasGradientOrCanvasPattern, can_gc: CanGc) {
-        self.canvas_state.set_stroke_style(None, value, can_gc)
+    fn SetStrokeStyle(&self, value: StringOrCanvasGradientOrCanvasPattern) {
+        self.canvas_state.set_stroke_style(None, value)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle
@@ -342,8 +353,8 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-strokestyle
-    fn SetFillStyle(&self, value: StringOrCanvasGradientOrCanvasPattern, can_gc: CanGc) {
-        self.canvas_state.set_fill_style(None, value, can_gc)
+    fn SetFillStyle(&self, value: StringOrCanvasGradientOrCanvasPattern) {
+        self.canvas_state.set_fill_style(None, value)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-createlineargradient
@@ -486,7 +497,7 @@ impl PaintRenderingContext2DMethods<crate::DomTypeHolder> for PaintRenderingCont
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-context-2d-shadowcolor
-    fn SetShadowColor(&self, value: DOMString, can_gc: CanGc) {
-        self.canvas_state.set_shadow_color(None, value, can_gc)
+    fn SetShadowColor(&self, value: DOMString) {
+        self.canvas_state.set_shadow_color(None, value)
     }
 }
